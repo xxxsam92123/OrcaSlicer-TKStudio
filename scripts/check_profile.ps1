@@ -5,20 +5,32 @@
 .DESCRIPTION
     The Windows counterpart of scripts/check_profile.sh, and kept deliberately close to it.
 
-    Runs the same five checks, in the same order, with the same validator flags, and with the
+    Runs the same six checks, in the same order, with the same validator flags, and with the
     same semantics: every check runs even after an earlier one fails (the workflow's
-    continue-on-error), then the script exits non-zero once at the end.
+    continue-on-error on the validator checks), then the script exits non-zero once at the end.
+    The guard is the one check CI does not continue past: it is not continue-on-error there, so
+    a red guard ends that run before the download, while this script runs the rest anyway.
 
+        air_filtration_guard          scripts/orca_profile_tool.py check-air-filtration
         profile_tool                  scripts/orca_profile_tool.py check
         validate_system               validator -p <profiles> -l <level>
         validate_slice                validator -p <profiles> -s -l <level>
         validate_filament_subtypes    validator -p <profiles> -l <level> -f
         validate_custom               validator against every released custom-preset fixture
 
-    profile_tool is the only check that is not the validator binary; it makes the static checks
-    the validator cannot, because the validator loads the tree the way the slicer does and so
-    never sees a profile no <vendor>.json indexes, a preset name two files claim, or a file
-    normalize and update-index would still rewrite.
+    air_filtration_guard covers the nine BBL machines that declare support_air_filtration as
+    this fork's own deviation. Upstream re-exports resources\profiles\BBL\ wholesale now and
+    then, and the copy that lands carries the key on the base every BBL machine inherits ("0")
+    and on Bambu Lab X1E ("1") and on no other preset, so a sync strips the capability - and
+    the printer's air-filtration setting with it (the chamber fan's M106 P3) - without failing
+    anything else in the tree. Run fix-air-filtration to repair such a sync. -Vendor cannot
+    scope the check away: narrowed to another vendor, the tool itself reports that BBL is out
+    of scope and passes, and that message is the report - no separate skip.
+
+    profile_tool and air_filtration_guard are the two checks that are not the validator binary.
+    profile_tool makes the static checks the validator cannot, because the validator loads the
+    tree the way the slicer does and so never sees a profile no <vendor>.json indexes, a preset
+    name two files claim, or a file normalize and update-index would still rewrite.
 
     Everything that has to be downloaded - the profile validator and the custom-preset fixture
     archives - lands under a per-user cache directory (%LOCALAPPDATA%\orca-profile-check) and
@@ -116,7 +128,7 @@ $HostArch = switch ($HostArch) {
     default { 'x86' }
 }
 
-$AllChecks = @('profile_tool', 'validate_system', 'validate_slice', 'validate_filament_subtypes', 'validate_custom')
+$AllChecks = @('air_filtration_guard', 'profile_tool', 'validate_system', 'validate_slice', 'validate_filament_subtypes', 'validate_custom')
 
 $script:LogWriter = $null
 $script:Python = ''
@@ -443,6 +455,16 @@ function Expand-VendorPresets([string] $Zip, [string] $Tree, [string] $Prefix) {
 
 $CheckBodies = @{
 
+    # Upstream re-exports resources\profiles\BBL\ wholesale from Bambu Studio's folder every so
+    # often, and the copy that lands drops support_air_filtration from the nine BBL machines
+    # that declare it as this fork's own deviation - silently taking the printer's air-filtration
+    # setting (and the chamber fan's M106 P3) away. Nothing else in the tree fails when it does,
+    # which is why the gate exists, and why it is the first check here: it is cheap, and a sync
+    # that trips it should say so in seconds. Run fix-air-filtration after such a sync.
+    air_filtration_guard = {
+        Invoke-Tool -Exe (Resolve-Python) -Arguments (@((Join-Path $RepoRoot 'scripts\orca_profile_tool.py'), 'check-air-filtration', '--profiles', $ProfilesDir) + $VendorPyArgs)
+    }
+
     profile_tool = {
         Invoke-Tool -Exe (Resolve-Python) -Arguments (@((Join-Path $RepoRoot 'scripts\orca_profile_tool.py'), 'check', '--profiles', $ProfilesDir) + $VendorPyArgs)
     }
@@ -580,6 +602,7 @@ $CheckBodies = @{
 
 # Heading CI puts above this check's log in the PR comment.
 $CommentHeadings = @{
+    air_filtration_guard       = '### BBL Air-Filtration Gate Failed (orca_profile_tool.py)'
     profile_tool               = '### Profile Check Failed (orca_profile_tool.py)'
     validate_system            = '### System Profile Validation Failed'
     validate_slice             = '### Slice Validation Failed (custom g-code expansion)'
@@ -627,7 +650,9 @@ try {
     [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
     Push-UserPresets
 
-    if ($Checks | Where-Object { $_ -ne 'profile_tool' }) { $Validator = Resolve-Validator }
+    # Neither orca_profile_tool.py check needs the validator binary, so naming only those must
+    # not drag in the download.
+    if ($Checks | Where-Object { $_ -ne 'profile_tool' -and $_ -ne 'air_filtration_guard' }) { $Validator = Resolve-Validator }
 
     # An empty printer set is a failure to the sweep, so validate_slice is recorded as skipped
     # rather than run for a vendor that ships no printers (the filament-only OrcaFilamentLibrary);

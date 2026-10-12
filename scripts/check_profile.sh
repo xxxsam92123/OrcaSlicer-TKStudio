@@ -2,9 +2,11 @@
 #
 # Local twin of the "Check profiles" CI job (.github/workflows/check_profiles.yml).
 #
-# Runs the same five checks, in the same order, with the same validator flags, and with the
+# Runs the same six checks, in the same order, with the same validator flags, and with the
 # same semantics: every check runs even after an earlier one fails (the workflow's
-# continue-on-error), then the script exits non-zero once at the end.
+# continue-on-error on the validator checks), then the script exits non-zero once at the end.
+# The guard is the one check CI does not continue past: it is not continue-on-error there, so a
+# red guard ends that run before the download, while this script runs the rest anyway.
 #
 # Everything that has to be downloaded - the profile validator and the custom-preset fixture
 # archives - lands under a per-user cache directory and is reused on the next run. Being outside
@@ -58,7 +60,7 @@ LOG_LEVEL=2
 PREFER_DOWNLOAD=0
 REFRESH=0
 
-ALL_CHECKS=(profile_tool validate_system validate_slice validate_filament_subtypes validate_custom)
+ALL_CHECKS=(air_filtration_guard profile_tool validate_system validate_slice validate_filament_subtypes validate_custom)
 CHECKS=()
 # "<check><TAB>pass|fail" per check that ran, plus "<check><TAB>skip<TAB>why" for one a vendor
 # scope left out; a string rather than an array because bash 3.2 (still the /bin/bash on macOS)
@@ -72,6 +74,7 @@ Run the profile checks from .github/workflows/check_profiles.yml locally.
 Usage: scripts/check_profile.sh [OPTION]... [CHECK]...
 
 Checks (default: all, in this order):
+  air_filtration_guard          scripts/orca_profile_tool.py check-air-filtration
   profile_tool                  scripts/orca_profile_tool.py check
   validate_system               validator -p <profiles> -l <level>
   validate_slice                validator -p <profiles> -s -l <level>
@@ -91,10 +94,19 @@ Options:
   -l, --log-level N    validator log level (default: ${LOG_LEVEL}, as in CI)
   -h, --help           show this help
 
-Note: profile_tool is the only check that is not the validator binary; it makes the static
-checks the validator cannot, because the validator loads the tree the way the slicer does
-and so never sees a profile no <vendor>.json indexes, a preset name two files claim, or a
-file normalize and update-index would still rewrite.
+Note: air_filtration_guard covers the nine BBL machines that declare support_air_filtration
+as this fork's own deviation. Upstream re-exports resources/profiles/BBL/ wholesale now and
+then, and the copy that lands carries the key on the base every BBL machine inherits ("0")
+and on Bambu Lab X1E ("1") and on no other preset, so a sync strips the capability - and the
+printer's air-filtration setting with it (the chamber fan's M106 P3) - without failing
+anything else in the tree. Run fix-air-filtration to repair such a sync. --vendor cannot
+scope the check away: narrowed to another vendor, the tool itself reports that BBL is out of
+scope and passes, and that message is the report - no separate skip.
+
+Note: profile_tool and air_filtration_guard are the two checks that are not the validator
+binary. profile_tool makes the static checks the validator cannot, because the validator
+loads the tree the way the slicer does and so never sees a profile no <vendor>.json indexes,
+a preset name two files claim, or a file normalize and update-index would still rewrite.
 
 Note: --vendor narrows validate_custom too, by keeping only that vendor's presets in each
 fixture tree. The one check it cannot narrow is validate_slice for a vendor that ships no
@@ -375,6 +387,16 @@ resolve_validator() {
 
 # ---------------------------------------------------------------------------- checks
 
+# Upstream re-exports resources/profiles/BBL/ wholesale from Bambu Studio's folder every so
+# often, and the copy that lands drops support_air_filtration from the nine BBL machines that
+# declare it as this fork's own deviation - silently taking the printer's air-filtration
+# setting (and the chamber fan's M106 P3) away. Nothing else in the tree fails when it does,
+# which is why the gate exists, and why it is the first check here: it is cheap, and a sync
+# that trips it should say so in seconds. Run fix-air-filtration after such a sync.
+check_air_filtration_guard() {
+    python3 "${REPO_ROOT}/scripts/orca_profile_tool.py" check-air-filtration --profiles "${PROFILES_DIR}" --vendor "${VENDOR}"
+}
+
 check_profile_tool() {
     python3 "${REPO_ROOT}/scripts/orca_profile_tool.py" check --profiles "${PROFILES_DIR}" --vendor "${VENDOR}"
 }
@@ -562,6 +584,7 @@ EOF
 # Heading CI puts above this check's log in the PR comment.
 comment_heading() {
     case "$1" in
+        air_filtration_guard) echo "### BBL Air-Filtration Gate Failed (orca_profile_tool.py)" ;;
         profile_tool) echo "### Profile Check Failed (orca_profile_tool.py)" ;;
         validate_system) echo "### System Profile Validation Failed" ;;
         validate_slice) echo "### Slice Validation Failed (custom g-code expansion)" ;;

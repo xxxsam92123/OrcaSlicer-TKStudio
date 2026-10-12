@@ -60,7 +60,10 @@ jobs:
       # "python scripts/orca_profile_tool.py fix-air-filtration" and commit the result.
       - name: Check BBL air-filtration capability
         id: air_filtration_guard
-        run: python3 ./scripts/orca_profile_tool.py check-air-filtration
+        run: |
+          set +e
+          python3 ./scripts/orca_profile_tool.py check-air-filtration 2>&1 | tee ${{ runner.temp }}/air_filtration_guard.log
+          exit ${PIPESTATUS[0]}
 
       # What the validator below cannot see. It loads the tree the way the slicer does, so
       # it never notices a profile no <vendor>.json indexes, a preset name two files claim,
@@ -234,13 +237,22 @@ jobs:
           echo "${{ github.event.pull_request.number }}" > ${{ runner.temp }}/profile-check-results/pr_number.txt
 
       - name: Prepare comment artifact
-        if: ${{ always() && github.event_name == 'pull_request' && (steps.profile_tool.outcome == 'failure' || steps.validate_system.outcome == 'failure' || steps.validate_slice.outcome == 'failure' || steps.validate_filament_subtypes.outcome == 'failure' || steps.validate_custom.outcome == 'failure') }}
+        if: ${{ always() && github.event_name == 'pull_request' && (steps.air_filtration_guard.outcome == 'failure' || steps.profile_tool.outcome == 'failure' || steps.validate_system.outcome == 'failure' || steps.validate_slice.outcome == 'failure' || steps.validate_filament_subtypes.outcome == 'failure' || steps.validate_custom.outcome == 'failure') }}
         run: |
           {
             # Marker matched by check_profiles_comment.yml to delete prior comments.
             echo "<!-- profile-validation-comment -->"
             echo "## :x: Profile Validation Errors"
             echo ""
+
+            if [ "${{ steps.air_filtration_guard.outcome }}" = "failure" ]; then
+              echo "### BBL Air-Filtration Gate Failed (orca_profile_tool.py)"
+              echo ""
+              echo '```'
+              head -c 30000 ${{ runner.temp }}/air_filtration_guard.log || echo "No output captured"
+              echo '```'
+              echo ""
+            fi
 
             if [ "${{ steps.profile_tool.outcome }}" = "failure" ]; then
               echo "### Profile Check Failed (orca_profile_tool.py)"
