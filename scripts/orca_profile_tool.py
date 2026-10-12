@@ -5,12 +5,14 @@ Every maintenance job for the OrcaSlicer system profile tree, in one tool.
 usage: python scripts/orca_profile_tool.py <command> [options]
 
 commands:
-  check            validate the whole tree -- what CI runs
-  fix-variant      resize the variant arrays check rejects
-  generate-id      write the filament_id / setting_id each profile's identity implies
-  normalize        rewrite profile files into their canonical shape
-  trim             delete profile files no <vendor>.json list references
-  update-index     regenerate the *_list sections of <vendor>.json
+  check                 validate the whole tree -- what CI runs
+  check-air-filtration  the BBL machines that must declare support_air_filtration
+  fix-air-filtration    write that key back into the machines a BBL sync dropped it from
+  fix-variant           resize the variant arrays check rejects
+  generate-id           write the filament_id / setting_id each profile's identity implies
+  normalize             rewrite profile files into their canonical shape
+  trim                  delete profile files no <vendor>.json list references
+  update-index          regenerate the *_list sections of <vendor>.json
 
 options shared by several commands:
   --vendor VENDOR      act on one vendor bundle only; repeatable, empty means all
@@ -138,6 +140,47 @@ PROFILE_SUBDIRS = ("filament", "process", "machine")
 # machine_model is an index section whose files live in the machine/ directory, and
 # this order is the order the sections are rebuilt (and therefore written) in.
 PROFILE_TYPES = ("machine_model", "process", "filament", "machine")
+
+# The BBL machine presets this fork has to put support_air_filtration back on, and
+# the reason the list exists at all. The option is the printer's air-filtration
+# switch: the GUI reads it out of the machine preset (src/slic3r/GUI/Tab.cpp) and
+# the g-code writer turns it into the chamber fan's M106 P3
+# (src/libslic3r/GCode.cpp). The base they inherit from,
+# BBL/machine/fdm_machine_common.json, declares the key as "0", so a machine that
+# does not declare its own "1" has the feature off.
+#
+# Upstream re-exports resources/profiles/BBL/ wholesale from Bambu Studio's own
+# folder now and then -- the point of upstream PR #15851 being that "future syncs
+# can copy the BBL folder over as-is". That copy carries the key on
+# fdm_machine_common ("0") and on Bambu Lab X1E ("1"), which is why neither is
+# listed here and why a sync leaves them alone: they ARE the mirror. The nine
+# below are the per-machine "1"s this fork restores on top of it, so a sync strips
+# every one of them and nothing else in the tree fails. check-air-filtration is the
+# guard that catches it and fix-air-filtration the repair; this list is the only
+# thing in the tree that says which machines are meant to have the key, so ADD A
+# NEW H2-SERIES MACHINE HERE when one is introduced.
+AIR_FILTRATION_VENDOR = "BBL"
+AIR_FILTRATION_KEY = "support_air_filtration"
+AIR_FILTRATION_MACHINES = (
+    "Bambu Lab H2D 0.4 nozzle.json",
+    "Bambu Lab H2D Pro 0.4 nozzle.json",
+    "Bambu Lab H2S 0.4 nozzle.json",
+    "Bambu Lab H2C 0.4 nozzle.json",
+    "Bambu Lab P1S 0.4 nozzle.json",
+    "Bambu Lab P2S 0.4 nozzle.json",
+    "Bambu Lab X1 0.4 nozzle.json",
+    "Bambu Lab X1 Carbon 0.4 nozzle.json",
+    "Bambu Lab X2D 0.4 nozzle.json",
+)
+# Where a repaired file gets the line: just before support_chamber_temp_control,
+# else just after support_cooling_filter, else just after instantiation. One rule
+# for all nine files, so a repeat repair lands in the same place. instantiation is
+# the fallback because it closes the identifying block (NORMALIZE_FIELD_ORDER), so
+# the line lands among the other settings and the file stays in the canonical shape
+# check_normalized demands -- right after `inherits` would put a setting inside the
+# identifying block and a later normalize would have to move it back out.
+AIR_FILTRATION_BEFORE = ("support_chamber_temp_control",)
+AIR_FILTRATION_AFTER = ("support_cooling_filter", "instantiation")
 
 # Data files that sit under a vendor bundle but are not presets: no name, no type.
 NON_PROFILE_FILES = {
@@ -3073,6 +3116,221 @@ def fix_variant_arrays(profiles_dir=PROFILES_DIR, vendors=None, dry_run=False, s
 
 
 # ---------------------------------------------------------------------------
+# BBL air-filtration guard
+# ---------------------------------------------------------------------------
+# An upstream sync copies Bambu Studio's BBL folder over resources/profiles/BBL/
+# as-is (see AIR_FILTRATION_MACHINES above), which drops support_air_filtration
+# from the machines that carry it. Nothing else in the tree fails when it does,
+# so without this the loss ships as a printer that quietly lost the setting.
+# check-air-filtration is the gate CI runs; fix-air-filtration the repair to run
+# after merging such a sync, before committing it.
+
+def _air_filtration_paths(profiles_dir):
+    """(path, tree-relative name) of every machine the guard protects."""
+    root = os.path.join(str(profiles_dir), AIR_FILTRATION_VENDOR, "machine")
+    return [(os.path.join(root, name),
+             posixpath.join(AIR_FILTRATION_VENDOR, "machine", name))
+            for name in AIR_FILTRATION_MACHINES]
+
+
+def _air_filtration_in_scope(vendors):
+    """False when --vendor narrowed the run to bundles the guard does not cover."""
+    if vendors is not None and AIR_FILTRATION_VENDOR not in vendors:
+        print_info(f"--vendor leaves {AIR_FILTRATION_VENDOR} out of scope; nothing to check")
+        return False
+    return True
+
+
+def _bumped_version(version):
+    """version with its last segment incremented: 02.08.00.13 -> 02.08.00.14.
+
+    Strictly greater than its input, and no segment ever moves backwards: a
+    segment that cannot grow a digit carries into the one before it. A vendor's
+    .opc cache is keyed on this version (docs/HLSD/preset-cache.md), so a profile
+    content change that does not bump it keeps being served from the old cache.
+    """
+    parts = version.split(".")
+    for i in range(len(parts) - 1, -1, -1):
+        if not parts[i].isdigit():
+            break
+        grown = str(int(parts[i]) + 1)
+        if len(grown) <= len(parts[i]) or i == 0:
+            parts[i] = grown.zfill(len(parts[i]))
+            return ".".join(parts)
+        parts[i] = "0" * len(parts[i])
+    raise RuntimeError(f'cannot bump the version "{version}": no trailing number')
+
+
+def _next_air_filtration_version(profiles_dir):
+    """(old, new) for <vendor>.json's version, computed and validated up front.
+
+    The caller settles this before it writes anything: a version that cannot be
+    bumped has to leave the machines alone, because machines changed under an
+    unchanged version is the one state the .opc cache cannot survive.
+    """
+    path = os.path.join(str(profiles_dir), AIR_FILTRATION_VENDOR + ".json")
+    rel = _rel(path, profiles_dir)
+    with open(path, "rb") as f:
+        data = json.loads(f.read().decode("utf-8-sig"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{rel}: not a JSON object")
+    old = data.get("version")
+    if not old:
+        raise RuntimeError(f"{rel} has no version to bump")
+    return old, _bumped_version(old)
+
+
+def _write_air_filtration_version(profiles_dir, bump, dry_run):
+    """Write the version pass above computed; returns 1 on error, else 0."""
+    old, new = bump
+    path = os.path.join(str(profiles_dir), AIR_FILTRATION_VENDOR + ".json")
+    rel = _rel(path, profiles_dir)
+    try:
+        data = _edit_profile(
+            path, lambda text: replace_key_value(text, "version", new, old_value=old),
+            dry_run, "version bump")
+    except (OSError, RuntimeError, ValueError) as e:
+        print_error(f"{rel}: {e}")
+        return 1
+    if not isinstance(data, dict) or data.get("version") != new:
+        print_error(f"{rel}: the version bump did not take effect")
+        return 1
+    print_info(f"{'would ' if dry_run else ''}bump {rel} version {old} -> {new}")
+    return 0
+
+
+_MISSING = object()  # a key the file does not carry at all (a JSON null is a value)
+
+
+def _air_filtration_value(path, rel):
+    """(value, errors) for one machine's key: _MISSING when the key is absent.
+
+    A sentinel rather than None, because the key's JSON value can be null: only
+    an absent key may be inserted, and a null one is "present with the wrong
+    value" -- inserting over it would leave the file with two copies of the key.
+    Duplicate keys are rejected outright, so the answer describes one key. Returns
+    (value, errors).
+    """
+    try:
+        data = load_json(path, detect_duplicates=True)
+    except FileNotFoundError:
+        print_error(f"{rel}: no such file")
+        return _MISSING, 1
+    except (OSError, ValueError) as e:
+        print_error(f"{rel}: cannot be read: {e}")
+        return _MISSING, 1
+    if not isinstance(data, dict):
+        print_error(f"{rel}: not a JSON object")
+        return _MISSING, 1
+    return (data[AIR_FILTRATION_KEY] if AIR_FILTRATION_KEY in data else _MISSING), 0
+
+
+def check_air_filtration(profiles_dir=PROFILES_DIR, vendors=None):
+    """Report every protected BBL machine that does not declare the key as "1".
+
+    One line per offending file, naming it, and the error count main turns into
+    the exit code -- so a CI run over a tree an upstream sync stripped fails with
+    the file names in the log. Returns the number of errors.
+    """
+    if not _air_filtration_in_scope(vendors):
+        return 0
+    errors = 0
+    for path, rel in _air_filtration_paths(profiles_dir):
+        value, read_errors = _air_filtration_value(path, rel)
+        errors += read_errors
+        if read_errors:
+            continue
+        if value is _MISSING:
+            print_error(f"{rel}: missing {AIR_FILTRATION_KEY}")
+            errors += 1
+        elif value != "1":
+            print_error(f"{rel}: {AIR_FILTRATION_KEY} is "
+                        f'{json.dumps(value, ensure_ascii=False)}, not "1"')
+            errors += 1
+    if errors:
+        print_warning(f"each file above lost {AIR_FILTRATION_KEY}, which is what the "
+                      "machine's air-filtration setting and M106 P3 read: run "
+                      '"python scripts/orca_profile_tool.py fix-air-filtration" and '
+                      "commit the result")
+        return errors
+    print_success(f"all {len(AIR_FILTRATION_MACHINES)} {AIR_FILTRATION_VENDOR} machines "
+                  f'declare {AIR_FILTRATION_KEY}: "1"')
+    return 0
+
+
+def fix_air_filtration(profiles_dir=PROFILES_DIR, vendors=None, dry_run=False):
+    """Write the missing `"support_air_filtration": "1"` line into each protected
+    BBL machine, and bump BBL.json's version for it.
+
+    Minimal and idempotent: only that one line goes in, in the file's own
+    indentation, line ending and key order -- never a normalize, which reserialises
+    the whole file -- and a file that already declares the key is not written at
+    all, so a second run leaves the tree byte-identical and bumps nothing. A key
+    that is present with another value is reported instead of duplicated. Returns
+    (files changed, errors).
+    """
+    if not _air_filtration_in_scope(vendors):
+        return 0, 0
+    verb = "would " if dry_run else ""
+    todo, errors = [], 0
+    for path, rel in _air_filtration_paths(profiles_dir):
+        value, read_errors = _air_filtration_value(path, rel)
+        errors += read_errors
+        if read_errors or value == "1":
+            continue
+        if value is not _MISSING:
+            print_error(f"{rel}: {AIR_FILTRATION_KEY} is "
+                        f'{json.dumps(value, ensure_ascii=False)}, not "1"; this only '
+                        "inserts a missing key")
+            errors += 1
+            continue
+        todo.append((path, rel))
+
+    if not todo:
+        if not errors:
+            print_success(f"the {AIR_FILTRATION_VENDOR} machines already declare "
+                          f'{AIR_FILTRATION_KEY}: "1"; nothing to write')
+        return 0, errors
+
+    # The version is settled, and raised, before the first machine write. A version
+    # that cannot be read or grown therefore changes nothing at all, and the reverse
+    # order -- machines written, then the version write failing on its own -- would
+    # leave content changed under the old version, which is the one state this
+    # command exists to prevent: .opc caches keyed on it keep serving the old copy
+    # and check-air-filtration is still green. A bump over unchanged content is the
+    # harmless direction: the cache rebuilds once.
+    try:
+        bump = _next_air_filtration_version(profiles_dir)
+    except (OSError, RuntimeError, ValueError) as e:
+        print_error(f"{e}; nothing written")
+        return 0, errors + 1
+    if _write_air_filtration_version(profiles_dir, bump, dry_run):
+        # Nothing else has been written yet, so the tree is untouched.
+        return 0, errors + 1
+
+    changed = 0
+    for path, rel in todo:
+        try:
+            data = _edit_profile(
+                path,
+                lambda text: insert_key_line(text, AIR_FILTRATION_KEY, "1",
+                                             before=AIR_FILTRATION_BEFORE,
+                                             after=AIR_FILTRATION_AFTER),
+                dry_run, f"{AIR_FILTRATION_KEY} insert")
+        except (OSError, RuntimeError, ValueError) as e:
+            print_error(f"{rel}: {e}")
+            errors += 1
+            continue
+        if not isinstance(data, dict) or data.get(AIR_FILTRATION_KEY) != "1":
+            print_error(f"{rel}: the {AIR_FILTRATION_KEY} insert did not take effect")
+            errors += 1
+            continue
+        print_info(f'{verb}add "{AIR_FILTRATION_KEY}": "1" to {rel}')
+        changed += 1
+    return changed, errors
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -3083,6 +3341,11 @@ examples:
   orca_profile_tool.py check --vendor Creality
       the per-vendor checks for one bundle; setting_id and filament_id are
       cross-vendor properties, so those two always cover the whole tree
+  orca_profile_tool.py check-air-filtration
+      the BBL machines that must declare support_air_filtration; a nonzero exit
+      names the file(s) a BBL folder sync dropped it from
+  orca_profile_tool.py fix-air-filtration --dry-run
+      preview writing that key back, and the BBL.json version bump it implies
   orca_profile_tool.py generate-id
       give every profile the id its identity mints, in every vendor bundle
   orca_profile_tool.py generate-id --dry-run
@@ -3159,6 +3422,37 @@ def build_parser():
         "--vendor narrows the per-vendor checks only: setting_id uniqueness and the\n"
         "filament_id state are cross-vendor properties a narrowed run cannot answer,\n"
         "so they always cover the whole tree.")
+
+    add(
+        "check-air-filtration", [vendor_opt, profiles_opt],
+        "check the BBL machines that must declare support_air_filtration",
+        "Report every protected BBL machine preset that does not declare\n"
+        '"support_air_filtration": "1", one line per file, naming it. Exits nonzero\n'
+        "on any of them, so CI can gate on it.\n"
+        "\n"
+        "Upstream re-exports resources/profiles/BBL/ wholesale from Bambu Studio's\n"
+        "own folder every so often, and the copy that lands carries the key on\n"
+        "fdm_machine_common.json (\"0\", the base every BBL machine inherits) and on\n"
+        "Bambu Lab X1E (\"1\") and on no other machine preset. The nine machines below\n"
+        "declare \"1\" over that base as this fork's own deviation, so a sync strips\n"
+        "every one of them and loses the printer's air-filtration setting without\n"
+        "failing anything else in the tree. Run fix-air-filtration to repair such a\n"
+        "sync before committing it.")
+
+    add(
+        "fix-air-filtration", [vendor_opt, dry_run_opt, profiles_opt],
+        "write support_air_filtration back into the BBL machines a sync dropped it from",
+        'Insert "support_air_filtration": "1" into each protected BBL machine that\n'
+        "lacks it, in that file's own indentation, line ending and key order: one\n"
+        "line, never a normalize, which reserialises the whole file. A file already\n"
+        "declaring the key is not written at all, so a second run changes nothing.\n"
+        "\n"
+        "BBL.json's version has its last segment raised first, before the machines,\n"
+        "because a vendor's .opc cache is keyed on that version\n"
+        "(docs/HLSD/preset-cache.md): content that changes without a bump keeps being\n"
+        "served from the cached copy beside it, so the repair would never reach the\n"
+        "printer list. Raising it first means a version that cannot be written stops\n"
+        "the run before anything else changes.")
 
     add("fix-variant", [vendor_opt, strict_opt, dry_run_opt, profiles_opt],
         "resize the variant arrays check rejects",
@@ -3254,6 +3548,13 @@ def main(argv=None):
 
     if args.command == "check":
         errors = check_profiles(profiles_dir, vendors, strict=args.strict)
+        return 1 if errors else 0
+
+    if args.command == "check-air-filtration":
+        return 1 if check_air_filtration(profiles_dir, vendors) else 0
+
+    if args.command == "fix-air-filtration":
+        _changed, errors = fix_air_filtration(profiles_dir, vendors, dry_run=args.dry_run)
         return 1 if errors else 0
 
     if args.command == "generate-id":
