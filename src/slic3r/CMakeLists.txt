@@ -289,6 +289,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/FilamentMapDialog.hpp
     GUI/IconManager.cpp
     GUI/IconManager.hpp
+    GUI/IMEXFilamentPickerPopover.cpp
+    GUI/IMEXFilamentPickerPopover.hpp
+    GUI/IMEXModesCtrl.cpp
+    GUI/IMEXModesCtrl.hpp
     GUI/IdleScheduler.cpp
     GUI/IdleScheduler.hpp
     GUI/ImageGrid.cpp
@@ -418,8 +422,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/MultiSendMachineModel.hpp
     GUI/MultiTaskManagerPage.cpp
     GUI/MultiTaskManagerPage.hpp
-    GUI/MultiTaskModel.cpp
-    GUI/MultiTaskModel.hpp
     GUI/NetworkTestDialog.cpp
     GUI/NetworkTestDialog.hpp
     GUI/Notebook.cpp
@@ -573,8 +575,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/UserNotification.hpp
     GUI/UVEditorCanvas.cpp
     GUI/UVEditorCanvas.hpp
-    GUI/WebDownPluginDlg.cpp
-    GUI/WebDownPluginDlg.hpp
     GUI/WebGuideDialog.cpp
     GUI/WebGuideDialog.hpp
     GUI/WebUserLoginDialog.cpp
@@ -806,7 +806,6 @@ set(SLIC3R_GUI_SOURCES
     Utils/PrintHost.hpp
     Utils/Process.cpp
     Utils/Process.hpp
-    Utils/Profile.hpp
     Utils/RaycastManager.cpp
     Utils/RaycastManager.hpp
     Utils/Repetier.cpp
