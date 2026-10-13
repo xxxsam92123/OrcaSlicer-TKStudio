@@ -40,10 +40,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      # Deliberately not continue-on-error, unlike every check below: if the tool itself is
-      # broken, nothing it then reports about the profiles is worth reading.
+      # Deliberately not continue-on-error, like the air-filtration guard below and
+      # unlike the validator checks: if the tool itself is broken, nothing it then
+      # reports about the profiles is worth reading.
       - name: Run the profile tool's own unit tests
         run: python3 -m unittest discover -s scripts/tests -t scripts
+
+      # Upstream re-exports resources/profiles/BBL/ wholesale from Bambu Studio's own
+      # folder every so often, and the copy that lands carries support_air_filtration on
+      # fdm_machine_common.json ("0", the base every BBL machine inherits) and on
+      # Bambu Lab X1E 0.4 nozzle.json ("1") and on no other machine preset. Nine other
+      # BBL machines declare "1" over that base as this fork's own deviation, so a sync
+      # strips every one of them, which silently takes the printer's air-filtration
+      # setting (and the chamber fan's M106 P3) away. No other check in this workflow
+      # fails when it does, so without this gate the loss ships.
+      # Deliberately not continue-on-error, and deliberately before the download below:
+      # it is a cheap structural check, and a sync that trips it should say so in
+      # seconds, not after the validators have run. Red here means run
+      # "python scripts/orca_profile_tool.py fix-air-filtration" and commit the result.
+      - name: Check BBL air-filtration capability
+        id: air_filtration_guard
+        run: python3 ./scripts/orca_profile_tool.py check-air-filtration
 
       # What the validator below cannot see. It loads the tree the way the slicer does, so
       # it never notices a profile no <vendor>.json indexes, a preset name two files claim,
@@ -283,7 +300,7 @@ jobs:
           retention-days: 1
 
       - name: Fail if any check failed
-        if: ${{ always() && (steps.profile_tool.outcome == 'failure' || steps.validate_system.outcome == 'failure' || steps.validate_slice.outcome == 'failure' || steps.validate_filament_subtypes.outcome == 'failure' || steps.validate_custom.outcome == 'failure') }}
+        if: ${{ always() && (steps.air_filtration_guard.outcome == 'failure' || steps.profile_tool.outcome == 'failure' || steps.validate_system.outcome == 'failure' || steps.validate_slice.outcome == 'failure' || steps.validate_filament_subtypes.outcome == 'failure' || steps.validate_custom.outcome == 'failure') }}
         run: |
           echo "One or more profile checks failed; see the step logs above."
           echo 'Reproduce the whole run locally with scripts/check_profile.sh (scripts\check_profile.bat on Windows).'
