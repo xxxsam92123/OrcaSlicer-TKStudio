@@ -5748,6 +5748,16 @@ void SelectMachineDialog::update_material_item_pos(MachineObject* obj_)
     const bool has_switcher = obj_->GetFilaSwitch()->IsInstalled();
     const bool use_single_panel = is_single_head || has_switcher;
 
+    // Orca: reset_and_sync_ams_list() fills m_filaments_map only while the full config carries more
+    // than one nozzle, whereas the branch below follows the selected machine's extruder and switch
+    // state. A multi-nozzle machine picked on a single-nozzle config therefore reaches this map with
+    // no entry for the id (still empty, or left over from an earlier fill), so read it bounds-checked:
+    // an id without an entry keeps the panel the item is already in instead of being an out-of-bounds
+    // read of the vector.
+    auto filament_map_at = [this](int id) -> int {
+        return (id >= 0 && static_cast<size_t>(id) < m_filaments_map.size()) ? m_filaments_map[id] : 0;
+    };
+
     bool to_change_pos = false;
     for (const auto& iter : m_materialList) {
         const auto& material_id = iter.second->id;
@@ -5757,9 +5767,9 @@ void SelectMachineDialog::update_material_item_pos(MachineObject* obj_)
                 to_change_pos = true;
             }
         } else {
-            if (m_filaments_map[material_id] == 1 && !m_sizer_ams_mapping_left->IsShown(material_item)) {
+            if (filament_map_at(material_id) == 1 && !m_sizer_ams_mapping_left->IsShown(material_item)) {
                 to_change_pos = true;
-            } else if (m_filaments_map[material_id] == 2 && !m_sizer_ams_mapping_right->IsShown(material_item)) {
+            } else if (filament_map_at(material_id) == 2 && !m_sizer_ams_mapping_right->IsShown(material_item)) {
                 to_change_pos = true;
             }
         }
@@ -5788,11 +5798,11 @@ void SelectMachineDialog::update_material_item_pos(MachineObject* obj_)
                 sizer_count++;
             }
         } else {
-            if (m_filaments_map[material_id] == 1) {
+            if (filament_map_at(material_id) == 1) {
                 material_item->Reparent(m_filament_left_panel);
                 m_sizer_ams_mapping_left->Add(material_item, 0, wxALL, FromDIP(5));
                 left_sizer_count++;
-            } else if(m_filaments_map[material_id] == 2){
+            } else if(filament_map_at(material_id) == 2){
                 material_item->Reparent(m_filament_right_panel);
                 m_sizer_ams_mapping_right->Add(material_item, 0, wxALL, FromDIP(5));
                 right_sizer_count++;
