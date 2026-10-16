@@ -379,11 +379,33 @@ jobs:
     - name: Pack deps/ for the Flatpak manifest
       run: ./scripts/flatpak/make_deps_tar.sh
       shell: bash
-    - uses: flatpak/flatpak-github-actions/flatpak-builder@master
+    - name: Build the Flatpak bundle
+      id: flatpak_build
+      continue-on-error: true
+      uses: flatpak/flatpak-github-actions/flatpak-builder@master
       with:
         bundle: OrcaSlicer-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
         manifest-path: scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
         # cache only turns on flatpak-builder --ccache; the caching itself is above.
+        cache: true
+        restore-cache: false
+        save-cache: false
+        arch: ${{ matrix.variant.arch }}
+        upload-artifact: false
+        keep-build-dirs: true
+    # The module sources the manifest downloads come from third-party mirrors that
+    # occasionally answer 503 or reset the connection (gst-plugins-good is the usual
+    # victim); flatpak-builder then reports "Failed to download sources" and the job
+    # goes red although nothing in this repository is broken. Retry the build once --
+    # keep-build-dirs keeps what already unpacked in .flatpak-builder/build, so only
+    # the failed download is repeated. A real compile error fails again and still
+    # turns the job red, which is why this step does not carry continue-on-error.
+    - name: Build the Flatpak bundle (retry after a source download failure)
+      if: steps.flatpak_build.outcome == 'failure'
+      uses: flatpak/flatpak-github-actions/flatpak-builder@master
+      with:
+        bundle: OrcaSlicer-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        manifest-path: scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
         cache: true
         restore-cache: false
         save-cache: false
