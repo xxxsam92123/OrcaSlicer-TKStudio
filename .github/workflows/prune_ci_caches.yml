@@ -1,0 +1,120 @@
+name: Prune stale CI caches
+
+# The repository's cache pool is 10 GB, and the build platforms plus Flatpak each
+# keep a deps cache and a set of compiler caches in it.
+#
+# The deps caches are long-lived: their key ("*-cache-orcaslicer_deps-build-<hash>")
+# carries no run id, so a later run reuses what an earlier one built.
+#
+# Every ccache entry, by contrast, is written by one run and only ever read back by
+# that same run, because its key ends in "<run id>-<attempt>". Nothing removes them
+# once that run is over except the Flatpak job, and it only prunes its own leg.
+# They therefore accumulate until the pool is full, and GitHub then evicts by least
+# recent use -- a platform's deps cache is as likely to go as any ccache. Once it
+# does, that platform's build fails at "load cached deps" (which runs with
+# fail-on-cache-miss) although nothing in the repository is broken. macOS arm64 hit
+# exactly this on 2026-10-17: run 39035863754 failed there while every other job
+# passed, and the pool stood at 8.17 GB of 10 GB.
+#
+# This job keeps, per ccache leg, only the newest entry and deletes the rest. It
+# never touches a deps cache, the flatpak-builder cache or the get-cmake caches.
+# Deleting a compiler cache only makes the next build slower; losing a deps cache
+# makes it fail, so the two are not equivalent and the pruning is deliberately
+# one-sided.
+
+on:
+  schedule:
+    # Mondays 02:30 UTC -- before the nightly build, so the pool is tidy for it.
+    - cron: '30 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Only list what would be deleted'
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+
+concurrency:
+  group: prune-ci-caches
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Prune per-run compiler caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.error, urllib.request
+
+          api = (os.environ.get("GITHUB_API_URL", "https://api.github.com")
+                 + "/repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/caches")
+          token = os.environ["GH_TOKEN"]
+          dry = os.environ.get("DRY_RUN") == "true"
+
+          # Keys that must never be pruned: the deps caches every platform's build
+          # restores with fail-on-cache-miss, the Flatpak builder tree, and the
+          # small get-cmake blobs.
+          KEEP = ("cache-orcaslicer_deps-build-", "flatpak-builder-", "get-cmake-")
+          # "<run id>-<attempt>" at the end of a ccache key.
+          RUN_TAIL = re.compile(r"-(\d+)-(\d+)$")
+
+
+          def call(url, method="GET"):
+              req = urllib.request.Request(url, method=method, headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r) if method == "GET" else None
+
+
+          # Paginate: the pool can hold more entries than one page returns. Bounded,
+          # so a repository that keeps answering with a full page cannot spin here.
+          caches, page = [], 1
+          while page <= 10:
+              batch = call(f"{api}?per_page=100&page={page}")["actions_caches"]
+              if not batch:
+                  break
+              caches += batch
+              page += 1
+
+          print(f"{len(caches)} cache entr{'y' if len(caches) == 1 else 'ies'} in the pool")
+
+          # Group the prunable entries by the leg their key belongs to, so the newest
+          # entry per leg survives and an unrelated leg is never the comparison.
+          newest = {}
+          prunable = []
+          for c in caches:
+              key = c["key"]
+              if any(key.startswith(p) for p in KEEP):
+                  continue
+              m = RUN_TAIL.search(key)
+              if not m:
+                  # Not one of ours and not shaped like a run-scoped ccache: leave it.
+                  print(f"  keep (unrecognised shape): {key}")
+                  continue
+              leg = key[: m.start()]
+              run_id = int(m.group(1))
+              if leg not in newest or run_id > newest[leg][0]:
+                  newest[leg] = (run_id, key, c["id"])
+              prunable.append((leg, run_id, key, c["id"]))
+
+          doomed = [p for p in prunable if p[3] != newest[p[0]][2]]
+          freed = 0
+          for leg, run_id, key, cid in sorted(doomed, key=lambda x: x[0]):
+              print(f"  delete {key}")
+              if not dry:
+                  call(f"{api}/{cid}", method="DELETE")
+              freed += 1
+
+          print(f"kept {len(newest)} leg(s), {'would delete' if dry else 'deleted'} {len(doomed)} entr{'y' if len(doomed) == 1 else 'ies'}")
+          for leg, (run_id, key, _) in sorted(newest.items()):
+              print(f"  keep newest for {leg}: {key}")
+          PY
