@@ -23,6 +23,24 @@ constexpr size_t MAX_GRID_FRAGMENTS   = 32;
 constexpr double MIN_CELL_MM          = 8.;
 constexpr double MIN_SURFACE_AREA_MM2 = 100.;
 
+// Empirical budget for the area a grid partition may lose: the tolerance is the outline length
+// times this value. The cells tile the bounding box exactly, so a residual can only come from
+// the outline being re-snapped inside each cell by Clipper2's Clipper64, which rounds the
+// intersection coordinates of every cut with nearbyint() - at most half an integer unit per
+// axis. That bound is per coordinate, not on the area: the rounding has no inward bias, so a cut
+// can as well lose area as gain it (on the 39099 mm2 bridge below the individual cut losses run
+// from -69552 to +145204936 units2), and the resulting error tracks the outline length, not the
+// area. The linear relation is measured, not derived - which is why this is a budget rather than
+// a geometric upper bound, and why the check around it uses abs(). Measured on that reported
+// bridge (790 mm outline, no holes): 0.1475 units2 of residual per outline unit at the accepted
+// 8x8 grid, and 0.1700 at 7x8, the highest of the seven candidates tried for the model
+// (E:/orca/ebg-evidence/followup-diag.log). This factor of 4 therefore sits about 23.5x above
+// the worst candidate measured on it: a margin over the candidates actually measured, not a
+// guarantee for every surface. A partition above the budget is rejected and the caller tries the
+// next coarser candidate, falling back to the whole surface when they all fail, so an over-tight
+// budget costs resolution, never geometry.
+constexpr double AREA_TOLERANCE_PER_OUTLINE_UNIT = 4.;
+
 struct GridCandidate
 {
     int cells_x;
@@ -112,7 +130,12 @@ std::optional<Surfaces> split_for_grid(const Surface &surface, const BoundingBox
     double result_area = 0.;
     for (const Surface &split_surface : result)
         result_area += split_surface.area();
-    const double area_tolerance = std::max(1., std::abs(surface.area()) * 1e-9);
+    // The budget covers the whole outline - the outer contour and every hole - because every cut
+    // re-snaps whichever boundary it crosses.
+    double outline_length = surface.expolygon.contour.length();
+    for (const Polygon &hole : surface.expolygon.holes)
+        outline_length += hole.length();
+    const double area_tolerance = std::max(1., outline_length * AREA_TOLERANCE_PER_OUTLINE_UNIT);
     if (std::abs(result_area - surface.area()) > area_tolerance)
         return std::nullopt;
 
