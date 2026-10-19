@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <utility>
 
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -12,7 +13,10 @@
 #include "libslic3r/ExternalBridgeGrid.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/libslic3r.h"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Surface.hpp"
 
@@ -95,6 +99,151 @@ TEST_CASE("External bridge grid honors requested resolution", "[ExternalBridgeGr
         REQUIRE(split.size() == size_t(cells * cells));
         REQUIRE(total_area(split) == Catch::Approx(bridge.area()));
     }
+}
+
+// A CAD or mesh derived outline reaches the slicer as a quantized polyline: its vertices
+// carry a unit scale wobble that no integer clipping can reproduce exactly. Splitting such
+// an outline into grid cells therefore loses slivers far below printer resolution, which
+// must not make the splitter silently fall back to a coarser grid than the requested one.
+// The wobble alternates with the vertex index, so the fixture's vertex sequence is fixed.
+static void quantize_outline(Polygon &outline)
+{
+    for (size_t i = 0; i < outline.points.size(); ++i)
+        outline.points[i].y() += (i % 2 == 1) ? 1 : -1;
+}
+
+static ExPolygon make_quantized_bridge()
+{
+    ExPolygon bridge = make_square(64., 64.);
+    quantize_outline(bridge.contour);
+    return bridge;
+}
+
+// A quantized hole is outline as well, and the production budget counts it alongside the
+// contour, because the same cuts re-snap its boundary. Nothing here proves that term is needed:
+// see the hole-only case below, whose residual the contour length alone would already cover.
+// The outline directions are the valid ones for the non-zero fill rule the clipping uses -
+// counter-clockwise contour, clockwise hole - and the hole edges are deliberately off the 8 mm
+// grid lines, so every cut crosses them instead of running along them.
+static ExPolygon make_quantized_bridge_with_hole(bool quantize_contour)
+{
+    ExPolygon bridge = make_square(64., 64.);
+    if (quantize_contour)
+        quantize_outline(bridge.contour);
+
+    // Clockwise 25 x 26 mm hole from (13, 11) to (38, 37).
+    Polygon hole { Points {
+        Point::new_scale(13., 11.),
+        Point::new_scale(13., 37.),
+        Point::new_scale(38., 37.),
+        Point::new_scale(38., 11.)
+    } };
+    quantize_outline(hole);
+    bridge.holes.emplace_back(std::move(hole));
+    return bridge;
+}
+
+// The outline length the production budget sums: the contour plus every hole.
+static double outline_length(const ExPolygon &expolygon)
+{
+    double length = expolygon.contour.length();
+    for (const Polygon &hole : expolygon.holes)
+        length += hole.length();
+    return length;
+}
+
+// Stand-in for AREA_TOLERANCE_PER_OUTLINE_UNIT in src/libslic3r/ExternalBridgeGrid.cpp. That
+// constant is internal to its translation unit, so the tests restate its value here rather than
+// reading it, and the two have to be kept in step by hand.
+static constexpr double area_tolerance_per_outline_unit = 4.;
+
+TEST_CASE("External bridge grid keeps the requested grid on a quantized bridge outline", "[ExternalBridgeGrid]")
+{
+    Surface bridge(stBottomBridge, make_quantized_bridge());
+    bridge.bridge_angle = 0.;
+
+    const Surfaces cells = split_external_bridge_surface(bridge, ExternalBridgeGridSettings { true, 8, 8, 15. });
+    REQUIRE(cells.size() == 64);
+
+    const Polylines walls = external_bridge_grid_walls(cells);
+    REQUIRE(walls.size() == 14);
+    REQUIRE(std::count_if(walls.begin(), walls.end(), [](const Polyline &wall) {
+        return wall.points.front().x() == wall.points.back().x();
+    }) == 7);
+    REQUIRE(std::count_if(walls.begin(), walls.end(), [](const Polyline &wall) {
+        return wall.points.front().y() == wall.points.back().y();
+    }) == 7);
+
+    // The partition may lose or gain integer clipping slivers along the outline, never a cell.
+    const double residual = std::abs(total_area(cells) - bridge.area());
+    // The rule this replaced measured the residual against max(1, |area| * 1e-9), smaller than
+    // the clipping noise of a quantized outline: this fixture is already above it, so the old
+    // rule could only degrade the requested grid.
+    REQUIRE(residual > std::max(1., std::abs(bridge.area()) * 1e-9));
+    REQUIRE(residual <= outline_length(bridge.expolygon) * area_tolerance_per_outline_unit);
+    REQUIRE(residual < scale_(8.) * scale_(8.));
+}
+
+TEST_CASE("External bridge grid keeps the requested grid on a quantized bridge with a hole", "[ExternalBridgeGrid]")
+{
+    Surface bridge(stBottomBridge, make_quantized_bridge_with_hole(true));
+    bridge.bridge_angle = 0.;
+
+    REQUIRE(bridge.expolygon.contour.is_counter_clockwise());
+    REQUIRE(bridge.expolygon.holes.size() == 1);
+    REQUIRE(bridge.expolygon.holes.front().is_clockwise());
+
+    const Surfaces cells = split_external_bridge_surface(bridge, ExternalBridgeGridSettings { true, 8, 8, 15. });
+    // The four cells that lie entirely inside the hole carry no material and drop out.
+    REQUIRE(cells.size() == 60);
+    REQUIRE(external_bridge_grid_walls(cells).size() == 20);
+
+    const double residual = std::abs(total_area(cells) - bridge.area());
+    REQUIRE(residual > std::max(1., std::abs(bridge.area()) * 1e-9));
+    REQUIRE(residual <= outline_length(bridge.expolygon) * area_tolerance_per_outline_unit);
+    REQUIRE(residual < scale_(8.) * scale_(8.));
+}
+
+TEST_CASE("External bridge grid keeps the requested grid when only the hole outline is quantized", "[ExternalBridgeGrid]")
+{
+    // The same hole under an exact outer contour, so the hole boundary is the only quantized
+    // outline. This covers that the request still holds and that the residual stays inside the
+    // budget; it does not pin the hole term down. The residual here is 3500000 units2, about
+    // 290x below the 1024000000 units2 the contour length alone would allow (256e6 units of
+    // contour * 4), so the fixture is accepted with or without the hole length in the sum and
+    // would keep passing if that term were removed. Making the hole term load-bearing needs a
+    // fixture whose residual has to exceed the contour-only budget, which this is not.
+    //
+    // This case also leaves out the rule the change replaced, residual > max(1, |area| * 1e-9):
+    // here the residual is 3500000 units2 against that rule's 3446000 units2 bound, a margin of
+    // only ~1.6%, which one integer unit of difference in a single clipping intersection is
+    // enough to flip. A guard that shallow would only fire while the fixture and the clipping
+    // path are both byte-identical, so it is not asserted as a regression. The old rule still
+    // degrades this fixture to 52 cells instead of 60, which is what the cells.size() assertion
+    // below holds; the two other quantized fixtures keep the replaced rule in full and clear its
+    // bound by ~5.9x and ~8.0x, and they are the ones that show the old rule failing. The
+    // remaining assertions here are the new budget and the one-cell bound.
+    Surface bridge(stBottomBridge, make_quantized_bridge_with_hole(false));
+    bridge.bridge_angle = 0.;
+
+    const Surfaces cells = split_external_bridge_surface(bridge, ExternalBridgeGridSettings { true, 8, 8, 15. });
+    REQUIRE(cells.size() == 60);
+
+    const double residual = std::abs(total_area(cells) - bridge.area());
+    REQUIRE(residual <= outline_length(bridge.expolygon) * area_tolerance_per_outline_unit);
+    REQUIRE(residual < scale_(8.) * scale_(8.));
+}
+
+TEST_CASE("External bridge grid still caps the grid at the cells the bridge can hold", "[ExternalBridgeGrid]")
+{
+    // A 64 x 40 mm bridge cannot hold eight rows of the 8 mm minimum cell, so the request
+    // is capped at 8 x 5 rather than split into cells below the minimum size.
+    Surface bridge(stBottomBridge, make_square(64., 40.));
+    bridge.bridge_angle = 0.;
+
+    const Surfaces cells = split_external_bridge_surface(bridge, ExternalBridgeGridSettings { true, 8, 8, 15. });
+    REQUIRE(cells.size() == 40);
+    REQUIRE(external_bridge_grid_walls(cells).size() == 11);
 }
 
 TEST_CASE("External bridge grid configuration allows 32 cells per axis", "[ExternalBridgeGrid]")
