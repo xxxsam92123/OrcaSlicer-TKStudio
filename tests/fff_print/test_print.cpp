@@ -53,6 +53,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <cstdlib>
 #include <sstream>
+#include <initializer_list>
 #include <limits>
 #include <fstream>
 #include <iterator>
@@ -1839,4 +1840,96 @@ TEST_CASE("Height ranges and modifiers count for the filament shrinkage compensa
         return w.string.find("Filament shrinkage will not be used") != std::string::npos;
     });
     CHECK(mismatch_warning == ! object_on_filament_2);
+}
+
+// ---------------------------------------------------------------------------
+// Prime tower and height range modifiers
+// ---------------------------------------------------------------------------
+namespace {
+
+// Add one 20 x 20 x `height` cube per entry of `heights`, 60mm apart along X. Returns the objects so
+// the caller can attach height ranges before apply().
+std::vector<ModelObject*> add_cubes_of_heights(Model& model, std::initializer_list<double> heights)
+{
+    std::vector<ModelObject*> objects;
+    for (double height : heights) {
+        ModelObject* object = model.add_object();
+        object->add_volume(make_cube(20., 20., height));
+        object->add_instance()->set_offset(Vec3d(double(objects.size()) * 60., 0., 0.));
+        objects.push_back(object);
+    }
+    return objects;
+}
+
+// Give `object` a 0-2mm height range carrying `layer_height`, the way a height range modifier does.
+void add_height_range(ModelObject& object, double layer_height)
+{
+    DynamicPrintConfig range;
+    range.set_key_value("extruder", new ConfigOptionInt(2)); // a range that only switches filament
+    // Every height range must carry a layer_height (see layer_height_profile_from_ranges).
+    range.set_key_value("layer_height", new ConfigOptionFloat(layer_height));
+    object.layer_config_ranges[{ 0., 2. }].assign_config(std::move(range));
+}
+
+} // namespace
+
+// A height range counts as custom layering whether or not it changes the layer height, so a range that
+// only switches filament still sends validate() through the prime tower synchronization check. That check
+// has to compare the layers the objects actually print; a raw profile carries each object's top Z as its
+// last breakpoint, so comparing those rejects two objects of different heights even when every layer
+// lines up.
+TEST_CASE("A height range that keeps the global layer height does not trigger the prime tower layering error", "[Print][validate][PrimeTowerLayering]")
+{
+    DynamicPrintConfig config = multifilament_config(2, {
+        { "layer_height",               0.2 },
+        { "initial_layer_print_height", 0.2 },
+        { "enable_prime_tower",         true },
+        { "wipe_tower_x",               50. }, // inside the 200x200 test bed, unlike the default y of 220
+        { "wipe_tower_y",               50. },
+        { "use_relative_e_distances",   true }, // the wipe tower is only supported with relative E
+        { "layer_change_gcode",         "G92 E0\n" }, // validate() relative-E reset
+    });
+
+    // Two objects of different heights: the profiles end at different top Z values, so an element-wise
+    // profile comparison fails on them even when both print the same layer heights.
+    Model model;
+    const std::vector<ModelObject*> objects = add_cubes_of_heights(model, { 20., 12. });
+
+    Print print;
+    const auto validate_print = [&]() {
+        for (ModelObject* object : model.objects)
+            object->ensure_on_bed();
+        print.apply(model, config);
+        // The prime tower layering check only runs for a configuration that reports a tower; assert it so
+        // this test cannot pass by skipping that branch.
+        REQUIRE(print.has_wipe_tower());
+        return print.validate();
+    };
+
+    SECTION("the range keeps the global layer height") {
+        add_height_range(*objects[1], 0.2);
+        // The range alone is what sends validate() into the block under test.
+        REQUIRE(objects[1]->has_custom_layering());
+        const StringObjectException err = validate_print();
+        INFO(err.string);
+        CHECK(err.string.empty());
+    }
+
+    SECTION("the range really changes the layer height") {
+        add_height_range(*objects[1], 0.1);
+        const StringObjectException err = validate_print();
+        // Genuinely unsynchronised layers must still be rejected.
+        REQUIRE(! err.string.empty());
+        CHECK(err.string.find("same variable layer height") != std::string::npos);
+    }
+
+    SECTION("neither object has a height range") {
+        // A per-object filament switch makes the plate use both filaments: Print::apply() turns
+        // enable_prime_tower off when only one filament ends up used, and then there is no tower to
+        // check at all.
+        objects[1]->config.set_key_value("extruder", new ConfigOptionInt(2));
+        const StringObjectException err = validate_print();
+        INFO(err.string);
+        CHECK(err.string.empty());
+    }
 }
