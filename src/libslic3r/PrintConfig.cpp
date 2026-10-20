@@ -2758,7 +2758,7 @@ void PrintConfigDef::init_fff_params()
     def = this->add("internal_solid_grid_angle_step", coFloat);
     def->label = L("Internal solid grid angle step");
     def->category = L("Strength");
-    def->tooltip = L("Alternating angle offset applied to adjacent internal solid grid cells.");
+    def->tooltip = L("Angle offset added once per grid cell along each axis: neighbouring cells differ by one step and the sequence wraps every 180 degrees. 0 keeps every cell at the same angle.");
     def->sidetext = u8"\u00b0";
     def->min = 0;
     def->max = 45;
