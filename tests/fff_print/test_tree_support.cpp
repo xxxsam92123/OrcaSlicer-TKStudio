@@ -237,9 +237,10 @@ TEST_CASE("Support layer grid resolves Z and gap layers on a grid with mixed lay
     double               bottom = 0.;
     for (const double h : heights) {
         TreeSupportLayerGrid::Entry entry;
-        entry.bottom_z = bottom;
-        entry.print_z  = bottom + h;
-        entry.height   = h;
+        entry.bottom_z     = bottom;
+        entry.obj_bottom_z = bottom; // build_layer_grid() starts the object's material at the layer bottom
+        entry.print_z      = bottom + h;
+        entry.height       = h;
         bottom         = entry.print_z;
         grid.entries.emplace_back(entry);
     }
@@ -285,6 +286,24 @@ TEST_CASE("Support layer grid resolves Z and gap layers on a grid with mixed lay
         CHECK(grid.layers_fitting(0.5) == 2);
         CHECK(grid.layers_covering(0.5) == 3);
         CHECK(grid.layers_rounding(0.5) == 2);
+    }
+
+    SECTION("The object material start of a layer only moves up, to the overhang face") {
+        // Grid tops 0.2 .. 1.6, every layer starts at its own bottom.
+        CHECK_THAT(grid.obj_bottom_z(4), Catch::Matchers::WithinAbs(1.2, 1e-9));
+        // The slice of layer 5 reaches into an overhang whose face is at 1.5, inside layer 4: the
+        // object inside layer 5 only starts there, so the clearance of the contact layer below has to
+        // be measured against 1.5 instead of against the layer bottom 1.4.
+        grid.set_obj_bottom_z(5, 1.5);
+        CHECK_THAT(grid.obj_bottom_z(5), Catch::Matchers::WithinAbs(1.5, 1e-9));
+        // Never downwards: a face measured below the layer bottom leaves the layer as it was.
+        grid.set_obj_bottom_z(5, 1.1);
+        CHECK_THAT(grid.obj_bottom_z(5), Catch::Matchers::WithinAbs(1.5, 1e-9));
+        // Out of range indices are ignored instead of growing the grid.
+        grid.set_obj_bottom_z(LayerIndex(grid.size()), 9.);
+        grid.set_obj_bottom_z(-1, 9.);
+        CHECK(grid.size() == 6);
+        CHECK_THAT(grid.obj_bottom_z(5), Catch::Matchers::WithinAbs(1.5, 1e-9));
     }
 }
 
