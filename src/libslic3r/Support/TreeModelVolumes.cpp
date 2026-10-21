@@ -513,12 +513,12 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                 max_layers_below = 0;
                 for (LayerIndex layer_idx = 0; layer_idx < LayerIndex(outlines.size()); ++ layer_idx) {
                     const double z = grid.z(layer_idx);
-                    // A layer above counts while its own bottom is still less than the clearance away.
-                    // The bottom comes from the entry itself: lowering the top of a gap layer moves the
-                    // upper entry's tiled bottom with it, which would pull the overhang layer into the
-                    // range and leave no room for the contact tips.
+                    // A layer above counts while the object inside it is still less than the clearance
+                    // away. The object's own bottom is used, not the tiled one: lowering a contact layer
+                    // pulls the tiled bottom of the layer above down with it, which would drag the
+                    // overhang layer into the clearance range and leave no room for the contact tips.
                     while (layer_idx + num_layers_above[layer_idx] + 1 < LayerIndex(outlines.size()) &&
-                           grid.bottom_z(layer_idx + num_layers_above[layer_idx] + 1) < z + top_distance - EPSILON)
+                           grid.obj_bottom_z(layer_idx + num_layers_above[layer_idx] + 1) < z + top_distance - EPSILON)
                         ++ num_layers_above[layer_idx];
                     // A layer below counts while its top is still less than the clearance away.
                     while (layer_idx - num_layers_below[layer_idx] - 1 >= 0 &&

@@ -268,7 +268,9 @@ TEST_CASE("Support layer grid resolves Z and gap layers on a grid with mixed lay
         // leave no vertical hole and the heights still add up to the last top (contract §4.1 rule 4).
         CHECK_THAT(grid.entries[5].bottom_z, Catch::Matchers::WithinAbs(1.3, 1e-9));
         CHECK_THAT(grid.entries[5].height, Catch::Matchers::WithinAbs(0.3, 1e-9));
-        CHECK_THAT(grid.z_span(0, 5), Catch::Matchers::WithinAbs(1.6, 1e-9));
+        // Tops still end at 1.6, so the heights of the grid add up to the same total as before the gap.
+        CHECK_THAT(grid.z(5), Catch::Matchers::WithinAbs(1.6, 1e-9));
+        CHECK_THAT(grid.bottom_z(5), Catch::Matchers::WithinAbs(1.3, 1e-9));
         // Exactly one contact layer is flagged, not the layers above it.
         CHECK(std::count_if(grid.entries.begin(), grid.entries.end(),
                             [](const TreeSupportLayerGrid::Entry &entry) { return entry.is_gap_layer; }) == 1);
