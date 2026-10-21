@@ -42,6 +42,114 @@ namespace TreeSupport3D
 {
 using LayerIndex = int;
 
+// A support layer thinner than this is never emitted: the contact layer falls back to the layer
+// below instead, which only makes the gap larger than requested (the safe direction). Mirrors the
+// slicer's own floor for object layers (MIN_LAYER_HEIGHT in Slicing.cpp).
+static constexpr double MIN_SUPPORT_LAYER_HEIGHT = 0.01;
+
+/*!
+ * \brief Z of every support layer, one entry per layer index.
+ *
+ * The organic generator used to derive every layer Z from a single layer height
+ * (SlicingParameters::layer_height), which is only correct while the object is sliced with a
+ * uniform layer height and the top / bottom gap is a multiple of it. Both assumptions break with
+ * custom (variable) layer heights and with a gap the user did not round to the layer height. The
+ * real object layers are the authority here, and one support layer per object layer keeps the layer
+ * index space (and with it TreeModelVolumes' outline lookup at index num_raft_layers + object layer)
+ * exactly as it was.
+ *
+ * A layer may additionally have its top lowered: the top contact layer of an overhang is placed
+ * exactly `support_top_z_distance` below the overhang instead of on the object layer Z, which makes
+ * that layer thinner than the object's. Such a layer is marked as a gap layer.
+ */
+struct TreeSupportLayerGrid
+{
+    struct Entry
+    {
+        // Z of the top of the layer.
+        double     print_z  { 0. };
+        // Z of the bottom of the layer, equals the print_z of the layer below (0 for the first one).
+        double     bottom_z { 0. };
+        // print_z - bottom_z. Lowering the top of a layer shrinks it.
+        double     height   { 0. };
+        // Object layer this support layer belongs to, -1 for the raft layers below the object.
+        LayerIndex obj_layer_idx { -1 };
+        // The top was lowered to satisfy an exact "overhang - support_top_z_distance" Z gap.
+        bool       is_gap_layer { false };
+    };
+
+    std::vector<Entry> entries;
+    size_t             raft_layers { 0 };
+
+    bool   empty() const { return entries.empty(); }
+    size_t size()  const { return entries.size(); }
+
+    // Top Z of the layer. Extrapolates with the height of the last layer beyond the grid, which the
+    // callers use for layers above the highest support layer.
+    double z(LayerIndex layer_idx) const
+    {
+        if (entries.empty())
+            return 0.;
+        if (layer_idx < 0)
+            return entries.front().bottom_z;
+        if (layer_idx >= LayerIndex(entries.size())) {
+            const Entry &last = entries.back();
+            return last.print_z + double(layer_idx - LayerIndex(entries.size()) + 1) * last.height;
+        }
+        return entries[layer_idx].print_z;
+    }
+
+    double h(LayerIndex layer_idx) const
+    {
+        if (entries.empty())
+            return 0.;
+        if (layer_idx < 0)
+            return entries.front().height;
+        if (layer_idx >= LayerIndex(entries.size()))
+            return entries.back().height;
+        return entries[layer_idx].height;
+    }
+
+    double bottom_z(LayerIndex layer_idx) const { return z(layer_idx) - h(layer_idx); }
+
+    // Vertical distance between the tops of two layers. The layers tile the Z axis, so this is the
+    // sum of the layer heights in between.
+    double z_span(LayerIndex from, LayerIndex to) const { return z(to) - z(from); }
+
+    // Lowest layer whose top reaches z, i.e. the layer that would have to be lowered to end at z.
+    LayerIndex idx_ceil(double z_req) const
+    {
+        const auto it = std::lower_bound(entries.begin(), entries.end(), z_req - EPSILON,
+            [](const Entry &entry, double z) { return entry.print_z < z; });
+        return LayerIndex(it - entries.begin());
+    }
+
+    // Highest layer whose top does not exceed z.
+    LayerIndex idx_floor(double z_req) const
+    {
+        const auto it = std::upper_bound(entries.begin(), entries.end(), z_req + EPSILON,
+            [](double z, const Entry &entry) { return z < entry.print_z; });
+        return std::max<LayerIndex>(0, LayerIndex(it - entries.begin()) - 1);
+    }
+
+    // Lower the top of `layer_idx` to `print_z_req`. Returns false when that would leave no layer
+    // below the new top (the requested gap is thinner than MIN_SUPPORT_LAYER_HEIGHT).
+    bool lower_top(LayerIndex layer_idx, double print_z_req)
+    {
+        if (layer_idx < 0 || layer_idx >= LayerIndex(entries.size()))
+            return false;
+        Entry &entry = entries[layer_idx];
+        if (print_z_req >= entry.print_z - EPSILON)
+            return true; // Already at or below the requested Z, nothing to do.
+        if (print_z_req <= entry.bottom_z + MIN_SUPPORT_LAYER_HEIGHT)
+            return false;
+        entry.print_z      = print_z_req;
+        entry.height       = entry.print_z - entry.bottom_z;
+        entry.is_gap_layer = true;
+        return true;
+    }
+};
+
 enum class InterfacePreference
 {
     InterfaceAreaOverwritesSupport,
@@ -89,8 +197,12 @@ struct TreeSupportMeshGroupSettings {
         this->support_xy_distance_1st_layer = scaled<coord_t>(config.support_object_first_layer_gap.value);
         // Separation of interfaces, it is likely smaller than support_xy_distance.
         this->support_xy_distance_overhang = std::min(this->support_xy_distance, scaled<coord_t>(0.5 * external_perimeter_width));
-        this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
-        this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
+        // Organic tree support places its contact layers from these distances directly, so take the
+        // raw values. SlicingParameters::gap_support_object / gap_object_support have already been
+        // rounded to a multiple of the layer height for the layer-synchronised generators, which is
+        // exactly the quantization the organic generator must not inherit.
+        this->support_top_distance      = scaled<coord_t>(config.support_top_z_distance.value);
+        this->support_bottom_distance   = scaled<coord_t>(config.support_bottom_z_distance.value);
         this->support_roof_enable       = config.support_interface_top_layers.value > 0;
         this->support_roof_layers       = config.support_interface_top_layers.value;
         this->support_floor_enable      = bottom_interface_layers > 0;
@@ -108,6 +220,61 @@ struct TreeSupportMeshGroupSettings {
         this->support_tree_top_rate       = config.tree_support_top_rate.value; // percent
     //    this->support_tree_tip_diameter = this->support_line_width;
         this->support_tree_tip_diameter = std::clamp(scaled<coord_t>(config.tree_support_tip_diameter.value), (coord_t)0, this->support_tree_branch_diameter);
+
+        this->build_layer_grid(print_object);
+    }
+
+    // Fill layer_grid with the raft layers followed by the object layers as they were sliced, so that
+    // every layer index keeps resolving to the object layer it is generated for. The belt Z offset is
+    // removed because the organic generator works in the object's local frame.
+    void build_layer_grid(const PrintObject &print_object)
+    {
+        const SlicingParameters &slicing_params = print_object.slicing_parameters();
+        const double             z_offset       = print_object.belt_global_z_offset();
+
+        layer_grid.entries.clear();
+        layer_grid.entries.reserve(slicing_params.raft_layers() + print_object.layer_count());
+
+        if (slicing_params.raft_layers() > 0) {
+            // Same layer Zs as the raft generator produces: first layer, base, interface, contact and
+            // the fill layers between the contact layer and the object.
+            double z = slicing_params.first_print_layer_height;
+            auto   add_raft_layer = [this](double print_z) {
+                TreeSupportLayerGrid::Entry entry;
+                entry.print_z  = print_z;
+                entry.bottom_z = layer_grid.entries.empty() ? 0. : layer_grid.entries.back().print_z;
+                entry.height   = entry.print_z - entry.bottom_z;
+                layer_grid.entries.emplace_back(entry);
+            };
+            add_raft_layer(z);
+            for (size_t i = 1; i < slicing_params.base_raft_layers; ++ i)
+                add_raft_layer(z += slicing_params.base_raft_layer_height);
+            for (size_t i = 0; i + 1 < slicing_params.interface_raft_layers; ++ i)
+                add_raft_layer(z += slicing_params.interface_raft_layer_height);
+            if (slicing_params.raft_layers() > 1) {
+                z = slicing_params.raft_contact_top_z;
+                add_raft_layer(z);
+            }
+            if (double dist_to_go = slicing_params.object_print_z_min - z; dist_to_go > EPSILON) {
+                // Layers between the raft contacts and bottom of the object.
+                // ORCA: Bias by EPSILON so near-equal gaps do not get an extra split from FP noise.
+                auto   nsteps = int(ceil((dist_to_go - EPSILON) / slicing_params.max_suport_layer_height));
+                double step   = dist_to_go / nsteps;
+                for (int i = 0; i < nsteps; ++ i)
+                    add_raft_layer(z += step);
+            }
+        }
+        layer_grid.raft_layers = layer_grid.entries.size();
+
+        for (size_t i = 0; i < print_object.layer_count(); ++ i) {
+            const Layer &layer = *print_object.get_layer(i);
+            TreeSupportLayerGrid::Entry entry;
+            entry.print_z       = layer.print_z - z_offset;
+            entry.bottom_z      = entry.print_z - layer.height;
+            entry.height        = layer.height;
+            entry.obj_layer_idx = LayerIndex(i);
+            layer_grid.entries.emplace_back(entry);
+        }
     }
 
 /*********************************************************************/
@@ -270,6 +437,9 @@ struct TreeSupportMeshGroupSettings {
     // minimum: min_wall_line_width, minimum warning: min_wall_line_width+0.05, maximum_value: support_tree_branch_diameter, value: support_line_width
     coord_t                         support_tree_tip_diameter               { scaled<coord_t>(0.4) };
 
+    // Z of every support layer (raft layers, then the object layers). See TreeSupportLayerGrid.
+    TreeSupportLayerGrid            layer_grid;
+
     // Support Interface Priority
     // How support interface and support will interact when they overlap. Currently only implemented for support roof.
     //enum                           support_interface_priority { support_lines_overwrite_interface_area };
@@ -322,6 +492,15 @@ public:
         assert(tip_layers > 0);
     
         layer_start_bp_radius = (bp_radius - branch_radius) / bp_radius_increase_per_layer;
+
+        // The layer Zs of this group. Copied so that a contact layer may be lowered to an exact Z gap
+        // without touching the settings the volumes are built from.
+        layer_grid = mesh_group_settings.layer_grid;
+        raft_layers.clear();
+        for (size_t i = 0; i < layer_grid.raft_layers; ++ i)
+            raft_layers.emplace_back(layer_grid.entries[i].print_z);
+        has_top_gap    = mesh_group_settings.support_top_distance > EPSILON;
+        has_bottom_gap = mesh_group_settings.support_bottom_distance > EPSILON;
     
         if (TreeSupportSettings::zero_top_z_gap) {
             // safeOffsetInc can only work in steps of the size xy_min_distance in the worst case => xy_min_distance has to be a bit larger than 0 in this worst case and should be large enough for performance to not suffer extremely
@@ -337,38 +516,6 @@ public:
     //            interface_preference = InterfacePreference::SupportLinesOverwriteInterface;
         //interface_preference = InterfacePreference::SupportAreaOverwritesInterface;
         interface_preference = InterfacePreference::InterfaceAreaOverwritesSupport;
-    
-        if (slicing_params.raft_layers() > 0) {
-            // Fill in raft_layers with the heights of the layers below the first object layer.
-            // First layer
-            double z = slicing_params.first_print_layer_height;
-            this->raft_layers.emplace_back(z);
-            // Raft base layers
-            for (size_t i = 1; i < slicing_params.base_raft_layers; ++ i) {
-                z += slicing_params.base_raft_layer_height;
-                this->raft_layers.emplace_back(z);
-            }
-            // Raft interface layers
-            for (size_t i = 0; i + 1 < slicing_params.interface_raft_layers; ++ i) {
-                z += slicing_params.interface_raft_layer_height;
-                this->raft_layers.emplace_back(z);
-            }
-            // Raft contact layer
-            if (slicing_params.raft_layers() > 1) {
-                z = slicing_params.raft_contact_top_z;
-                this->raft_layers.emplace_back(z);
-            }
-            if (double dist_to_go = slicing_params.object_print_z_min - z; dist_to_go > EPSILON) {
-                // Layers between the raft contacts and bottom of the object.
-                // ORCA: Bias by EPSILON so near-equal gaps do not get an extra split from FP noise.
-                auto nsteps = int(ceil((dist_to_go - EPSILON) / slicing_params.max_suport_layer_height));
-                double step = dist_to_go / nsteps;
-                for (int i = 0; i < nsteps; ++ i) {
-                    z += step;
-                    this->raft_layers.emplace_back(z);
-                }
-            }
-        }
     }
 
     // some static variables dependent on other meshes that are not currently processed.
@@ -452,13 +599,26 @@ public:
      */
     coord_t xy_min_distance;
     /*!
-     * \brief Amount of layers distance required the top of the support to the model
+     * \brief Nominal amount of layers between the top of the support and the model.
+     *
+     * round(distance / layer height). Kept for the heuristics that only need a layer count; the
+     * geometric clearance is derived from layer_grid, which knows the real Z of every layer and
+     * therefore also holds for a varying layer height.
      */
     size_t z_distance_top_layers;
     /*!
-     * \brief Amount of layers distance required from the top of the model to the bottom of a support structure.
+     * \brief Nominal amount of layers between the top of the model and the bottom of a support structure.
      */
     size_t z_distance_bottom_layers;
+    /*!
+     * \brief Z of every support layer, plus the object layer it was generated for.
+     */
+    TreeSupportLayerGrid layer_grid;
+    /*!
+     * \brief True when a non-zero vertical gap between the object and the support has to be kept.
+     */
+    bool has_top_gap    { false };
+    bool has_bottom_gap { false };
     /*!
      * \brief User specified angles for the support infill.
      */
@@ -623,66 +783,49 @@ inline void tree_supports_show_error(std::string_view message, bool critical)
 #endif // TREE_SUPPORT_SHOW_ERRORS_WIN32
 }
 
+// Print Z of a support layer. Comes from the layer grid, which holds the real object layer Zs, so
+// a varying layer height and a contact layer lowered to an exact Z gap both resolve correctly.
+inline double layer_z(const TreeSupportSettings &config, const size_t layer_idx)
+{
+    return config.layer_grid.z(LayerIndex(layer_idx));
+}
+
+// Overload for the caller that still passes the slicing parameters (the tree skeleton preview in
+// TreeSupport.cpp, which is outside this change's scope). The grid carries the same Zs, so the
+// slicing parameters only serve as a fallback for a settings object whose grid was never built.
 inline double layer_z(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const size_t layer_idx)
 {
-    return layer_idx >= config.raft_layers.size() ? 
+    if (! config.layer_grid.empty())
+        return layer_z(config, layer_idx);
+    return layer_idx >= config.raft_layers.size() ?
         slicing_params.object_print_z_min + slicing_params.first_object_layer_height + (layer_idx - config.raft_layers.size()) * slicing_params.layer_height :
         config.raft_layers[layer_idx];
 }
 
-inline double first_object_support_layer_z(const SlicingParameters &slicing_params)
+// Lowest collision layer: the lowest layer whose top reaches z.
+inline LayerIndex layer_idx_ceil(const TreeSupportSettings &config, const double z)
 {
-    return slicing_params.object_print_z_min + slicing_params.first_object_layer_height;
+    return config.layer_grid.idx_ceil(z);
 }
 
-// Orca: Reverse layer_z() for support layers below the first object layer.
-// config.raft_layers may include raft/contact/intermediate support Zs, so do not collapse them to the first object support layer.
-// Lowest collision layer
-inline LayerIndex layer_idx_ceil(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const double z)
+// Highest collision layer: the highest layer whose top does not exceed z.
+inline LayerIndex layer_idx_floor(const TreeSupportSettings &config, const double z)
 {
-    const double first_object_z = first_object_support_layer_z(slicing_params);
-    if (!config.raft_layers.empty() && z < first_object_z - EPSILON) {
-        auto it = std::lower_bound(config.raft_layers.begin(), config.raft_layers.end(), z - EPSILON);
-        return LayerIndex(it == config.raft_layers.end() ? config.raft_layers.size() : std::distance(config.raft_layers.begin(), it));
-    }
-    return LayerIndex(config.raft_layers.size()) +
-        std::max<LayerIndex>(0, LayerIndex(std::ceil((z - first_object_z) / slicing_params.layer_height)));
-}
-// Highest collision layer
-inline LayerIndex layer_idx_floor(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const double z)
-{
-    const double first_object_z = first_object_support_layer_z(slicing_params);
-    if (!config.raft_layers.empty() && z < first_object_z - EPSILON) {
-        auto it = std::upper_bound(config.raft_layers.begin(), config.raft_layers.end(), z + EPSILON);
-        return LayerIndex(it == config.raft_layers.begin() ? 0 : std::distance(config.raft_layers.begin(), it) - 1);
-    }
-    return LayerIndex(config.raft_layers.size()) +
-        std::max<LayerIndex>(0, LayerIndex(std::floor((z - first_object_z) / slicing_params.layer_height)));
+    return config.layer_grid.idx_floor(z);
 }
 
 inline SupportGeneratorLayer& layer_initialize(
     SupportGeneratorLayer     &layer_new,
-    const SlicingParameters   &slicing_params,
     const TreeSupportSettings &config, 
     const size_t               layer_idx)
 {
-    layer_new.print_z  = layer_z(slicing_params, config, layer_idx);
-    // Layer 0 has no layer below it, so its bottom is the build plate at z = 0 --
-    // true for a flat bed, false for a belt, whose virtual support layers extend
-    // below zero. Taking 0 there made the bottom-most belt layer's height come out
-    // as its own (negative) print_z, which reached Flow::with_height() and threw
-    // FlowErrorNegativeFlow, so tree support could not slice any belt model whose
-    // branches reached down that far.
-    //
-    // Only the negative case is corrected. An earlier version used
-    // min(0, print_z - layer_height), which also fires whenever the initial layer
-    // is THINNER than the regular layer height -- e.g. 0.2 over 0.3, both
-    // independently configurable -- and silently changed flat-bed support layer
-    // heights. Keying on the sign leaves every non-negative print_z on exactly
-    // the previous value of 0.
-    layer_new.bottom_z = layer_idx > 0 ? layer_z(slicing_params, config, layer_idx - 1) : 0.;
-    if (layer_idx == 0 && layer_new.print_z < 0.)
-        layer_new.bottom_z = layer_new.print_z - slicing_params.layer_height;
+    layer_new.print_z  = layer_z(config, layer_idx);
+    // The grid carries the bottom of every layer: z = 0 for the first layer on a flat bed, and the
+    // (possibly negative) local Z below the belt for a belt printer, whose virtual support layers
+    // continue below zero. Taking 0 there made the bottom-most belt layer's height come out as its
+    // own print_z, which reached Flow::with_height() and threw FlowErrorNegativeFlow, so tree support
+    // could not slice any belt model whose branches reached down that far.
+    layer_new.bottom_z = config.layer_grid.bottom_z(LayerIndex(layer_idx));
     layer_new.height   = layer_new.print_z - layer_new.bottom_z;
     return layer_new;
 }
@@ -691,30 +834,27 @@ inline SupportGeneratorLayer& layer_initialize(
 inline SupportGeneratorLayer& layer_allocate_unguarded(
     SupportGeneratorLayerStorage      &layer_storage,
     SupporLayerType                    layer_type,
-    const SlicingParameters           &slicing_params,
     const TreeSupportSettings         &config, 
     size_t                             layer_idx)
 {
     SupportGeneratorLayer &layer = layer_storage.allocate_unguarded(layer_type);
-    return layer_initialize(layer, slicing_params, config, layer_idx);
+    return layer_initialize(layer, config, layer_idx);
 }
 
 inline SupportGeneratorLayer& layer_allocate(
     SupportGeneratorLayerStorage      &layer_storage,
     SupporLayerType                    layer_type,
-    const SlicingParameters           &slicing_params,
     const TreeSupportSettings         &config, 
     size_t                             layer_idx)
 {
     SupportGeneratorLayer &layer = layer_storage.allocate(layer_type);
-    return layer_initialize(layer, slicing_params, config, layer_idx);
+    return layer_initialize(layer, config, layer_idx);
 }
 
 // Used by generate_initial_areas() in parallel by multiple layers.
 class InterfacePlacer {
 public:
     InterfacePlacer(
-        const SlicingParameters         &slicing_parameters, 
         const SupportParameters         &support_parameters,
         const TreeSupportSettings       &config, 
         SupportGeneratorLayerStorage    &layer_storage, 
@@ -722,15 +862,14 @@ public:
         SupportGeneratorLayersPtr       &top_interfaces,
         SupportGeneratorLayersPtr       &top_base_interfaces) 
     :
-        slicing_parameters(slicing_parameters), support_parameters(support_parameters), config(config),
+        support_parameters(support_parameters), config(config),
         layer_storage(layer_storage), top_contacts(top_contacts), top_interfaces(top_interfaces), top_base_interfaces(top_base_interfaces)  
     {}
     InterfacePlacer(const InterfacePlacer& rhs) :
-        slicing_parameters(rhs.slicing_parameters), support_parameters(rhs.support_parameters), config(rhs.config),
+        support_parameters(rhs.support_parameters), config(rhs.config),
         layer_storage(rhs.layer_storage), top_contacts(rhs.top_contacts), top_interfaces(rhs.top_interfaces), top_base_interfaces(rhs.top_base_interfaces) 
     {}
 
-    const SlicingParameters    &slicing_parameters;
     const SupportParameters    &support_parameters;
     const TreeSupportSettings  &config;
     SupportGeneratorLayersPtr&  top_contacts_mutable() { return this->top_contacts; }
@@ -776,7 +915,7 @@ public:
         SupportGeneratorLayer*& l = layers[insert_layer_idx];
         if (l == nullptr)
             l = &layer_allocate_unguarded(layer_storage, dtt_roof == 0 ? SupporLayerType::TopContact : SupporLayerType::TopInterface, 
-                    slicing_parameters, config, insert_layer_idx);
+                    config, insert_layer_idx);
         // will be unioned in finalize_interface_and_support_areas()
         append(l->polygons, std::move(new_roofs));
     }

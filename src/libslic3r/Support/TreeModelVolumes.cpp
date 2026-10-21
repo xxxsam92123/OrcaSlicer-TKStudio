@@ -69,7 +69,8 @@ static Polygons calculateMachineBorderCollision(Polygon machine_border)
 TreeModelVolumes::TreeModelVolumes(
     const PrintObject &print_object,
     const BuildVolume &build_volume,
-    const coord_t max_move, const coord_t max_move_slow, size_t current_mesh_idx, 
+    const coord_t max_move, const coord_t max_move_slow, size_t current_mesh_idx,
+    const TreeSupportLayerGrid &layer_grid,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
     double progress_multiplier, double progress_offset, 
 #endif // SLIC3R_TREESUPPORTS_PROGRESS
@@ -110,6 +111,8 @@ TreeModelVolumes::TreeModelVolumes(
     {
         m_anti_overhang = print_object.slice_support_blockers();
         TreeSupportMeshGroupSettings mesh_settings(print_object);
+        // Take the grid the generator lowered the contact layers on, not the plain object layer grid.
+        mesh_settings.layer_grid = layer_grid;
         const TreeSupportSettings config{ mesh_settings, print_object.slicing_parameters() };
         m_current_min_xy_dist = config.xy_min_distance;
         m_current_min_xy_dist_delta = config.xy_distance - m_current_min_xy_dist;
@@ -494,6 +497,45 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             const coord_t       layer_height              = settings.layer_height;
             const int           z_distance_bottom_layers  = int(round(double(settings.support_bottom_distance) / double(layer_height)));
             const int           z_distance_top_layers     = int(round(double(settings.support_top_distance) / double(layer_height)));
+            // Number of layers above / below each layer whose Z range still overlaps the clearance
+            // distance. Derived from the layer grid, which holds the real layer Zs, so a varying layer
+            // height and a distance that is not a multiple of the layer height stay correct. Empty when
+            // the group carries no grid, in which case the round(distance / layer height) values above
+            // are used for every layer.
+            std::vector<int>    num_layers_above;
+            std::vector<int>    num_layers_below;
+            int                 max_layers_above          = z_distance_top_layers;
+            int                 max_layers_below          = z_distance_bottom_layers;
+            if (const TreeSupportLayerGrid &grid = settings.layer_grid; grid.size() == outlines.size()) {
+                const double top_distance    = unscale<double>(settings.support_top_distance);
+                const double bottom_distance = unscale<double>(settings.support_bottom_distance);
+                num_layers_above.assign(outlines.size(), 0);
+                num_layers_below.assign(outlines.size(), 0);
+                max_layers_above = 0;
+                max_layers_below = 0;
+                for (LayerIndex layer_idx = 0; layer_idx < LayerIndex(outlines.size()); ++ layer_idx) {
+                    const double z = grid.z(layer_idx);
+                    // A layer above counts while its own bottom is still less than the clearance away.
+                    // The bottom comes from the entry itself: lowering the top of a gap layer moves the
+                    // upper entry's tiled bottom with it, which would pull the overhang layer into the
+                    // range and leave no room for the contact tips.
+                    while (layer_idx + num_layers_above[layer_idx] + 1 < LayerIndex(outlines.size()) &&
+                           grid.bottom_z(layer_idx + num_layers_above[layer_idx] + 1) < z + top_distance - EPSILON)
+                        ++ num_layers_above[layer_idx];
+                    // A layer below counts while its top is still less than the clearance away.
+                    while (layer_idx - num_layers_below[layer_idx] - 1 >= 0 &&
+                           grid.z(layer_idx - num_layers_below[layer_idx] - 1) > z - bottom_distance - EPSILON)
+                        ++ num_layers_below[layer_idx];
+                    max_layers_above = std::max(max_layers_above, num_layers_above[layer_idx]);
+                    max_layers_below = std::max(max_layers_below, num_layers_below[layer_idx]);
+                }
+            }
+            const auto layers_above = [&num_layers_above, z_distance_top_layers](LayerIndex layer_idx) {
+                return layer_idx < LayerIndex(num_layers_above.size()) ? num_layers_above[layer_idx] : z_distance_top_layers;
+            };
+            const auto layers_below = [&num_layers_below, z_distance_bottom_layers](LayerIndex layer_idx) {
+                return layer_idx < LayerIndex(num_layers_below.size()) ? num_layers_below[layer_idx] : z_distance_bottom_layers;
+            };
             const coord_t       xy_distance               = outline_idx == m_current_outline_idx ? m_current_min_xy_dist : 
                 // technically this causes collision for the normal xy_distance to be larger by m_current_min_xy_dist_delta for all 
                 // not currently processing meshes as this delta will be added at request time.
@@ -506,8 +548,8 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             // 1) Calculate offsets of collision areas in parallel.
             LayerPolygonCache collision_areas_offsetted;
             collision_areas_offsetted.allocate(
-                std::max<LayerIndex>(0, data.begin() - z_distance_bottom_layers),
-                std::min<LayerIndex>(outlines.size(), data.end() + z_distance_top_layers));
+                std::max<LayerIndex>(0, data.begin() - max_layers_below),
+                std::min<LayerIndex>(outlines.size(), data.end() + max_layers_above));
             tbb::parallel_for(tbb::blocked_range<LayerIndex>(collision_areas_offsetted.begin(), collision_areas_offsetted.end()),
                 [&outlines, &machine_border = std::as_const(m_machine_border), offset_value = radius + xy_distance, &collision_areas_offsetted, &throw_on_cancel]
                 (const tbb::blocked_range<LayerIndex> &range) {
@@ -528,14 +570,16 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             const bool processing_last_mesh = outline_idx == layer_outline_indices.back();
             tbb::parallel_for(tbb::blocked_range<LayerIndex>(data.begin(), data.end()),
                 [&collision_areas_offsetted, &outlines, &machine_border = m_machine_border, &anti_overhang = m_anti_overhang, radius,
-                    xy_distance, z_distance_bottom_layers, z_distance_top_layers, min_resolution = m_min_resolution, &data, processing_last_mesh, &throw_on_cancel]
+                    xy_distance, &layers_above, &layers_below, min_resolution = m_min_resolution, &data, processing_last_mesh, &throw_on_cancel]
                 (const tbb::blocked_range<LayerIndex>& range) {
                     for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++ layer_idx) {
+                        const int num_below = layers_below(layer_idx);
+                        const int num_above = layers_above(layer_idx);
                         Polygons collisions;
-                        for (int i = - z_distance_bottom_layers; i <= 0; ++ i)
+                        for (int i = - num_below; i <= 0; ++ i)
                             if (int j = layer_idx + i; collision_areas_offsetted.has(j))
                                 append(collisions, collision_areas_offsetted[j]);
-                        for (int i = 1; i <= z_distance_top_layers; ++ i)
+                        for (int i = 1; i <= num_above; ++ i)
                             if (int j = layer_idx + i; j < int(outlines.size())) {
                                 Polygons collision_areas_original = machine_border;
                                 append(collision_areas_original, outlines[j]);
@@ -567,7 +611,7 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                                 // overhang that is expected to be supported is overwritten by the remaining part of the xy distance of the
                                 // layer below the to be supported area.
                                 coord_t required_range_x =
-                                    (xy_distance - ((i - (z_distance_top_layers == 1 ? 0.5 : 0)) * xy_distance / z_distance_top_layers)); 
+                                    (xy_distance - ((i - (num_above == 1 ? 0.5 : 0)) * xy_distance / num_above));
                                     // the conditional -0.5 ensures that plastic can never touch on the diagonal
                                     // downward when the z_distance_top_layers = 1. It is assumed to be better to
                                     // not support an overhang<90 degree than to risk fusing to it.
@@ -596,12 +640,12 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             // 3) Optionally calculate placables.
             if (calculate_placable) {
                 // Now calculate the placable areas.
-                tbb::parallel_for(tbb::blocked_range<LayerIndex>(std::max(z_distance_bottom_layers + 1, data.begin()), data.end()),
+                tbb::parallel_for(tbb::blocked_range<LayerIndex>(std::max(max_layers_below + 1, data.begin()), data.end()),
                     [&collision_areas_offsetted, &outlines, &anti_overhang = m_anti_overhang, processing_last_mesh,
-                     min_resolution = m_min_resolution, z_distance_bottom_layers, xy_distance, &data_placeable, &throw_on_cancel]
+                     min_resolution = m_min_resolution, &layers_below, xy_distance, &data_placeable, &throw_on_cancel]
                 (const tbb::blocked_range<LayerIndex>& range) {
                     for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++ layer_idx) {
-                        LayerIndex layer_idx_below = layer_idx - z_distance_bottom_layers - 1;
+                        LayerIndex layer_idx_below = layer_idx - layers_below(layer_idx) - 1;
                         assert(layer_idx_below >= 0);
                         const Polygons &current = collision_areas_offsetted[layer_idx];
                         const Polygons &below   = outlines[layer_idx_below];
