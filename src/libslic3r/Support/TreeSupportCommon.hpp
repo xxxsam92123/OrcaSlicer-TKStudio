@@ -927,11 +927,14 @@ public:
     }
 
     /*!
-     * \brief Same radius, but integrated over the actual layer heights above the branch tip.
+     * \brief Same radius, but integrated over the actual layer heights between the branch tip and
+     * the element.
      *
-     * `grown_layers` counts layers from the tip, while a branch grows over a Z distance. On a uniform grid
-     * the two expressions agree exactly; with a variable layer height the growth has to be accumulated
-     * over the grid heights instead of multiplied by the nominal layer height (contract §4.1/§4.4).
+     * `grown_layers` counts layers below the tip (the tip is the element with distance_to_top == 0,
+     * which sits `distance_to_top` layers above the element it describes), while a branch grows over
+     * a Z distance. On a uniform grid the two expressions agree exactly; with a variable layer height
+     * the growth has to be accumulated over the grid heights instead of multiplied by the nominal
+     * layer height (contract §4.1/§4.4).
      */
     [[nodiscard]] inline coord_t getRadius_at(const LayerIndex tip_layer, const size_t grown_layers,
                                               const double elephant_foot_increases = 0) const
@@ -939,9 +942,12 @@ public:
         if (layer_grid.empty() || tip_layer < 0 || tip_layer >= LayerIndex(layer_grid.size()))
             return getRadius(grown_layers, elephant_foot_increases);
 
-        const LayerIndex grown_layer = tip_layer + LayerIndex(grown_layers);
-        const coord_t    z_above     = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(tip_layer, grown_layer));
-        const coord_t    z_tip       = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(tip_layer, tip_layer + LayerIndex(tip_layers)));
+        // The element sits `grown_layers` layers *below* the tip, so the Z it grew over is the height
+        // between that layer and the tip, not the height of the layers above the tip (which is a
+        // different range of the grid, and on a variable layer height a different number of microns).
+        const LayerIndex grown_layer = tip_layer - LayerIndex(grown_layers);
+        const coord_t    z_above     = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(grown_layer, tip_layer));
+        const coord_t    z_tip       = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(tip_layer - LayerIndex(tip_layers), tip_layer));
         const coord_t    radius      = grown_layers <= tip_layers ?
             min_radius + (branch_radius - min_radius) * z_above / std::max<coord_t>(z_tip, 1) :
             branch_radius + coord_t(std::tan(branch_diameter_angle) * double(z_above - z_tip));
