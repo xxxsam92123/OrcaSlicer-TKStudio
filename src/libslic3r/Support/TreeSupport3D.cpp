@@ -1338,6 +1338,10 @@ static void generate_initial_areas(
     // does not turn valid in double the amount of layers a slope of support angle would take to travel xy_distance, nothing reasonable will come from it.
     // The 2*z_distance_delta is only a catch for when the support angle is very high.
     // Used only if not min_xy_dist.
+    // Deliberately the nominal layer height and the nominal layer count: this is a heuristic cap on
+    // how far below an overhang a tip may still be inserted, not a geometric quantity. Letting it
+    // follow per-layer thickness would change how many tips are dropped without moving anything
+    // (contract §4.1 keeps such heuristic thresholds at their nominal value).
     coord_t max_overhang_insert_lag = 0;
     if (config.z_distance_top_layers > 0) {
         max_overhang_insert_lag = 2 * config.z_distance_top_layers;
@@ -4084,6 +4088,9 @@ void organic_draw_branches(
                             // mode, so it doubles as the gate (no effect on other printer types).
                             const bool                      belt_mode = !volumes.m_belt_floor.empty();
                             // Don't propagate further than 1.5 * bottom radius.
+                            // Deliberately the nominal layer height: this is a heuristic cap on how
+                            // far a hanging branch is propagated towards a surface, not a geometric
+                            // quantity (contract §4.1 lists it with the nominal-value keepers).
                             //LayerIndex                      layers_propagate_max = 2 * bottom_radius / config.layer_height;
                             LayerIndex                      layers_propagate_max = 5 * bottom_radius / config.layer_height;
                             LayerIndex                      layer_bottommost = (branch.path.front()->state.verylost && !belt_mode) ?

@@ -97,14 +97,19 @@ struct TreeSupportLayerGrid
     bool   empty() const { return entries.empty(); }
     size_t size()  const { return entries.size(); }
 
-    // Top Z of the layer. Extrapolates with the height of the last layer beyond the grid, which the
-    // callers use for layers above the highest support layer.
+    // Top Z of the layer. Extrapolates with the height of the first / last layer beyond the grid: a
+    // branch tip near the bed spans `tip_layers` of grid, which reach under the first layer, and the
+    // layers above the highest support layer are asked for by the growth code. Both have to keep the
+    // Z axis linear, so that a Z span stays layers x height; clamping it at the first layer would
+    // shorten the span and with it the radius derived from it (contract §4.1/§4.4).
     double z(LayerIndex layer_idx) const
     {
         if (entries.empty())
             return 0.;
         if (layer_idx < 0)
-            return entries.front().bottom_z;
+            // Extrapolate below the first layer: z(-1) is the bottom of the first layer and each
+            // further step down is one more of its heights, so a Z span stays layers x height.
+            return entries.front().bottom_z + double(layer_idx + 1) * entries.front().height;
         if (layer_idx >= LayerIndex(entries.size())) {
             const Entry &last = entries.back();
             return last.print_z + double(layer_idx - LayerIndex(entries.size()) + 1) * last.height;
