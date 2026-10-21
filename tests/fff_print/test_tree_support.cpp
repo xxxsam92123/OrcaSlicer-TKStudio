@@ -15,7 +15,9 @@
 
 #include "test_helpers.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Support/TreeSupportCommon.hpp"
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
@@ -197,4 +199,98 @@ TEST_CASE("Tree support toolpaths do not depend on the MST tie order", "[TreeSup
         { "tree_support_branch_angle",    40 },
         { "support_line_width",           0.4 },
     });
+}
+
+// The organic generator used to turn support_top_z_distance into a whole number of layers, so 0.3
+// came out as one skipped layer plus a full one (0.4) and 0.1 as 0.2. The top contact is now placed
+// at the requested distance below the overhang, whatever the layer height.
+TEST_CASE("Organic support places its top contact the configured distance below the overhang", "[TreeSupportOrganicGap]")
+{
+    // The upper plate of two_tier_mesh() starts at z = 16.0, so every point of its lower face is an
+    // overhang bottom.
+    const TriangleMesh mesh = two_tier_mesh();
+    const double     gap    = GENERATE(0.1, 0.2, 0.3);
+    INFO("support_top_z_distance=" << gap);
+
+    Slic3r::Print print;
+    slice_with_tree_support(mesh, print, "organic", 30, 0, 0, {
+        { "support_top_z_distance",      gap },
+        { "support_interface_top_layers", 2 },
+    });
+
+    // "support" matches both the base and the interface role comments.
+    const std::string      g         = gcode(print);
+    const std::set<double> support_z = layers_with_role(g, "support");
+    INFO("support layers=" << print.objects().front()->support_layers().size() << " gcode=" << g.size() << " zs=" << support_z.size());
+    REQUIRE(! support_z.empty());
+    REQUIRE_THAT(*support_z.rbegin(), Catch::Matchers::WithinAbs(16.0 - gap, 1e-6));
+}
+
+TEST_CASE("Support layer grid resolves Z and gap layers on a grid with mixed layer heights", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    // Tops 0.2, 0.4, 0.8, 1.2, 1.4, 1.6: two 0.2 layers, two 0.4 layers, two 0.2 layers.
+    const std::vector<double> heights { 0.2, 0.2, 0.4, 0.4, 0.2, 0.2 };
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (const double h : heights) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z = bottom;
+        entry.print_z  = bottom + h;
+        entry.height   = h;
+        bottom         = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+
+    CHECK_THAT(grid.z(2), Catch::Matchers::WithinAbs(0.8, 1e-9));
+    CHECK_THAT(grid.h(2), Catch::Matchers::WithinAbs(0.4, 1e-9));
+    CHECK(grid.idx_ceil(0.7) == 2);
+    CHECK(grid.idx_floor(0.7) == 1);
+    CHECK_THAT(grid.z_span(1, 4), Catch::Matchers::WithinAbs(1.0, 1e-9));
+
+    SECTION("A gap that lands on a layer top leaves that layer unchanged") {
+        // Overhang bottom 1.6 and a 0.2 gap give 1.4, which is layer 4's own top.
+        REQUIRE(grid.lower_top(4, 1.4));
+        CHECK(! grid.entries[4].is_gap_layer);
+        CHECK_THAT(grid.z(4), Catch::Matchers::WithinAbs(1.4, 1e-9));
+        CHECK_THAT(grid.h(4), Catch::Matchers::WithinAbs(0.2, 1e-9));
+    }
+
+    SECTION("A gap between two layer tops lowers the upper one and flags it") {
+        // Overhang bottom 1.6 and a 0.3 gap give 1.3, which is inside layer 4.
+        REQUIRE(grid.lower_top(4, 1.3));
+        CHECK(grid.entries[4].is_gap_layer);
+        CHECK_THAT(grid.z(4), Catch::Matchers::WithinAbs(1.3, 1e-9));
+        CHECK_THAT(grid.h(4), Catch::Matchers::WithinAbs(0.1, 1e-9));
+    }
+}
+
+TEST_CASE("Organic support accepts a variable layer height profile", "[TreeSupportOrganicGap]")
+{
+    Slic3r::Model model;
+    ModelObject *object = model.add_object();
+    object->name        = "tshape.stl";
+    object->add_volume(two_tier_mesh());
+    object->add_instance();
+    // 0.2 mm up to z=15, 0.4 mm above it up to the model top at z=16.
+    object->layer_height_profile.set({ 0., 0.2, 15.0, 0.4, 16.0, 0.2 });
+    object->ensure_on_bed();
+
+    Slic3r::Print print;
+    print.auto_assign_extruders(object);
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "enable_support", 1 },
+        { "support_type",   "tree(auto)" },
+        { "support_style",  "organic" },
+        // Relative extruder addressing needs a reset at each layer, as validate() points out.
+        { "before_layer_change_gcode", "G92 E0" },
+    });
+    print.apply(model, config);
+
+    REQUIRE(print.objects().front()->model_object()->has_custom_layering());
+    // Before the change this returned "Variable layer height is not supported with Organic supports."
+    const StringObjectException error = print.validate();
+    INFO("validate: " << error.string);
+    CHECK(error.string.empty());
 }
