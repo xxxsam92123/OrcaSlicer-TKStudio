@@ -82,7 +82,7 @@ public:
             external_bridge_grid_area(other.external_bridge_grid_area),
             internal_solid_grid(other.internal_solid_grid), internal_solid_grid_index(other.internal_solid_grid_index)
         {};
-    Surface(Surface &&rhs)
+    Surface(Surface &&rhs) noexcept
         : surface_type(rhs.surface_type), expolygon(std::move(rhs.expolygon)),
             thickness(rhs.thickness), thickness_layers(rhs.thickness_layers),
             bridge_angle(rhs.bridge_angle), extra_perimeters(rhs.extra_perimeters),
@@ -121,7 +121,7 @@ public:
         return *this;
     }
 
-    Surface& operator=(Surface &&rhs)
+    Surface& operator=(Surface &&rhs) noexcept
     {
         surface_type     = rhs.surface_type;
         expolygon        = std::move(rhs.expolygon);
