@@ -20,6 +20,13 @@
 #include "libslic3r/Support/TreeSupportCommon.hpp"
 
 #include <algorithm>
+#include <set>
+#include <string>
+#include <vector>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include "libslic3r/PrintBase.hpp"
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
