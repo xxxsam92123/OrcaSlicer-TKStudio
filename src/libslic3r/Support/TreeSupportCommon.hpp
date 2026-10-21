@@ -116,6 +116,75 @@ struct TreeSupportLayerGrid
     // sum of the layer heights in between.
     double z_span(LayerIndex from, LayerIndex to) const { return z(to) - z(from); }
 
+    // How many layers a Z distance spans. Walking the grid keeps these counts meaningful with
+    // variable layer heights; the three roundings reproduce the historical formulas exactly on a
+    // uniform grid, which is what keeps existing output unchanged (contract §4.4).
+    // Layers that fit completely into `distance` - matches a truncated `distance / layer_height`.
+    size_t layers_fitting(const double distance, const LayerIndex from = 0) const
+    {
+        double accumulated = 0.;
+        size_t layers      = 0;
+        const size_t start = from > 0 ? size_t(from) : 0;
+        for (size_t idx = start; idx < entries.size(); ++ idx) {
+            const double height = entries[idx].height;
+            if (height <= EPSILON)
+                continue;
+            if (accumulated + height > distance + EPSILON)
+                break;
+            accumulated += height;
+            ++ layers;
+        }
+        return layers;
+    }
+
+    // Layers needed to cover `distance` - matches round_up_divide(distance, layer_height).
+    size_t layers_covering(const double distance, const LayerIndex from = 0) const
+    {
+        double accumulated = 0.;
+        size_t layers      = 0;
+        const size_t start = from > 0 ? size_t(from) : 0;
+        for (size_t idx = start; idx < entries.size() && accumulated < distance - EPSILON; ++ idx) {
+            if (entries[idx].height <= EPSILON)
+                continue;
+            accumulated += entries[idx].height;
+            ++ layers;
+        }
+        return layers;
+    }
+
+    // Layers closest to `distance`, ties rounding up - matches round(distance / layer_height).
+    size_t layers_rounding(const double distance, const LayerIndex from = 0) const
+    {
+        double accumulated = 0.;
+        size_t layers      = 0;
+        const size_t start = from > 0 ? size_t(from) : 0;
+        for (size_t idx = start; idx < entries.size(); ++ idx) {
+            const double height = entries[idx].height;
+            if (height <= EPSILON)
+                continue;
+            if (accumulated + height >= distance - EPSILON) {
+                // One more layer crosses the distance; take it when it lands closer than stopping.
+                if (distance - accumulated >= 0.5 * height)
+                    ++ layers;
+                break;
+            }
+            accumulated += height;
+            ++ layers;
+        }
+        return layers;
+    }
+
+    // Rebuild the tiling from the tops: entry k starts where entry k-1 ends. Lowering or inserting a
+    // top therefore can never leave a vertical hole between two neighbouring layers.
+    void retile()
+    {
+        for (size_t idx = 0; idx < entries.size(); ++ idx) {
+            Entry &entry   = entries[idx];
+            entry.bottom_z = idx == 0 ? 0. : entries[idx - 1].print_z;
+            entry.height   = entry.print_z - entry.bottom_z;
+        }
+    }
+
     // Lowest layer whose top reaches z, i.e. the layer that would have to be lowered to end at z.
     LayerIndex idx_ceil(double z_req) const
     {
@@ -144,8 +213,16 @@ struct TreeSupportLayerGrid
         if (print_z_req <= entry.bottom_z + MIN_SUPPORT_LAYER_HEIGHT)
             return false;
         entry.print_z      = print_z_req;
-        entry.height       = entry.print_z - entry.bottom_z;
         entry.is_gap_layer = true;
+        // Keep the grid tiling: the layer above now starts at the lowered top instead of at the old
+        // one, otherwise the two neighbouring layers would leave a vertical hole of the difference
+        // (contract §4.1 rule 4 - heights are recomputed after a top changes).
+        if (layer_idx + 1 < LayerIndex(entries.size())) {
+            Entry &above   = entries[layer_idx + 1];
+            above.bottom_z = entry.print_z;
+            above.height   = above.print_z - above.bottom_z;
+        }
+        entry.height       = entry.print_z - entry.bottom_z;
         return true;
     }
 };
@@ -455,6 +532,9 @@ public:
     explicit TreeSupportSettings(const TreeSupportMeshGroupSettings &mesh_group_settings, const SlicingParameters &slicing_params)
         : support_line_width(mesh_group_settings.support_line_width),
           layer_height(mesh_group_settings.layer_height),
+          support_tree_angle(mesh_group_settings.support_tree_angle),
+          support_tree_angle_slow(mesh_group_settings.support_tree_angle_slow),
+          branch_diameter_angle(mesh_group_settings.support_tree_branch_diameter_angle),
           branch_radius(mesh_group_settings.support_tree_branch_diameter / 2),
           min_radius(mesh_group_settings.support_tree_tip_diameter / 2), // The actual radius is 50 microns larger as the resulting branches will be increased by 50 microns to avoid rounding errors effectively increasing the xydistance
           maximum_move_distance((mesh_group_settings.support_tree_angle < M_PI / 2.) ? (coord_t)(tan(mesh_group_settings.support_tree_angle) * layer_height) : std::numeric_limits<coord_t>::max()),
@@ -501,7 +581,23 @@ public:
             raft_layers.emplace_back(layer_grid.entries[i].print_z);
         has_top_gap    = mesh_group_settings.support_top_distance > EPSILON;
         has_bottom_gap = mesh_group_settings.support_bottom_distance > EPSILON;
-    
+
+        // Derive the layer counts from the grid, so a variable layer height does not silently change how
+        // many layers a millimetre covers (contract §4.1). On a uniform grid every count resolves to the
+        // value the initialisation list derived from the nominal layer height.
+        if (! layer_grid.empty()) {
+            support_bottom_layers = mesh_group_settings.support_bottom_enable ?
+                layer_grid.layers_rounding(unscale<double>(mesh_group_settings.support_bottom_height)) : 0;
+            tip_layers = std::max<size_t>(size_t(1),
+                std::max<size_t>(size_t((branch_radius - min_radius) / std::max<coord_t>(support_line_width / 3, 1)),
+                                 layer_grid.layers_fitting(unscale<double>(branch_radius))));
+            min_dtt_to_model = layer_grid.layers_covering(unscale<double>(mesh_group_settings.support_tree_min_height_to_model));
+            increase_radius_until_layer = increase_radius_until_radius <= branch_radius ?
+                size_t(tip_layers * (increase_radius_until_radius / branch_radius)) :
+                layers_for_branch_radius_growth(unscale<double>(increase_radius_until_radius - branch_radius));
+            layer_start_bp_radius = LayerIndex(layers_for_bp_radius_growth(unscale<double>(bp_radius - branch_radius)));
+        }
+
         if (TreeSupportSettings::zero_top_z_gap) {
             // safeOffsetInc can only work in steps of the size xy_min_distance in the worst case => xy_min_distance has to be a bit larger than 0 in this worst case and should be large enough for performance to not suffer extremely
             // When for all meshes the z bottom and top distance is more than one layer though the worst case is xy_min_distance + min_feature_size
@@ -529,6 +625,14 @@ public:
      * \brief Height of a single layer
      */
     coord_t layer_height;
+    /*!
+     * \brief Angles the per-layer growth limits are derived from. The members below hold those limits
+     * for the nominal layer height; the *_at() accessors apply the same angle to the actual thickness
+     * of one layer of the grid (contract §4.1/§4.4).
+     */
+    double support_tree_angle;
+    double support_tree_angle_slow;
+    double branch_diameter_angle;
     /*!
      * \brief Radius of a branch when it has left the tip.
      */
@@ -714,11 +818,77 @@ public:
             ;
     }
 
+    // ---- Per-layer growth (contract §4.1/§4.4) ------------------------------------------------
+    // The branch moves and widens once per layer. With a variable layer height that step has to follow
+    // the layer's own thickness, not the nominal layer height the members above are derived from. On a
+    // uniform grid every accessor returns exactly the member it replaces, so existing output is
+    // unchanged.
+
+    [[nodiscard]] static coord_t move_distance_for_height(const double height, const double angle)
+    {
+        return angle < M_PI / 2. ? coord_t(std::tan(angle) * scaled<coord_t>(height)) : std::numeric_limits<coord_t>::max();
+    }
+
+    // How far an influence area may move outward from `layer_idx` down to the layer below it.
+    [[nodiscard]] coord_t maximum_move_distance_at(const LayerIndex layer_idx) const
+    {
+        return move_distance_for_height(layer_grid.h(layer_idx), support_tree_angle);
+    }
+
+    [[nodiscard]] coord_t maximum_move_distance_slow_at(const LayerIndex layer_idx) const
+    {
+        return move_distance_for_height(layer_grid.h(layer_idx), support_tree_angle_slow);
+    }
+
+    // Radius a branch gains while `layer_idx` is printed. Scaled units, like
+    // `branch_radius_increase_per_layer`, which it replaces layer by layer.
+    [[nodiscard]] double branch_radius_increase_at(const LayerIndex layer_idx) const
+    {
+        return std::tan(branch_diameter_angle) * double(scaled<coord_t>(layer_grid.h(layer_idx)));
+    }
+
+    // Radius an elephant foot gains while `layer_idx` is printed. Scaled units.
+    [[nodiscard]] double bp_radius_increase_at(const LayerIndex layer_idx) const
+    {
+        return std::min(std::tan(0.7) * double(scaled<coord_t>(layer_grid.h(layer_idx))), 0.5 * double(support_line_width));
+    }
+
+    // Layers until the branch radius grew by `radius_delta`, accumulated over the actual layer heights.
+    [[nodiscard]] size_t layers_for_branch_radius_growth(const double radius_delta) const
+    {
+        double accumulated = 0.;
+        size_t layers      = 0;
+        for (size_t idx = 0; idx < layer_grid.size(); ++ idx) {
+            const double growth = branch_radius_increase_at(LayerIndex(idx));
+            if (growth <= EPSILON || accumulated + growth > radius_delta + EPSILON)
+                break;
+            accumulated += growth;
+            ++ layers;
+        }
+        return layers;
+    }
+
+    // Layers until an elephant foot grew by `radius_delta`, accumulated over the actual layer heights.
+    [[nodiscard]] size_t layers_for_bp_radius_growth(const double radius_delta) const
+    {
+        double accumulated = 0.;
+        size_t layers      = 0;
+        for (size_t idx = 0; idx < layer_grid.size(); ++ idx) {
+            const double growth = bp_radius_increase_at(LayerIndex(idx));
+            if (growth <= EPSILON || accumulated + growth > radius_delta + EPSILON)
+                break;
+            accumulated += growth;
+            ++ layers;
+        }
+        return layers;
+    }
+
     /*!
      * \brief Get the Radius part will have based on numeric values.
      * \param distance_to_top[in] The effective distance_to_top of the element
      * \param elephant_foot_increases[in] The elephant_foot_increases of the element.
-     * \return The radius an element with these attributes would have.
+     * 
+eturn The radius an element with these attributes would have.
      */
     [[nodiscard]] inline coord_t getRadius(size_t distance_to_top, const double elephant_foot_increases = 0) const
     {
@@ -727,6 +897,29 @@ public:
                        (distance_to_top - tip_layers) * branch_radius_increase_per_layer)
                + // gradual increase
                elephant_foot_increases * (std::max(bp_radius_increase_per_layer - branch_radius_increase_per_layer, 0.0));
+    }
+
+    /*!
+     * \brief Same radius, but integrated over the actual layer heights above the branch tip.
+     *
+     * `grown_layers` counts layers from the tip, while a branch grows over a Z distance. On a uniform grid
+     * the two expressions agree exactly; with a variable layer height the growth has to be accumulated
+     * over the grid heights instead of multiplied by the nominal layer height (contract §4.1/§4.4).
+     */
+    [[nodiscard]] inline coord_t getRadius_at(const LayerIndex tip_layer, const size_t grown_layers,
+                                              const double elephant_foot_increases = 0) const
+    {
+        if (layer_grid.empty() || tip_layer < 0 || tip_layer >= LayerIndex(layer_grid.size()))
+            return getRadius(grown_layers, elephant_foot_increases);
+
+        const LayerIndex grown_layer = tip_layer + LayerIndex(grown_layers);
+        const coord_t    z_above     = scaled<coord_t>(layer_grid.z_span(tip_layer, grown_layer));
+        const coord_t    z_tip       = scaled<coord_t>(layer_grid.z_span(tip_layer, tip_layer + LayerIndex(tip_layers)));
+        const coord_t    radius      = grown_layers <= tip_layers ?
+            min_radius + (branch_radius - min_radius) * z_above / std::max<coord_t>(z_tip, 1) :
+            branch_radius + coord_t(std::tan(branch_diameter_angle) * double(z_above - z_tip));
+        return radius + coord_t(elephant_foot_increases *
+                                std::max(bp_radius_increase_at(grown_layer) - branch_radius_increase_at(grown_layer), 0.0));
     }
 
     /*!

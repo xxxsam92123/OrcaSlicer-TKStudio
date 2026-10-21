@@ -1727,15 +1727,17 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
             while (current_ceil_radius < target_radius && validWithRadius(volumes.getRadiusNextCeil(current_ceil_radius + 1, settings.use_min_distance)))
                 current_ceil_radius = volumes.getRadiusNextCeil(current_ceil_radius + 1, settings.use_min_distance);
             size_t resulting_eff_dtt = current_elem.effective_radius_height;
+            const LayerIndex tip_layer = current_elem.layer_idx - LayerIndex(current_elem.distance_to_top);
             while (resulting_eff_dtt + 1 < current_elem.distance_to_top &&
-                config.getRadius(resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= current_ceil_radius &&
-                config.getRadius(resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= support_element_radius(config, current_elem))
+                config.getRadius_at(tip_layer, resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= current_ceil_radius &&
+                config.getRadius_at(tip_layer, resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= support_element_radius(config, current_elem))
                 ++ resulting_eff_dtt;
             current_elem.effective_radius_height = resulting_eff_dtt;
         }
         radius = support_element_collision_radius(config, current_elem);
 
-        const coord_t foot_radius_increase = std::max(config.bp_radius_increase_per_layer - config.branch_radius_increase_per_layer, 0.0);
+        const LayerIndex current_tip = current_elem.layer_idx - LayerIndex(current_elem.distance_to_top);
+        const coord_t foot_radius_increase = std::max(config.bp_radius_increase_at(current_elem.layer_idx) - config.branch_radius_increase_at(current_elem.layer_idx), 0.0);
         // Is nearly all of the time 1, but sometimes an increase of 1 could cause the radius to become bigger than recommendedMinRadius,
         // which could cause the radius to become bigger than precalculated.
         double planned_foot_increase = std::min(1.0, double(config.recommendedMinRadius(layer_idx - 1) - support_element_radius(config, current_elem)) / foot_radius_increase);
@@ -1744,7 +1746,7 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
 //        bool increase_bp_foot = false;
 
         if (increase_bp_foot && support_element_radius(config, current_elem) >= config.branch_radius && support_element_radius(config, current_elem) >= config.increase_radius_until_radius)
-            if (validWithRadius(config.getRadius(current_elem.effective_radius_height, current_elem.elephant_foot_increases + planned_foot_increase))) {
+            if (validWithRadius(config.getRadius_at(current_tip, current_elem.effective_radius_height, current_elem.elephant_foot_increases + planned_foot_increase))) {
                 current_elem.elephant_foot_increases += planned_foot_increase;
                 radius = support_element_collision_radius(config, current_elem);
             }
@@ -1846,6 +1848,14 @@ static void increase_areas_one_layer(
             assert(merging_area.parents.size() == 1);
             SupportElement          &parent         = layer_elements[merging_area.parents.front()];
             SupportElementState      elem           = SupportElementState::propagate_down(parent.state);
+            // Per-layer growth limits for the step from `layer_idx` down to the layer below it: the same
+            // angles applied to that layer's actual thickness instead of the nominal layer height
+            // (contract §4.1/§4.4). On a uniform grid these equal maximum_move_distance(_slow).
+            const coord_t            max_move       = config.maximum_move_distance_at(layer_idx);
+            const coord_t            max_move_slow  = config.maximum_move_distance_slow_at(layer_idx);
+            const double             bp_increase    = config.bp_radius_increase_at(layer_idx);
+            // Layer the branch tip of `elem` sits on: support layer index minus the layers it grew over.
+            const LayerIndex         elem_tip       = elem.layer_idx - LayerIndex(elem.distance_to_top);
             const Polygons          &wall_restriction =
                 // Abstract representation of the model outline. If an influence area would move through it, it could teleport through a wall.
                 volumes.getWallRestriction(support_element_collision_radius(config, parent.state), layer_idx, parent.state.use_min_xy_dist);
@@ -1862,7 +1872,8 @@ static void increase_areas_one_layer(
             coord_t extra_speed = 5; // The extra speed is added to both movement distances. Also move 5 microns faster than allowed to avoid rounding errors, this may cause issues at VERY VERY small layer heights.
             coord_t extra_slow_speed = 0; // Only added to the slow movement distance.
             const coord_t ceiled_parent_radius = volumes.ceilRadius(support_element_collision_radius(config, parent.state), parent.state.use_min_xy_dist);
-            coord_t projected_radius_increased = config.getRadius(parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases);
+            const LayerIndex parent_tip = parent.state.layer_idx - LayerIndex(parent.state.distance_to_top);
+            coord_t projected_radius_increased = config.getRadius_at(parent_tip, parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases);
             coord_t projected_radius_delta = projected_radius_increased - support_element_collision_radius(config, parent.state);
 
             // When z distance is more than one layer up and down the Collision used to calculate the wall restriction will always include the wall (and not just the xy_min_distance) of the layer above and below like this (d = blocked area because of z distance):
@@ -1888,20 +1899,20 @@ static void increase_areas_one_layer(
             else
                 // if a guaranteed radius increase is not possible, only increase the slow speed
                 // Ensure that the slow movement distance can not become larger than the fast one.
-                extra_slow_speed += std::min(projected_radius_delta, (config.maximum_move_distance + extra_speed) - (config.maximum_move_distance_slow + extra_slow_speed));
+                extra_slow_speed += std::min(projected_radius_delta, (max_move + extra_speed) - (max_move_slow + extra_slow_speed));
 
             if (config.layer_start_bp_radius > layer_idx &&
-                config.recommendedMinRadius(layer_idx - 1) < config.getRadius(elem.effective_radius_height + 1, elem.elephant_foot_increases)) {
+                config.recommendedMinRadius(layer_idx - 1) < config.getRadius_at(elem_tip, elem.effective_radius_height + 1, elem.elephant_foot_increases)) {
                 // can guarantee elephant foot radius increase
-                if (ceiled_parent_radius == volumes.ceilRadius(config.getRadius(parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases + 1), parent.state.use_min_xy_dist))
-                    extra_speed += config.bp_radius_increase_per_layer;
+                if (ceiled_parent_radius == volumes.ceilRadius(config.getRadius_at(elem_tip, elem.effective_radius_height + 1, elem.elephant_foot_increases + 1), parent.state.use_min_xy_dist))
+                    extra_speed += bp_increase;
                 else
-                    extra_slow_speed += std::min(coord_t(config.bp_radius_increase_per_layer),
-                                                 config.maximum_move_distance - (config.maximum_move_distance_slow + extra_slow_speed));
+                    extra_slow_speed += std::min(coord_t(bp_increase),
+                                                 max_move - (max_move_slow + extra_slow_speed));
             }
 
-            const coord_t fast_speed = config.maximum_move_distance + extra_speed;
-            const coord_t slow_speed = config.maximum_move_distance_slow + extra_speed + extra_slow_speed;
+            const coord_t fast_speed = max_move + extra_speed;
+            const coord_t slow_speed = max_move_slow + extra_speed + extra_slow_speed;
 
             Polygons offset_slow, offset_fast;
 
@@ -1920,14 +1931,14 @@ static void increase_areas_one_layer(
                 }
             };
 
-            const bool parent_moved_slow = elem.last_area_increase.increase_speed < config.maximum_move_distance;
+            const bool parent_moved_slow = elem.last_area_increase.increase_speed < max_move;
             const bool avoidance_speed_mismatch = parent_moved_slow && elem.last_area_increase.type != AvoidanceType::Slow;
             if (elem.last_area_increase.move && elem.last_area_increase.no_error && elem.can_use_safe_radius && !mergelayer &&
                 !avoidance_speed_mismatch && (elem.distance_to_top >= config.tip_layers || parent_moved_slow)) {
                 // assume that the avoidance type that was best for the parent is best for me. Makes this function about 7% faster.
-                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < config.maximum_move_distance ? slow_speed : fast_speed,
+                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < max_move ? slow_speed : fast_speed,
                     increase_radius, elem.last_area_increase.no_error, !use_min_radius, elem.last_area_increase.move }, true);
-                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < config.maximum_move_distance ? slow_speed : fast_speed,
+                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < max_move ? slow_speed : fast_speed,
                     !increase_radius, elem.last_area_increase.no_error, !use_min_radius, elem.last_area_increase.move }, true);
             }
             // branch may still go though a hole, so a check has to be done whether the hole was already passed, and the regular avoidance can be used.
@@ -1977,22 +1988,22 @@ static void increase_areas_one_layer(
             Polygons inc_wo_collision;
             // Check whether it is faster to calculate the area increased with the fast speed independently from the slow area, or time could be saved by reusing the slow area to calculate the fast one.
             // Calculated by comparing the steps saved when calcualting idependently with the saved steps when not.
-            bool offset_independant_faster = radius / safe_movement_distance - int(config.maximum_move_distance + extra_speed < radius + safe_movement_distance) >
-                                             round_up_divide((extra_speed + extra_slow_speed + config.maximum_move_distance_slow), safe_movement_distance);
+            bool offset_independant_faster = radius / safe_movement_distance - int(max_move + extra_speed < radius + safe_movement_distance) >
+                                             round_up_divide((extra_speed + extra_slow_speed + max_move_slow), safe_movement_distance);
             for (const AreaIncreaseSettings &settings : order) {
                 if (settings.move) {
                     if (offset_slow.empty() && (settings.increase_speed == slow_speed || ! offset_independant_faster)) {
                         // offsetting in 2 steps makes our offsetted area rounder preventing (rounding) errors created by to pointy areas. At this point one can see that the Polygons class
                         // was never made for precision in the single digit micron range.
-                        offset_slow = safe_offset_inc(parent.influence_area, extra_speed + extra_slow_speed + config.maximum_move_distance_slow,
+                        offset_slow = safe_offset_inc(parent.influence_area, extra_speed + extra_slow_speed + max_move_slow,
                             wall_restriction, safe_movement_distance, offset_independant_faster ? safe_movement_distance + radius : 0, 2);
                     }
                     if (offset_fast.empty() && settings.increase_speed != slow_speed) {
                         if (offset_independant_faster)
-                            offset_fast = safe_offset_inc(parent.influence_area, extra_speed + config.maximum_move_distance,
+                            offset_fast = safe_offset_inc(parent.influence_area, extra_speed + max_move,
                                 wall_restriction, safe_movement_distance, offset_independant_faster ? safe_movement_distance + radius : 0, 1);
                         else {
-                            const coord_t delta_slow_fast = config.maximum_move_distance - (config.maximum_move_distance_slow + extra_slow_speed);
+                            const coord_t delta_slow_fast = max_move - (max_move_slow + extra_slow_speed);
                             offset_fast = safe_offset_inc(offset_slow, delta_slow_fast, wall_restriction, safe_movement_distance, safe_movement_distance + radius, offset_independant_faster ? 2 : 1);
                         }
                     }
@@ -2005,7 +2016,7 @@ static void increase_areas_one_layer(
                     Polygons lines_offset = offset(to_polylines(parent.influence_area), scaled<float>(0.005), jtMiter, 1.2);
                     Polygons base_error_area = union_(parent.influence_area, lines_offset);
                     result = increase_single_area(volumes, config, settings, layer_idx, parent,
-                        base_error_area, to_bp_data, to_model_data, inc_wo_collision, (config.maximum_move_distance + extra_speed) * 1.5, mergelayer);
+                        base_error_area, to_bp_data, to_model_data, inc_wo_collision, (max_move + extra_speed) * 1.5, mergelayer);
 #ifdef TREE_SUPPORT_SHOW_ERRORS
                     BOOST_LOG_TRIVIAL(error)
 #else // TREE_SUPPORT_SHOW_ERRORS
@@ -2117,11 +2128,13 @@ static void increase_areas_one_layer(
     out.to_model_gracious = first.to_model_gracious && second.to_model_gracious; // valid as we do not merge non-gracious with gracious
 
     out.elephant_foot_increases = 0;
-    if (config.bp_radius_increase_per_layer > 0) {
+    // Per-layer growth of what a foot may add over a branch: both parts follow this layer's thickness.
+    const double foot_increase_per_layer = config.bp_radius_increase_at(out.layer_idx) - config.branch_radius_increase_at(out.layer_idx);
+    if (foot_increase_per_layer > 0) {
         coord_t foot_increase_radius = std::abs(std::max(support_element_collision_radius(config, second), support_element_collision_radius(config, first)) - support_element_collision_radius(config, out));
         // elephant_foot_increases has to be recalculated, as when a smaller tree with a larger elephant_foot_increases merge with a larger branch
         // the elephant_foot_increases may have to be lower as otherwise the radius suddenly increases. This results often in a non integer value.
-        out.elephant_foot_increases = foot_increase_radius / (config.bp_radius_increase_per_layer - config.branch_radius_increase_per_layer);
+        out.elephant_foot_increases = foot_increase_radius / foot_increase_per_layer;
     }
 
     // set last settings to the best out of both parents. If this is wrong, it will only cause a small performance penalty instead of weird behavior.
@@ -2501,6 +2514,8 @@ static void create_layer_pathing(const TreeModelVolumes &volumes, const TreeSupp
     const auto _tiny_area_threshold = tiny_area_threshold();
 
     // Ensures at least one merge operation per 3mm height, 50 layers, 1 mm movement of slow speed or 5mm movement of fast speed (whatever is lowest). Values were guessed.
+    // Deliberately the nominal layer height: this is a performance heuristic on how many layers to merge
+    // at once, not geometry, so it must not follow the per-layer thicknesses (contract §4.1).
     size_t max_merge_every_x_layers = std::min(std::min(5000 / (std::max(config.maximum_move_distance, coord_t(100))), 1000 / std::max(config.maximum_move_distance_slow, coord_t(20))), 3000 / config.layer_height);
     size_t merge_every_x_layers = 1;
     // Calculate the influence areas for each layer below (Top down)
@@ -3212,7 +3227,7 @@ static void organic_smooth_branches_avoid_collisions(
         const LayerIndex layer_idx = sphere.element.state.layer_idx;
         const Vec2d current_pos = to_2d(sphere.position).cast<double>();
         const double current_radius = double(support_element_radius(config, sphere.element));
-        const double maximum_move_distance_slow = double(config.maximum_move_distance_slow);
+        const double maximum_move_distance_slow = double(config.maximum_move_distance_slow_at(layer_idx));
 
         if (sphere.element_below_id != -1 && layer_idx > 0) {
             const size_t lower_id = linear_data_layers[layer_idx - 1] + size_t(sphere.element_below_id);
@@ -3564,6 +3579,9 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         }
 
         // Generator for model collision, avoidance and internal guide volumes.
+        // The avoidance caches take the nominal movement limits: they quantise growth in steps of
+        // xy_min_distance, so a per-layer limit would only change how many steps a cache is built with,
+        // not the geometry (contract §4.1 keeps the nominal value for such non-geometric uses).
         TreeModelVolumes volumes{ print_object, build_volume, config.maximum_move_distance, config.maximum_move_distance_slow, processing.second.front(),
             &processing.first.layer_grid,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS

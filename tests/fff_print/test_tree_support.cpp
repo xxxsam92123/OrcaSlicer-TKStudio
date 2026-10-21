@@ -19,6 +19,8 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
 
+#include <algorithm>
+
 using namespace Slic3r::Test;
 using namespace Slic3r;
 
@@ -262,6 +264,25 @@ TEST_CASE("Support layer grid resolves Z and gap layers on a grid with mixed lay
         CHECK(grid.entries[4].is_gap_layer);
         CHECK_THAT(grid.z(4), Catch::Matchers::WithinAbs(1.3, 1e-9));
         CHECK_THAT(grid.h(4), Catch::Matchers::WithinAbs(0.1, 1e-9));
+        // The grid stays tiled: the layer above now starts at the lowered top, so the two neighbours
+        // leave no vertical hole and the heights still add up to the last top (contract §4.1 rule 4).
+        CHECK_THAT(grid.entries[5].bottom_z, Catch::Matchers::WithinAbs(1.3, 1e-9));
+        CHECK_THAT(grid.entries[5].height, Catch::Matchers::WithinAbs(0.3, 1e-9));
+        CHECK_THAT(grid.z_span(0, 5), Catch::Matchers::WithinAbs(1.6, 1e-9));
+        // Exactly one contact layer is flagged, not the layers above it.
+        CHECK(std::count_if(grid.entries.begin(), grid.entries.end(),
+                            [](const TreeSupportLayerGrid::Entry &entry) { return entry.is_gap_layer; }) == 1);
+    }
+
+    SECTION("Layer counts follow the grid heights") {
+        // Tops 0.2, 0.4, 0.8, 1.2, 1.4, 1.6: 0.6 is covered by 0.2 + 0.2 + 0.4 but only 0.2 + 0.2 fit into it.
+        CHECK(grid.layers_fitting(0.6) == 2);
+        CHECK(grid.layers_covering(0.6) == 3);
+        CHECK(grid.layers_rounding(0.6) == 3);
+        // 0.5 sits 0.1 above the 0.4 top and 0.3 below the 0.8 top, so it rounds down to two layers.
+        CHECK(grid.layers_fitting(0.5) == 2);
+        CHECK(grid.layers_covering(0.5) == 3);
+        CHECK(grid.layers_rounding(0.5) == 2);
     }
 }
 
