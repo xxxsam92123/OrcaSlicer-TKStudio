@@ -380,21 +380,60 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 // and for a smaller gap it ends up inside the object. The face is a down facing facet of the mesh, so
 // take the lowest of those within `area`. Sloped faces contribute their lowest point, which can only
 // widen the gap, never close it.
-[[nodiscard]] static std::optional<double> overhang_face_z(const TriangleMesh &mesh, const Polygons &area,
-                                                           const double z_lo, const double z_hi)
+//
+// The search runs once per overhang area, so the facet Z minima are collected once per mesh instead of
+// being recomputed - together with a full walk over the triangles - for every area (review round 4,
+// issue 3). Only the facets whose lowest vertex lies inside the window are visited at all.
+struct OverhangFacetZIndex
 {
-    if (area.empty())
+    std::vector<double> z_min; // lowest vertex Z of each facet, in mesh order
+    std::vector<size_t> by_z;  // facet indices, ascending z_min, ties in mesh order
+
+    void build(const indexed_triangle_set &its)
+    {
+        z_min.clear();
+        z_min.reserve(its.indices.size());
+        for (const stl_triangle_vertex_indices &triangle : its.indices) {
+            const Vec3f &a = its.vertices[triangle[0]];
+            const Vec3f &b = its.vertices[triangle[1]];
+            const Vec3f &c = its.vertices[triangle[2]];
+            z_min.emplace_back(std::min({ double(a.z()), double(b.z()), double(c.z()) }));
+        }
+        by_z.resize(z_min.size());
+        for (size_t i = 0; i < by_z.size(); ++ i)
+            by_z[i] = i;
+        std::stable_sort(by_z.begin(), by_z.end(), [this](size_t l, size_t r) { return z_min[l] < z_min[r]; });
+    }
+
+    // Facets whose lowest vertex lies in [z_lo, z_hi], in mesh order: the tie breaking between facets
+    // that sit within EPSILON of each other has to stay the one the full scan used.
+    [[nodiscard]] std::vector<size_t> window(const double z_lo, const double z_hi) const
+    {
+        const auto first = std::lower_bound(by_z.begin(), by_z.end(), z_lo - EPSILON,
+            [this](size_t facet, double z) { return z_min[facet] < z; });
+        const auto last = std::upper_bound(by_z.begin(), by_z.end(), z_hi + EPSILON,
+            [this](double z, size_t facet) { return z < z_min[facet]; });
+        std::vector<size_t> facets(first, last);
+        std::sort(facets.begin(), facets.end());
+        return facets;
+    }
+};
+
+[[nodiscard]] static std::optional<double> overhang_face_z(const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
+                                                           const Polygons &area, const double z_lo, const double z_hi)
+{
+    if (area.empty() || facet_z.z_min.empty())
         return std::nullopt;
     std::optional<double> face_z;
     const indexed_triangle_set &its = mesh.its;
-    for (const stl_triangle_vertex_indices &triangle : its.indices) {
+    for (const size_t facet : facet_z.window(z_lo, z_hi)) {
+        const stl_triangle_vertex_indices &triangle = its.indices[facet];
+        const double                      z_min     = facet_z.z_min[facet];
+        if (face_z && z_min > *face_z - EPSILON)
+            continue;
         const Vec3f &a = its.vertices[triangle[0]];
         const Vec3f &b = its.vertices[triangle[1]];
         const Vec3f &c = its.vertices[triangle[2]];
-        const double z_min = std::min({ double(a.z()), double(b.z()), double(c.z()) });
-        // The window rejects nearly every facet, so test it before anything else.
-        if (z_min < z_lo - EPSILON || z_min > z_hi + EPSILON || (face_z && z_min > *face_z - EPSILON))
-            continue;
         // Only down facing facets: an up facing one of a lower feature inside the same area would
         // otherwise pull the contact below the overhang it belongs to. Sign of the Z component of the
         // face normal, so no normalisation is needed (a degenerate facet counts as up facing).
@@ -415,19 +454,11 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
  * \param storage[in] Background storage to access meshes.
  * \param currently_processing_meshes[in] Indexes of all meshes that are processed in this iteration
  */
-// Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`.
-// The contact layer is lowered so its top ends up exactly `top_z_distance` below the overhang; when
-// that would make it thinner than a printable layer the contact stays one layer lower instead, which
-// only widens the gap and can therefore never fuse the support to the object.
+// Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`: see
+// TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft layers.
 [[nodiscard]] static LayerIndex place_top_contact(TreeSupportLayerGrid &grid, const double overhang_bottom_z, const double top_z_distance)
 {
-    if (grid.size() < 2)
-        return -1;
-    const double z_gap     = overhang_bottom_z - top_z_distance;
-    const LayerIndex layer_idx = std::clamp(grid.idx_ceil(z_gap), LayerIndex(1), LayerIndex(grid.size()) - 1);
-    if (grid.lower_top(layer_idx, z_gap))
-        return layer_idx;
-    return layer_idx - 1;
+    return grid.place_top_contact(overhang_bottom_z, top_z_distance);
 }
 
 [[nodiscard]] static LayerIndex precalculate(const std::vector<LayerIndex> &overhang_top_layer, const PrintObject &print_object, TreeModelVolumes &volumes, std::function<void()> throw_on_cancel)
@@ -3622,16 +3653,19 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             // The grid works in the object's local frame with the belt Z offset removed.
             const double     z_offset = print_object.belt_global_z_offset();
             TriangleMesh     mesh;
+            OverhangFacetZIndex facet_index;
             if (std::any_of(overhangs.begin(), overhangs.end(), [](const Polygons &overhang) { return ! overhang.empty(); })) {
                 mesh = print_object.model_object()->raw_mesh();
                 mesh.transform(print_object.trafo_sliced());
+                // One pass over the facets for all the areas below, instead of one per area.
+                facet_index.build(mesh.its);
             }
             for (size_t overhang_idx = grid.raft_layers; overhang_idx < overhangs.size(); ++ overhang_idx)
                 if (! overhangs[overhang_idx].empty()) {
                     const LayerIndex layer_idx = LayerIndex(overhang_idx);
                     // The overhang shows up in this layer's slice; its face lies between the top of the
                     // layer below and this layer's top.
-                    const std::optional<double> face_z = overhang_face_z(mesh, overhangs[overhang_idx],
+                    const std::optional<double> face_z = overhang_face_z(mesh, facet_index, overhangs[overhang_idx],
                         grid.bottom_z(layer_idx - 1) + z_offset, grid.z(layer_idx) + z_offset);
                     overhang_top_layer[overhang_idx] = place_top_contact(grid,
                         face_z ? *face_z - z_offset : grid.bottom_z(layer_idx), top_z);
