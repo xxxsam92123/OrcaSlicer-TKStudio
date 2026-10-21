@@ -915,8 +915,7 @@ public:
      * \brief Get the Radius part will have based on numeric values.
      * \param distance_to_top[in] The effective distance_to_top of the element
      * \param elephant_foot_increases[in] The elephant_foot_increases of the element.
-     * 
-eturn The radius an element with these attributes would have.
+     * \return The radius an element with these attributes would have.
      */
     [[nodiscard]] inline coord_t getRadius(size_t distance_to_top, const double elephant_foot_increases = 0) const
     {
