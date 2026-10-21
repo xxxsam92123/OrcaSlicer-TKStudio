@@ -3576,7 +3576,8 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         std::vector<LayerIndex> overhang_top_layer(overhangs.size(), -1);
         {
             TreeSupportLayerGrid &grid   = processing.first.layer_grid;
-            const double          top_z  = unscale<double>(processing.first.settings.support_top_distance);
+            // Raw millimetres: the contact layer goes exactly this far below the overhang.
+            const double          top_z  = processing.first.settings.support_top_z_distance_mm;
             for (size_t overhang_idx = grid.raft_layers; overhang_idx < overhangs.size(); ++ overhang_idx)
                 if (! overhangs[overhang_idx].empty())
                     overhang_top_layer[overhang_idx] = place_top_contact(grid, grid.bottom_z(LayerIndex(overhang_idx)), top_z);

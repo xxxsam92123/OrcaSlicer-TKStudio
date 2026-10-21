@@ -355,3 +355,33 @@ TEST_CASE("Organic support accepts a variable layer height profile", "[TreeSuppo
     INFO("validate: " << error.string);
     CHECK(error.string.empty());
 }
+
+// The Cura derived engines (tree_slim / strong / hybrid) derive their clearance layer counts from
+// settings.support_top_distance, which SlicingParameters rounds to whole layers unless support layers
+// are independent of the object's. The organic generator needs the raw millimetres. Both have to be
+// carried side by side: feeding the raw value to the quantised member shifted a tree_slim contact
+// layer by one layer in that configuration (review round 1, issue 2).
+TEST_CASE("The clearance is quantised for the layer synchronised engines and raw for the organic grid", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    constexpr double top_z_distance = 0.3; // 1.5 layer heights at 0.2, so the rounding decides the count
+
+    Slic3r::Print print;
+    slice_with_tree_support(two_tier_mesh(), print, "tree_slim", 30, 0, 0, {
+        // 0 is the configuration in which SlicingParameters quantises the clearance, and the one where
+        // feeding the raw value to the quantised member moved the contact layer.
+        { "independent_support_layer_height", 0 },
+        { "support_top_z_distance",          top_z_distance },
+        { "support_interface_top_layers",    2 },
+    });
+    const PrintObject            &po = *print.objects().front();
+    TreeSupportMeshGroupSettings mesh_settings(po);
+    TreeSupportSettings          config(mesh_settings, po.slicing_parameters());
+
+    // Quantised to whole layers for the layer synchronised engine ...
+    CHECK_THAT(unscale<double>(mesh_settings.support_top_distance), Catch::Matchers::WithinAbs(0.4, 1e-9));
+    // ... two of them at 0.2 mm; the raw 0.3 mm would round to one.
+    CHECK(config.z_distance_top_layers == 2);
+    // The raw millimetre value is what the organic grid places its contact layers from.
+    CHECK_THAT(mesh_settings.support_top_z_distance_mm, Catch::Matchers::WithinAbs(top_z_distance, 1e-9));
+}
