@@ -388,15 +388,18 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     std::optional<double> face_z;
     const indexed_triangle_set &its = mesh.its;
     for (const stl_triangle_vertex_indices &triangle : its.indices) {
-        // Only down facing facets: an up facing one of a lower feature inside the same area would
-        // otherwise pull the contact below the overhang it belongs to.
-        if (its_face_normal(its, triangle).z() >= -float(EPSILON))
-            continue;
         const Vec3f &a = its.vertices[triangle[0]];
         const Vec3f &b = its.vertices[triangle[1]];
         const Vec3f &c = its.vertices[triangle[2]];
         const double z_min = std::min({ double(a.z()), double(b.z()), double(c.z()) });
+        // The window rejects nearly every facet, so test it before anything else.
         if (z_min < z_lo - EPSILON || z_min > z_hi + EPSILON || (face_z && z_min > *face_z - EPSILON))
+            continue;
+        // Only down facing facets: an up facing one of a lower feature inside the same area would
+        // otherwise pull the contact below the overhang it belongs to. Sign of the Z component of the
+        // face normal, so no normalisation is needed (a degenerate facet counts as up facing).
+        if ((double(b.x()) - double(a.x())) * (double(c.y()) - double(b.y())) -
+            (double(b.y()) - double(a.y())) * (double(c.x()) - double(b.x())) >= 0.)
             continue;
         const Polygons footprint{ Polygon{ { Point::new_scale(a.x(), a.y()), Point::new_scale(b.x(), b.y()),
                                             Point::new_scale(c.x(), c.y()) } } };
