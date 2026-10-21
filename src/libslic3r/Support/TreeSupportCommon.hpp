@@ -64,6 +64,14 @@ static constexpr double MIN_SUPPORT_LAYER_HEIGHT = 0.01;
  */
 struct TreeSupportLayerGrid
 {
+    // Millimetres to scaled units, rounded to the nearest unit instead of truncated: the grid Zs come
+    // from double arithmetic, so a 0.19999999999999996 would otherwise end up a unit short of the real
+    // 200 microns and shift every growth limit derived from it.
+    [[nodiscard]] static coord_t scaled_rounded(const double mm)
+    {
+        return SCALING_FACTOR > 0. ? coord_t(std::llround(mm / SCALING_FACTOR)) : coord_t(0);
+    }
+
     struct Entry
     {
         // Z of the top of the layer.
@@ -614,8 +622,8 @@ public:
             min_dtt_to_model = layer_grid.layers_covering(unscale<double>(mesh_group_settings.support_tree_min_height_to_model));
             increase_radius_until_layer = increase_radius_until_radius <= branch_radius ?
                 size_t(tip_layers * (increase_radius_until_radius / branch_radius)) :
-                layers_for_branch_radius_growth(unscale<double>(increase_radius_until_radius - branch_radius));
-            layer_start_bp_radius = LayerIndex(layers_for_bp_radius_growth(unscale<double>(bp_radius - branch_radius)));
+                layers_for_branch_radius_growth(double(increase_radius_until_radius - branch_radius));
+            layer_start_bp_radius = LayerIndex(layers_for_bp_radius_growth(double(bp_radius - branch_radius)));
         }
 
         if (TreeSupportSettings::zero_top_z_gap) {
@@ -846,7 +854,7 @@ public:
 
     [[nodiscard]] static coord_t move_distance_for_height(const double height, const double angle)
     {
-        return angle < M_PI / 2. ? coord_t(std::tan(angle) * scaled<coord_t>(height)) : std::numeric_limits<coord_t>::max();
+        return angle < M_PI / 2. ? coord_t(std::tan(angle) * double(TreeSupportLayerGrid::scaled_rounded(height))) : std::numeric_limits<coord_t>::max();
     }
 
     // How far an influence area may move outward from `layer_idx` down to the layer below it.
@@ -864,13 +872,13 @@ public:
     // `branch_radius_increase_per_layer`, which it replaces layer by layer.
     [[nodiscard]] double branch_radius_increase_at(const LayerIndex layer_idx) const
     {
-        return std::tan(branch_diameter_angle) * double(scaled<coord_t>(layer_grid.h(layer_idx)));
+        return std::tan(branch_diameter_angle) * double(TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx)));
     }
 
     // Radius an elephant foot gains while `layer_idx` is printed. Scaled units.
     [[nodiscard]] double bp_radius_increase_at(const LayerIndex layer_idx) const
     {
-        return std::min(std::tan(0.7) * double(scaled<coord_t>(layer_grid.h(layer_idx))), 0.5 * double(support_line_width));
+        return std::min(std::tan(0.7) * double(TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx))), 0.5 * double(support_line_width));
     }
 
     // Layers until the branch radius grew by `radius_delta`, accumulated over the actual layer heights.
@@ -933,8 +941,8 @@ eturn The radius an element with these attributes would have.
             return getRadius(grown_layers, elephant_foot_increases);
 
         const LayerIndex grown_layer = tip_layer + LayerIndex(grown_layers);
-        const coord_t    z_above     = scaled<coord_t>(layer_grid.z_span(tip_layer, grown_layer));
-        const coord_t    z_tip       = scaled<coord_t>(layer_grid.z_span(tip_layer, tip_layer + LayerIndex(tip_layers)));
+        const coord_t    z_above     = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(tip_layer, grown_layer));
+        const coord_t    z_tip       = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(tip_layer, tip_layer + LayerIndex(tip_layers)));
         const coord_t    radius      = grown_layers <= tip_layers ?
             min_radius + (branch_radius - min_radius) * z_above / std::max<coord_t>(z_tip, 1) :
             branch_radius + coord_t(std::tan(branch_diameter_angle) * double(z_above - z_tip));
