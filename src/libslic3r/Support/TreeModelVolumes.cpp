@@ -224,12 +224,24 @@ void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord
     // like inital layer diameter are only done in once.
     TreeSupportSettings config(m_layer_outlines[m_current_outline_idx].first, print_object.slicing_parameters());
 
+    // Radius an element `distance_to_top` layers below its tip can reach. The generator asks for
+    // `getRadius_at(tip_layer, distance_to_top)`, which integrates the real layer heights between the
+    // tip and the element, so on a variable layer height the requested radius differs from the
+    // nominal `getRadius(distance_to_top)`. The tip is placed on the highest layer here: that is the
+    // longest Z span such an element can cover, hence the largest radius the generator may ask for,
+    // and every shallower tip lands on a layer at or below the one recorded below. On a uniform grid
+    // both expressions are identical.
+    const LayerIndex radius_tip_layer = std::min<LayerIndex>(LayerIndex(max_layer), LayerIndex(config.layer_grid.size()) - 1);
+    const auto       radius_below_tip = [&config, radius_tip_layer](const size_t distance_to_top, const double elephant_foot_increases = 0.) {
+        return config.getRadius_at(radius_tip_layer, distance_to_top, elephant_foot_increases);
+    };
+
     {
         // calculate which radius each layer in the tip may have.
         std::vector<coord_t> possible_tip_radiis;
         for (size_t distance_to_top = 0; distance_to_top <= config.tip_layers; ++ distance_to_top) {
-            possible_tip_radiis.emplace_back(ceilRadius(config.getRadius(distance_to_top)));
-            possible_tip_radiis.emplace_back(ceilRadius(config.getRadius(distance_to_top) + m_current_min_xy_dist_delta));
+            possible_tip_radiis.emplace_back(ceilRadius(radius_below_tip(distance_to_top)));
+            possible_tip_radiis.emplace_back(ceilRadius(radius_below_tip(distance_to_top) + m_current_min_xy_dist_delta));
         }
         sort_remove_duplicates(possible_tip_radiis);
         // It theoretically may happen in the tip, that the radius can change so much in-between 2 layers, 
@@ -259,9 +271,9 @@ void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord
                 assert(it->second >= current_layer);
         };
         // regular radius
-        update_radius_until_layer(ceilRadius(config.getRadius(distance_to_top, 0) + m_current_min_xy_dist_delta));
+        update_radius_until_layer(ceilRadius(radius_below_tip(distance_to_top) + m_current_min_xy_dist_delta));
         // the maximum radius that the radius with the min_xy_dist can achieve
-        update_radius_until_layer(ceilRadius(config.getRadius(distance_to_top, 0)));
+        update_radius_until_layer(ceilRadius(radius_below_tip(distance_to_top)));
         update_radius_until_layer(ceilRadius(config.recommendedMinRadius(current_layer) + m_current_min_xy_dist_delta));
     }
 
