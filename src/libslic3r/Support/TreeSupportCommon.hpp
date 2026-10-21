@@ -130,6 +130,19 @@ struct TreeSupportLayerGrid
 
     double bottom_z(LayerIndex layer_idx) const { return z(layer_idx) - h(layer_idx); }
 
+    // Move the Z where the object's material inside `layer_idx` really starts. A layer whose slice
+    // reaches an overhang starts above the face when the face falls inside the layer below, and the
+    // clearance of the contact layer below has to be measured against the face, not against the
+    // layer's bottom: with the exact gap the contact top sits exactly `top_z_distance` under the face,
+    // so that layer is not within the clearance and must not be treated as an obstacle there.
+    // Lowering it is never done - the layer's slices do start at its bottom everywhere else.
+    void set_obj_bottom_z(LayerIndex layer_idx, const double obj_bottom_z_req)
+    {
+        if (layer_idx < 0 || layer_idx >= LayerIndex(entries.size()))
+            return;
+        entries[layer_idx].obj_bottom_z = std::max(entries[layer_idx].obj_bottom_z, obj_bottom_z_req);
+    }
+
     // Z where the object inside this layer really starts. Stays put when the support stack above is
     // pulled down by a lowered contact layer.
     double obj_bottom_z(LayerIndex layer_idx) const
