@@ -48,11 +48,11 @@ public:
     TreeModelVolumes() = default;
     explicit TreeModelVolumes(const PrintObject &print_object, const BuildVolume &build_volume,
         coord_t max_move, coord_t max_move_slow, size_t current_mesh_idx, 
-        // The layer grid carries the Zs the organic generator settled on, including the contact
-        // layers lowered to an exact Z gap. The collision volumes have to see those Zs: a lowered
-        // contact layer is only part of a layer height below the overhang, which puts the overhang
-        // layer into its "layers above" range.
-        const TreeSupportLayerGrid &layer_grid,
+        // The layer grid the organic generator settled on, including the contact layers lowered to
+        // an exact Z gap. The collision volumes have to see those Zs: a lowered contact layer is only
+        // part of a layer height below the overhang, which puts the overhang layer into its "layers
+        // above" range. Null keeps the plain object layer grid.
+        const TreeSupportLayerGrid *layer_grid = nullptr,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
         double progress_multiplier, 
         double progress_offset, 

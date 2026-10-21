@@ -70,7 +70,7 @@ TreeModelVolumes::TreeModelVolumes(
     const PrintObject &print_object,
     const BuildVolume &build_volume,
     const coord_t max_move, const coord_t max_move_slow, size_t current_mesh_idx,
-    const TreeSupportLayerGrid &layer_grid,
+    const TreeSupportLayerGrid *layer_grid,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
     double progress_multiplier, double progress_offset, 
 #endif // SLIC3R_TREESUPPORTS_PROGRESS
@@ -112,7 +112,8 @@ TreeModelVolumes::TreeModelVolumes(
         m_anti_overhang = print_object.slice_support_blockers();
         TreeSupportMeshGroupSettings mesh_settings(print_object);
         // Take the grid the generator lowered the contact layers on, not the plain object layer grid.
-        mesh_settings.layer_grid = layer_grid;
+        if (layer_grid != nullptr && ! layer_grid->empty())
+            mesh_settings.layer_grid = *layer_grid;
         const TreeSupportSettings config{ mesh_settings, print_object.slicing_parameters() };
         m_current_min_xy_dist = config.xy_min_distance;
         m_current_min_xy_dist_delta = config.xy_distance - m_current_min_xy_dist;

@@ -3565,7 +3565,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
         // Generator for model collision, avoidance and internal guide volumes.
         TreeModelVolumes volumes{ print_object, build_volume, config.maximum_move_distance, config.maximum_move_distance_slow, processing.second.front(),
-            processing.first.layer_grid,
+            &processing.first.layer_grid,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
             m_progress_multiplier, m_progress_offset,
 #endif // SLIC3R_TREESUPPORT_PROGRESS
