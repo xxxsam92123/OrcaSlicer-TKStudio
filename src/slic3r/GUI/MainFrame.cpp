@@ -813,7 +813,6 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
             this->Iconize();
             return;
         }
-        if (evt.CmdDown() && evt.GetKeyCode() == 'Q') { wxPostEvent(this, wxCloseEvent(wxEVT_CLOSE_WINDOW)); return;}
         if (evt.CmdDown() && evt.RawControlDown() && evt.GetKeyCode() == 'F') {
             EnableFullScreenView(true);
             if (IsFullScreen()) {
@@ -912,6 +911,9 @@ bool MainFrame::handle_global_shortcut(const KeyChord& chord)
     case Shortcut::Publish3mf:
         if (can_export_model())
             publish_project();
+        break;
+    case Shortcut::Quit:
+        Close(false);
         break;
     case Shortcut::ShowLabels:
         if (m_plater && m_plater->is_view3D_shown()) {
@@ -3128,7 +3130,7 @@ void MainFrame::init_menubar_as_editor()
         fileMenu->AppendSeparator();
 
 #ifndef __APPLE__
-        append_menu_item(fileMenu, wxID_EXIT, _L("Quit"), wxString::Format(_L("Quit")),
+        append_shortcut_item(fileMenu, Shortcut::Quit, false, _L("Quit"), wxString::Format(_L("Quit")),
             [this](wxCommandEvent&) { Close(false); }, "menu_exit", nullptr);
 #else
         append_menu_item(fileMenu, wxID_EXIT, _L("Quit"), wxString::Format(_L("Quit")),

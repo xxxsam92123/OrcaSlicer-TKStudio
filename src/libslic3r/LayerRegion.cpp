@@ -101,13 +101,14 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
         by_surface[size_t(surface.surface_type)].emplace_back(&surface);
     // Trim surfaces by the fill_boundaries.
     this->fill_surfaces.surfaces.clear();
+    const Polygons fill_boundaries = to_polygons(this->fill_expolygons);
     for (size_t surface_type = 0; surface_type < size_t(stCount); ++ surface_type) {
         const SurfacesPtr &this_surfaces = by_surface[surface_type];
         if (! this_surfaces.empty()) {
             // Select the bridge boundary before clipping away the original slice.
             const ExPolygons &boundary = surface_type == size_t(stBottomBridge) ?
                 this->external_bridge_fill_expolygons : this->fill_expolygons;
-            this->fill_surfaces.append(intersection_ex(this_surfaces, boundary), SurfaceType(surface_type));
+            this->fill_surfaces.append(intersection_ex_by_piece(to_expolygons(this_surfaces), to_polygons(boundary)), SurfaceType(surface_type));
         }
     }
 }
