@@ -262,7 +262,9 @@ struct SupportElementState : public SupportElementStateBits
  */
 [[nodiscard]] inline coord_t support_element_radius(const TreeSupportSettings &settings, const SupportElementState &elem)
 { 
-    return settings.getRadius(getEffectiveDTT(settings, elem), elem.elephant_foot_increases);
+    // Grown from the tip layer upwards, over the actual layer heights (contract §4.1/§4.4).
+    return settings.getRadius_at(elem.layer_idx - LayerIndex(elem.distance_to_top), getEffectiveDTT(settings, elem),
+                                 elem.elephant_foot_increases);
 }
 
 /*!
@@ -272,7 +274,8 @@ struct SupportElementState : public SupportElementStateBits
  */
 [[nodiscard]] inline coord_t support_element_collision_radius(const TreeSupportSettings &settings, const SupportElementState &elem)
 {
-    return settings.getRadius(elem.effective_radius_height, elem.elephant_foot_increases);
+    return settings.getRadius_at(elem.layer_idx - LayerIndex(elem.distance_to_top), elem.effective_radius_height,
+                                 elem.elephant_foot_increases);
 }
 
 struct SupportElement
