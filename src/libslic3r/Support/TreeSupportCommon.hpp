@@ -69,7 +69,12 @@ struct TreeSupportLayerGrid
         // Z of the top of the layer.
         double     print_z  { 0. };
         // Z of the bottom of the layer, equals the print_z of the layer below (0 for the first one).
+        // Lowering or inserting a layer moves this, so it describes the support stack, not the object.
         double     bottom_z { 0. };
+        // Z where the object layer this entry belongs to really starts. Unlike bottom_z it is never
+        // moved when a contact layer is lowered, so collision clearances are measured against the
+        // object rather than against the support stack.
+        double     obj_bottom_z { 0. };
         // print_z - bottom_z. Lowering the top of a layer shrinks it.
         double     height   { 0. };
         // Object layer this support layer belongs to, -1 for the raft layers below the object.
@@ -111,6 +116,19 @@ struct TreeSupportLayerGrid
     }
 
     double bottom_z(LayerIndex layer_idx) const { return z(layer_idx) - h(layer_idx); }
+
+    // Z where the object inside this layer really starts. Stays put when the support stack above is
+    // pulled down by a lowered contact layer.
+    double obj_bottom_z(LayerIndex layer_idx) const
+    {
+        if (entries.empty())
+            return 0.;
+        if (layer_idx < 0)
+            return entries.front().obj_bottom_z;
+        if (layer_idx >= LayerIndex(entries.size()))
+            return entries.back().obj_bottom_z;
+        return entries[layer_idx].obj_bottom_z;
+    }
 
     // Vertical distance between the tops of two layers. The layers tile the Z axis, so this is the
     // sum of the layer heights in between.
@@ -164,7 +182,7 @@ struct TreeSupportLayerGrid
                 continue;
             if (accumulated + height >= distance - EPSILON) {
                 // One more layer crosses the distance; take it when it lands closer than stopping.
-                if (distance - accumulated >= 0.5 * height)
+                if (distance - accumulated >= 0.5 * height - EPSILON)
                     ++ layers;
                 break;
             }
@@ -320,6 +338,7 @@ struct TreeSupportMeshGroupSettings {
                 TreeSupportLayerGrid::Entry entry;
                 entry.print_z  = print_z;
                 entry.bottom_z = layer_grid.entries.empty() ? 0. : layer_grid.entries.back().print_z;
+                entry.obj_bottom_z = entry.bottom_z;
                 entry.height   = entry.print_z - entry.bottom_z;
                 layer_grid.entries.emplace_back(entry);
             };
@@ -348,6 +367,7 @@ struct TreeSupportMeshGroupSettings {
             TreeSupportLayerGrid::Entry entry;
             entry.print_z       = layer.print_z - z_offset;
             entry.bottom_z      = entry.print_z - layer.height;
+            entry.obj_bottom_z  = entry.bottom_z;
             entry.height        = layer.height;
             entry.obj_layer_idx = LayerIndex(i);
             layer_grid.entries.emplace_back(entry);
