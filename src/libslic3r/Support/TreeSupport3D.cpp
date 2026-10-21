@@ -33,6 +33,7 @@
 #include "libslic3r/Support/SupportLayer.hpp"
 #include "SupportCommon.hpp"
 #include "libslic3r/Surface.hpp"
+#include "TriangleMesh.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TreeSupport.hpp"
 #include "I18N.hpp"
@@ -369,6 +370,41 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     return out;
 }
 #endif
+
+// Z of the lowest overhang face inside `area`, searched in the Z window [z_lo, z_hi].
+//
+// The layer stack only records *where* the slicer first sees an overhang, which is the layer whose
+// slice reaches into it. On a variable layer height that layer can start a whole layer above the face
+// itself - the contract T-shape's plate starts at 12.0 inside the layer 11.8691 .. 12.0691 - so
+// measuring the gap from the layer boundary would leave the support 0.069 mm too close to the object,
+// and for a smaller gap it ends up inside the object. The face is a down facing facet of the mesh, so
+// take the lowest of those within `area`. Sloped faces contribute their lowest point, which can only
+// widen the gap, never close it.
+[[nodiscard]] static std::optional<double> overhang_face_z(const TriangleMesh &mesh, const Polygons &area,
+                                                           const double z_lo, const double z_hi)
+{
+    if (area.empty())
+        return std::nullopt;
+    std::optional<double> face_z;
+    const indexed_triangle_set &its = mesh.its;
+    for (const stl_triangle_vertex_indices &triangle : its.indices) {
+        // Only down facing facets: an up facing one of a lower feature inside the same area would
+        // otherwise pull the contact below the overhang it belongs to.
+        if (its_face_normal(its, triangle).z() >= -float(EPSILON))
+            continue;
+        const Vec3f &a = its.vertices[triangle[0]];
+        const Vec3f &b = its.vertices[triangle[1]];
+        const Vec3f &c = its.vertices[triangle[2]];
+        const double z_min = std::min({ double(a.z()), double(b.z()), double(c.z()) });
+        if (z_min < z_lo - EPSILON || z_min > z_hi + EPSILON || (face_z && z_min > *face_z - EPSILON))
+            continue;
+        const Polygons footprint{ Polygon{ { Point::new_scale(a.x(), a.y()), Point::new_scale(b.x(), b.y()),
+                                            Point::new_scale(c.x(), c.y()) } } };
+        if (! intersection(footprint, area).empty())
+            face_z = z_min;
+    }
+    return face_z;
+}
 
 /*!
  * \brief Precalculates all avoidances, that could be required.
@@ -3546,9 +3582,29 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             TreeSupportLayerGrid &grid   = processing.first.layer_grid;
             // Raw millimetres: the contact layer goes exactly this far below the overhang.
             const double          top_z  = processing.first.settings.support_top_z_distance_mm;
+            // The mesh in the frame the layers were sliced in, so the overhang face Z can be measured
+            // against the grid Zs: the face itself is not in the layer stack (see overhang_face_z).
+            // The grid works in the object's local frame with the belt Z offset removed.
+            const double     z_offset = print_object.belt_global_z_offset();
+            TriangleMesh     mesh;
+            if (std::any_of(overhangs.begin(), overhangs.end(), [](const Polygons &overhang) { return ! overhang.empty(); })) {
+                mesh = print_object.model_object()->raw_mesh();
+                mesh.transform(print_object.trafo_sliced());
+            }
             for (size_t overhang_idx = grid.raft_layers; overhang_idx < overhangs.size(); ++ overhang_idx)
-                if (! overhangs[overhang_idx].empty())
-                    overhang_top_layer[overhang_idx] = place_top_contact(grid, grid.bottom_z(LayerIndex(overhang_idx)), top_z);
+                if (! overhangs[overhang_idx].empty()) {
+                    const LayerIndex layer_idx = LayerIndex(overhang_idx);
+                    // The overhang shows up in this layer's slice; its face lies between the top of the
+                    // layer below and this layer's top.
+                    const std::optional<double> face_z = overhang_face_z(mesh, overhangs[overhang_idx],
+                        grid.bottom_z(layer_idx - 1) + z_offset, grid.z(layer_idx) + z_offset);
+                    overhang_top_layer[overhang_idx] = place_top_contact(grid,
+                        face_z ? *face_z - z_offset : grid.bottom_z(layer_idx), top_z);
+                    // The contact layer's clearance is measured against the face, not against this
+                    // layer's bottom, which sits below it on a variable layer height.
+                    if (face_z)
+                        grid.set_obj_bottom_z(layer_idx, *face_z - z_offset);
+                }
         }
 
         // Generator for model collision, avoidance and internal guide volumes.
