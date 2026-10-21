@@ -350,6 +350,107 @@ TEST_CASE("A uniform layer grid keeps every per-layer growth limit at its nomina
             INFO("tip layer " << tip << ", distance_to_top " << distance_to_top);
             CHECK(cfg.getRadius_at(LayerIndex(tip), distance_to_top) == cfg.getRadius(distance_to_top));
         }
+
+    // The radius the tree aims for at least has to stay the nominal layer count times the nominal
+    // growth: on a uniform grid every layer grows the foot by exactly that much.
+    for (size_t i = 0; i < cfg.layer_grid.size(); ++ i) {
+        const LayerIndex layer_idx = LayerIndex(i);
+        INFO("layer " << i);
+        if (layer_idx < cfg.layer_start_bp_radius)
+            CHECK(cfg.recommendedMinRadius(layer_idx) ==
+                  coord_t(cfg.branch_radius + double(cfg.layer_start_bp_radius - layer_idx) * cfg.bp_radius_increase_per_layer));
+        else
+            CHECK(cfg.recommendedMinRadius(layer_idx) == 0);
+    }
+}
+
+// The radius the tree aims for follows the growth of the elephant foot, which is integrated over the
+// real layer heights by bp_radius_increase_at(). Multiplying a layer count by the nominal growth asks
+// for a radius the branches below never reach as soon as the layers are thinner or thicker than the
+// nominal one, which is what a variable layer height produces.
+TEST_CASE("The recommended root radius accumulates the real layer heights", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    Slic3r::Print print;
+    slice_with_tree_support(two_tier_mesh(), print, "organic", 30, 0, 0, {
+        { "support_top_z_distance",       0.2 },
+        { "support_interface_top_layers", 2 },
+    });
+    const PrintObject            &po = *print.objects().front();
+    TreeSupportMeshGroupSettings  ms(po);
+
+    // Same settings, but a grid of 0.1 mm layers: every layer grows the foot by half of what a nominal
+    // 0.2 mm layer does, so the number of growth layers no longer says how much the foot grew.
+    TreeSupportMeshGroupSettings mixed = ms;
+    mixed.layer_grid.entries.clear();
+    mixed.layer_grid.raft_layers = 0;
+    double bottom                = 0.;
+    for (size_t i = 0; i < 8; ++ i) {
+        const double                height = 0.1;
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z     = bottom;
+        entry.obj_bottom_z = bottom;
+        entry.print_z      = bottom + height;
+        entry.height       = height;
+        bottom             = entry.print_z;
+        mixed.layer_grid.entries.emplace_back(entry);
+    }
+    TreeSupportSettings cfg(mixed, po.slicing_parameters());
+
+    const size_t widened = size_t(cfg.layer_start_bp_radius);
+    // At least two growth layers, otherwise one increment would equal the nominal projection.
+    REQUIRE(widened >= 2);
+    double integrated = cfg.branch_radius;
+    for (size_t idx = 1; idx <= widened; ++ idx)
+        integrated += cfg.bp_radius_increase_at(LayerIndex(idx));
+    const double nominal_projection = cfg.branch_radius + double(widened) * cfg.bp_radius_increase_per_layer;
+    // Half as thick layers add up to less than the nominal projection ...
+    CHECK(integrated < nominal_projection - 1.);
+    // ... and the recommendation at the bottom layer follows the grid, not the layer count.
+    CHECK_THAT(double(cfg.recommendedMinRadius(0)), Catch::Matchers::WithinAbs(integrated, 1.));
+    CHECK(cfg.recommendedMinRadius(0) < coord_t(nominal_projection));
+}
+
+TEST_CASE("The top contact of an overhang never lands in the raft", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    // Two raft layers (tops 0.2 and 0.4) followed by four 0.2 mm object layers (tops 0.6 .. 1.2).
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (const double height : { 0.2, 0.2, 0.2, 0.2, 0.2, 0.2 }) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z     = bottom;
+        entry.obj_bottom_z = bottom;
+        entry.print_z      = bottom + height;
+        entry.height       = height;
+        bottom             = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+    grid.raft_layers = 2;
+
+    SECTION("A contact requested inside the raft is refused instead of drawn there") {
+        // Overhang at 0.9 with a 0.55 gap wants its top at 0.35, which is inside the first raft layer.
+        CHECK(grid.place_top_contact(0.9, 0.55) == -1);
+        CHECK_THAT(grid.z(0), Catch::Matchers::WithinAbs(0.2, 1e-9));
+        CHECK_THAT(grid.z(1), Catch::Matchers::WithinAbs(0.4, 1e-9));
+        CHECK_THAT(grid.z(2), Catch::Matchers::WithinAbs(0.6, 1e-9));
+        CHECK(std::count_if(grid.entries.begin(), grid.entries.end(),
+                            [](const TreeSupportLayerGrid::Entry &entry) { return entry.is_gap_layer; }) == 0);
+    }
+
+    SECTION("A gap thinner than a layer steps down but stays above the raft") {
+        // 1.01 leaves less than MIN_SUPPORT_LAYER_HEIGHT of layer 5, so the contact stays one layer lower.
+        CHECK(grid.place_top_contact(1.4, 0.39) == 4);
+        CHECK_THAT(grid.z(5), Catch::Matchers::WithinAbs(1.2, 1e-9));
+        CHECK(! grid.entries[5].is_gap_layer);
+    }
+
+    SECTION("A contact that fits lowers its own layer, leaving the raft alone") {
+        CHECK(grid.place_top_contact(1.4, 0.35) == 5);
+        CHECK_THAT(grid.z(5), Catch::Matchers::WithinAbs(1.05, 1e-9));
+        CHECK(grid.entries[5].is_gap_layer);
+        CHECK_THAT(grid.z(1), Catch::Matchers::WithinAbs(0.4, 1e-9));
+    }
 }
 
 TEST_CASE("Organic support accepts a variable layer height profile", "[TreeSupportOrganicGap]")
