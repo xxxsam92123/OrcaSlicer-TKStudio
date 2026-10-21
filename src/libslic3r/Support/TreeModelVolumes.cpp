@@ -222,14 +222,19 @@ void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord
 
     // Radius an element `distance_to_top` layers below its tip can reach. The generator asks for
     // `getRadius_at(tip_layer, distance_to_top)`, which integrates the real layer heights between the
-    // tip and the element, so on a variable layer height the requested radius differs from the
-    // nominal `getRadius(distance_to_top)`. The tip is placed on the highest layer here: that is the
-    // longest Z span such an element can cover, hence the largest radius the generator may ask for,
-    // and every shallower tip lands on a layer at or below the one recorded below. On a uniform grid
-    // both expressions are identical.
+    // tip and the element. A uniform grid makes that independent of the tip, a variable layer height
+    // does not: the same depth covers a different Z span depending on where the tip sits (a tip under
+    // the thin layers grows less than one under the thick ones). The caches below have to hold every
+    // radius the generator may ask for, otherwise the missing radius is recalculated on demand, and a
+    // request for a layer below the ones already calculated for that radius trips the cache's
+    // contiguous layer range (std::length_error, "vector too long"). So bound the radius by the widest
+    // tip anywhere in the grid. On a uniform grid every tip gives the same radius, so nothing changes.
     const LayerIndex radius_tip_layer = std::min<LayerIndex>(LayerIndex(max_layer), LayerIndex(config.layer_grid.size()) - 1);
     const auto       radius_below_tip = [&config, radius_tip_layer](const size_t distance_to_top, const double elephant_foot_increases = 0.) {
-        return config.getRadius_at(radius_tip_layer, distance_to_top, elephant_foot_increases);
+        coord_t radius = config.getRadius_at(radius_tip_layer, distance_to_top, elephant_foot_increases);
+        for (LayerIndex tip = std::min<LayerIndex>(LayerIndex(distance_to_top), radius_tip_layer); tip < radius_tip_layer; ++ tip)
+            radius = std::max(radius, config.getRadius_at(tip, distance_to_top, elephant_foot_increases));
+        return radius;
     };
 
     {
