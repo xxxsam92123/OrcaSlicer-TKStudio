@@ -264,6 +264,29 @@ struct TreeSupportLayerGrid
         entry.height       = entry.print_z - entry.bottom_z;
         return true;
     }
+
+    // Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`.
+    // The contact layer is lowered so its top ends up exactly `top_z_distance` below the overhang; when
+    // that would make it thinner than a printable layer the contact stays one layer lower instead, which
+    // only widens the gap and can therefore never fuse the support to the object.
+    //
+    // Layer 0 is the build plate face and has no support below it, and a raft layer has no object above
+    // it to gain distance from, so the contact never lands in either of them. Returns -1 when no layer
+    // is left to carry it.
+    LayerIndex place_top_contact(const double overhang_bottom_z, const double top_z_distance)
+    {
+        const LayerIndex lowest = std::max<LayerIndex>(1, LayerIndex(raft_layers));
+        if (entries.size() < size_t(lowest) + 1)
+            return -1;
+        const double     z_gap     = overhang_bottom_z - top_z_distance;
+        const LayerIndex layer_idx = std::clamp(idx_ceil(z_gap), lowest, LayerIndex(entries.size()) - 1);
+        if (lower_top(layer_idx, z_gap))
+            return layer_idx;
+        // One layer lower only widens the gap, but the raft layers are below the object: falling back
+        // into them would draw the contact inside the raft instead of below the overhang.
+        const LayerIndex lowered = layer_idx - 1;
+        return lowered >= LayerIndex(raft_layers) ? lowered : -1;
+    }
 };
 
 enum class InterfacePreference
@@ -998,8 +1021,26 @@ public:
      */
     [[nodiscard]] inline coord_t recommendedMinRadius(LayerIndex layer_idx) const
     {
-        double num_layers_widened = layer_start_bp_radius - layer_idx;
-        return num_layers_widened > 0 ? branch_radius + num_layers_widened * bp_radius_increase_per_layer : 0;
+        const double num_layers_widened = double(layer_start_bp_radius - layer_idx);
+        if (num_layers_widened <= 0.)
+            return 0;
+        // The historical formula multiplies the number of layers by the nominal per-layer growth of the
+        // elephant foot. The foot itself grows by `bp_radius_increase_at()`, i.e. by the real thickness
+        // of each layer, so on a variable layer height the recommendation has to accumulate the same
+        // increments - multiplying them by the count would ask for a radius the branches below never
+        // reach, and the branch spacing derived from it would be wrong (review round 4, issue 1).
+        // A range of nominal layers carries no thickness information beyond the scalar, so it takes the
+        // scalar expression verbatim and a uniform grid stays bit-identical (contract §5.1).
+        bool all_nominal = ! layer_grid.empty();
+        for (LayerIndex idx = layer_idx + 1; all_nominal && idx <= layer_start_bp_radius; ++ idx)
+            all_nominal = nominal_thickness(idx);
+        if (! all_nominal) {
+            double radius = branch_radius;
+            for (LayerIndex idx = layer_idx + 1; idx <= layer_start_bp_radius; ++ idx)
+                radius += bp_radius_increase_at(idx);
+            return coord_t(radius);
+        }
+        return branch_radius + num_layers_widened * bp_radius_increase_per_layer;
     }
 
 #if 0
