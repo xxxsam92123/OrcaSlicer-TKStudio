@@ -288,6 +288,44 @@ TEST_CASE("Support layer grid resolves Z and gap layers on a grid with mixed lay
     }
 }
 
+// The two tiers give a uniform 0.2 mm grid with an overhang at z = 16, so every per-layer limit has
+// to land exactly on the nominal value it replaced (contract §4.1/§5.1). getRadius_at() integrates the
+// Z between a branch tip and the element, and the tips near the bed used to ask for a span below the
+// first layer: clamping that Z shortened the span and changed the radius, which moved the branch.
+TEST_CASE("A uniform layer grid keeps every per-layer growth limit at its nominal value", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    Slic3r::Print print;
+    slice_with_tree_support(two_tier_mesh(), print, "organic", 30, 0, 0, {
+        { "support_top_z_distance",      0.2 },
+        { "support_interface_top_layers", 2 },
+    });
+    const PrintObject           &po = *print.objects().front();
+    TreeSupportMeshGroupSettings ms(po);
+    TreeSupportSettings          cfg(ms, po.slicing_parameters());
+
+    REQUIRE(cfg.layer_grid.size() == size_t(po.layer_count()));
+    REQUIRE(cfg.layer_grid.raft_layers == 0);
+
+    for (size_t i = 0; i < cfg.layer_grid.size(); ++ i) {
+        const LayerIndex layer_idx = LayerIndex(i);
+        INFO("layer " << i);
+        CHECK(cfg.maximum_move_distance_at(layer_idx) == cfg.maximum_move_distance);
+        CHECK(cfg.maximum_move_distance_slow_at(layer_idx) == cfg.maximum_move_distance_slow);
+        CHECK_THAT(cfg.branch_radius_increase_at(layer_idx), Catch::Matchers::WithinAbs(cfg.branch_radius_increase_per_layer, 1e-6));
+        CHECK_THAT(cfg.bp_radius_increase_at(layer_idx), Catch::Matchers::WithinAbs(cfg.bp_radius_increase_per_layer, 1e-6));
+    }
+
+    // Tips anywhere in the grid, including the bottom ones whose growth span reaches below the first
+    // layer and the top ones whose span runs past the object.
+    const std::vector<size_t> tip_layers { 0, 1, 2, 5, 6, 7, 20, size_t(po.layer_count()) - 1 };
+    for (const size_t tip : tip_layers)
+        for (size_t distance_to_top = 0; distance_to_top <= 2 * cfg.tip_layers; ++ distance_to_top) {
+            INFO("tip layer " << tip << ", distance_to_top " << distance_to_top);
+            CHECK(cfg.getRadius_at(LayerIndex(tip), distance_to_top) == cfg.getRadius(distance_to_top));
+        }
+}
+
 TEST_CASE("Organic support accepts a variable layer height profile", "[TreeSupportOrganicGap]")
 {
     Slic3r::Model model;
