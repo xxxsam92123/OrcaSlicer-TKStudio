@@ -520,8 +520,9 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             int                 max_layers_above          = z_distance_top_layers;
             int                 max_layers_below          = z_distance_bottom_layers;
             if (const TreeSupportLayerGrid &grid = settings.layer_grid; grid.size() == outlines.size()) {
-                const double top_distance    = unscale<double>(settings.support_top_distance);
-                const double bottom_distance = unscale<double>(settings.support_bottom_distance);
+                // Raw millimetres: the organic grid measures the clearance in Z, not in whole layers.
+                const double top_distance    = settings.support_top_z_distance_mm;
+                const double bottom_distance = settings.support_bottom_z_distance_mm;
                 num_layers_above.assign(outlines.size(), 0);
                 num_layers_below.assign(outlines.size(), 0);
                 max_layers_above = 0;

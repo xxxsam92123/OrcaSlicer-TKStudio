@@ -205,17 +205,6 @@ struct TreeSupportLayerGrid
         return layers;
     }
 
-    // Rebuild the tiling from the tops: entry k starts where entry k-1 ends. Lowering or inserting a
-    // top therefore can never leave a vertical hole between two neighbouring layers.
-    void retile()
-    {
-        for (size_t idx = 0; idx < entries.size(); ++ idx) {
-            Entry &entry   = entries[idx];
-            entry.bottom_z = idx == 0 ? 0. : entries[idx - 1].print_z;
-            entry.height   = entry.print_z - entry.bottom_z;
-        }
-    }
-
     // Lowest layer whose top reaches z, i.e. the layer that would have to be lowered to end at z.
     LayerIndex idx_ceil(double z_req) const
     {
@@ -234,6 +223,12 @@ struct TreeSupportLayerGrid
 
     // Lower the top of `layer_idx` to `print_z_req`. Returns false when that would leave no layer
     // below the new top (the requested gap is thinner than MIN_SUPPORT_LAYER_HEIGHT).
+    //
+    // The top is lowered rather than a separate gap layer being inserted: the grid is one global stack,
+    // so a layer inserted at the contact Z would leave the object layer above it in the stack and the
+    // support would still reach that layer's top instead of the requested Z. Lowering the contact
+    // layer's own top is the only way to end the support exactly there, and the layer below keeps its
+    // own bottom, so the stack stays tiled.
     bool lower_top(LayerIndex layer_idx, double print_z_req)
     {
         if (layer_idx < 0 || layer_idx >= LayerIndex(entries.size()))
@@ -305,12 +300,15 @@ struct TreeSupportMeshGroupSettings {
         this->support_xy_distance_1st_layer = scaled<coord_t>(config.support_object_first_layer_gap.value);
         // Separation of interfaces, it is likely smaller than support_xy_distance.
         this->support_xy_distance_overhang = std::min(this->support_xy_distance, scaled<coord_t>(0.5 * external_perimeter_width));
-        // Organic tree support places its contact layers from these distances directly, so take the
-        // raw values. SlicingParameters::gap_support_object / gap_object_support have already been
-        // rounded to a multiple of the layer height for the layer-synchronised generators, which is
-        // exactly the quantization the organic generator must not inherit.
-        this->support_top_distance      = scaled<coord_t>(config.support_top_z_distance.value);
-        this->support_bottom_distance   = scaled<coord_t>(config.support_bottom_z_distance.value);
+        // Quantised clearance, as SlicingParameters computed it for the layer synchronised generators.
+        // The Cura derived engines (tree_slim / strong / hybrid) read it through
+        // z_distance_top_layers below, so it must stay rounded to whole layers (review round 1, issue 2).
+        this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
+        this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
+        // Raw millimetres for the organic generator, which places its contact layers exactly this far
+        // below the overhang instead of a whole number of layers. Only the organic paths read these.
+        this->support_top_z_distance_mm    = config.support_top_z_distance.value;
+        this->support_bottom_z_distance_mm = config.support_bottom_z_distance.value;
         this->support_roof_enable       = config.support_interface_top_layers.value > 0;
         this->support_roof_layers       = config.support_interface_top_layers.value;
         this->support_floor_enable      = bottom_interface_layers > 0;
@@ -435,6 +433,11 @@ struct TreeSupportMeshGroupSettings {
     // Support Bottom Distance
     // Distance from the print to the bottom of the support.
     coord_t                         support_bottom_distance                 { scaled<coord_t>(0.1) };
+    // Raw (unquantised) clearances in millimetres. The organic generator places its contact layers
+    // from these; the quantised members above stay for the layer synchronised engines (review round 1,
+    // issue 2).
+    double                          support_top_z_distance_mm               { 0.1 };
+    double                          support_bottom_z_distance_mm            { 0.1 };
     //FIXME likely not needed, optimization for clipping of interface layers
     // When checking where there's model above and below the support, take steps of the given height. Lower values will slice slower, while higher values 
     // may cause normal support to be printed in some places where there should have been support interface.
@@ -612,8 +615,8 @@ public:
         raft_layers.clear();
         for (size_t i = 0; i < layer_grid.raft_layers; ++ i)
             raft_layers.emplace_back(layer_grid.entries[i].print_z);
-        has_top_gap    = mesh_group_settings.support_top_distance > EPSILON;
-        has_bottom_gap = mesh_group_settings.support_bottom_distance > EPSILON;
+        has_top_gap    = mesh_group_settings.support_top_z_distance_mm > EPSILON;
+        has_bottom_gap = mesh_group_settings.support_bottom_z_distance_mm > EPSILON;
 
         // Derive the layer counts from the grid, so a variable layer height does not silently change how
         // many layers a millimetre covers (contract §4.1). On a uniform grid every count resolves to the
@@ -863,27 +866,36 @@ public:
     }
 
     // How far an influence area may move outward from `layer_idx` down to the layer below it.
+    // A layer as thick as the nominal layer height returns the legacy scalar verbatim, so a uniform
+    // layer grid stays bit-identical to the scalar implementation this replaced (contract §5.1).
+    [[nodiscard]] bool nominal_thickness(const LayerIndex layer_idx) const
+    { return TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx)) == layer_height; }
+
     [[nodiscard]] coord_t maximum_move_distance_at(const LayerIndex layer_idx) const
     {
-        return move_distance_for_height(layer_grid.h(layer_idx), support_tree_angle);
+        return nominal_thickness(layer_idx) ? maximum_move_distance :
+            move_distance_for_height(layer_grid.h(layer_idx), support_tree_angle);
     }
 
     [[nodiscard]] coord_t maximum_move_distance_slow_at(const LayerIndex layer_idx) const
     {
-        return move_distance_for_height(layer_grid.h(layer_idx), support_tree_angle_slow);
+        return nominal_thickness(layer_idx) ? maximum_move_distance_slow :
+            move_distance_for_height(layer_grid.h(layer_idx), support_tree_angle_slow);
     }
 
     // Radius a branch gains while `layer_idx` is printed. Scaled units, like
     // `branch_radius_increase_per_layer`, which it replaces layer by layer.
     [[nodiscard]] double branch_radius_increase_at(const LayerIndex layer_idx) const
     {
-        return std::tan(branch_diameter_angle) * double(TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx)));
+        return nominal_thickness(layer_idx) ? branch_radius_increase_per_layer :
+            std::tan(branch_diameter_angle) * double(TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx)));
     }
 
     // Radius an elephant foot gains while `layer_idx` is printed. Scaled units.
     [[nodiscard]] double bp_radius_increase_at(const LayerIndex layer_idx) const
     {
-        return std::min(std::tan(0.7) * double(TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx))), 0.5 * double(support_line_width));
+        return nominal_thickness(layer_idx) ? bp_radius_increase_per_layer :
+            std::min(std::tan(0.7) * double(TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx))), 0.5 * double(support_line_width));
     }
 
     // Layers until the branch radius grew by `radius_delta`, accumulated over the actual layer heights.
@@ -953,6 +965,12 @@ public:
         const LayerIndex grown_layer = tip_layer - LayerIndex(grown_layers);
         const coord_t    z_above     = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(grown_layer, tip_layer));
         const coord_t    z_tip       = TreeSupportLayerGrid::scaled_rounded(layer_grid.z_span(tip_layer - LayerIndex(tip_layers), tip_layer));
+        // Both spans being whole layers means the grid carries no thickness information the scalar
+        // implementation lacks, so take its value verbatim: the expressions are mathematically equal
+        // there, but only the scalar one is bit-for-bit reproducible (products are evaluated in a
+        // different order), and that is what keeps a uniform grid byte-identical (contract §5.1).
+        if (z_above == coord_t(grown_layers) * layer_height && z_tip == coord_t(tip_layers) * layer_height)
+            return getRadius(grown_layers, elephant_foot_increases);
         const coord_t    radius      = grown_layers <= tip_layers ?
             min_radius + (branch_radius - min_radius) * z_above / std::max<coord_t>(z_tip, 1) :
             branch_radius + coord_t(std::tan(branch_diameter_angle) * double(z_above - z_tip));
