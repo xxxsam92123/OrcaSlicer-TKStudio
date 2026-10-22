@@ -490,6 +490,24 @@ bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const Pre
 bool is_compatible_with_printer(const DynamicPrintConfig &preset_config, Preset::Type preset_type,
                                 const DynamicPrintConfig &printer_config, const std::string &printer_name);
 
+// Re-encode the per-variant option keys of a print preset ("key#slot", one slot per entry of the
+// printer's printer_extruder_variant) from the slots of the printer the preset was edited for onto
+// the slots of the printer it is being moved to. Slots are paired by (extruder id, variant name),
+// so a speed set for the high flow variant stays on the high flow variant of the same extruder
+// even where the target printer lists more variants or lists them in another order.
+// Keys without a slot are returned unchanged. A slot with no counterpart on the target printer is
+// dropped -- its key goes to `dropped` and is missing from the result -- except the first slot,
+// which falls back to the target's first slot so single-extruder presets keep their changes.
+// `indices` receives one (old slot, new slot) pair per returned key, std::string::npos for keys
+// without a slot: apply_only() reads and writes at the same slot index, so a caller moving the
+// values between two configs first has to place the old slot's value at the new slot.
+std::vector<std::string> remap_variant_option_keys(
+    const std::vector<std::string> &keys,
+    const std::vector<std::string> &old_variants, const std::vector<int> &old_extruder_ids,
+    const std::vector<std::string> &new_variants, const std::vector<int> &new_extruder_ids,
+    std::vector<std::string> *dropped = nullptr,
+    std::vector<std::pair<size_t, size_t>> *indices = nullptr);
+
 // Where a preset is being loaded from. `Auto` lets load_presets() infer from the directory path.
 struct PresetOrigin {
     enum class Kind { Auto, User, LocalBundle, SubscribedBundle };
