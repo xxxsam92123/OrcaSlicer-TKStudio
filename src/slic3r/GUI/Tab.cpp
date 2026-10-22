@@ -7682,7 +7682,11 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
         DynamicPrintConfig      remapped_source;
         bool                    source_copied = false;
         std::vector<std::string> dropped_options;
-        if (!no_transfer && no_transfer_variant) {
+        // Only a print preset's per-variant options follow the printer's variant list. A filament
+        // preset describes its own slots with its own filament_extruder_variant -- the list may be
+        // shorter and in another order than the printer's -- and the target filament preset is not
+        // known yet at this point, so its slots are not paired here.
+        if (!no_transfer && no_transfer_variant && presets->type() == Preset::TYPE_PRINT) {
             auto variants_of = [](const Preset *printer, std::vector<std::string> &variants, std::vector<int> &extruder_ids) {
                 if (printer == nullptr)
                     return;
@@ -7751,6 +7755,27 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
                 }
                 BOOST_LOG_TRIVIAL(info) << boost::format("transfer options remapped: kept=%1% dropped=%2%") % selected_options.size() % dropped_options.size()
                                         << ", dropped_keys=" << dropped_keys;
+            }
+        }
+        else if (!no_transfer && no_transfer_variant) {
+            // Every other preset type keeps the behavior this path had before slots were paired by
+            // name: an option addressing a per-variant slot cannot be moved to a preset that describes
+            // its slots with a different variant list, so it is dropped and the user is told.
+            auto & options_list = wxGetApp().get_tab(presets->type())->m_options_list;
+            bool has_variants = false;
+            for (auto &opt : selected_options) {
+                if (auto n = opt.find('#'); n != std::string::npos) {
+                    auto iter = options_list.lower_bound(opt.substr(0, n));
+                    if (iter == options_list.end() || opt.compare(0, n, iter->first)) {
+                        has_variants = true;
+                        opt.clear();
+                    }
+                }
+            }
+            if (has_variants) {
+                auto msg = _L("Switching to a printer with different extruder types or numbers will discard or reset changes to extruder or multi-nozzle-related parameters.");
+                MessageDialog(wxGetApp().plater(), msg, _L("Use Modified Value"), wxOK | wxICON_WARNING).ShowModal();
+                selected_options.erase(std::remove(selected_options.begin(), selected_options.end(), ""), selected_options.end());
             }
         }
 
