@@ -494,7 +494,9 @@ bool is_compatible_with_printer(const DynamicPrintConfig &preset_config, Preset:
 // printer's printer_extruder_variant) from the slots of the printer the preset was edited for onto
 // the slots of the printer it is being moved to. Slots are paired by (extruder id, variant name),
 // so a speed set for the high flow variant stays on the high flow variant of the same extruder
-// even where the target printer lists more variants or lists them in another order.
+// even where the target printer lists more variants or lists them in another order. An old slot is
+// resolved once and every option carrying it reuses that answer, so a whole set of edits made on one
+// nozzle travels together; only two different old slots competing for one target slot drop a key.
 // Keys without a slot are returned unchanged. A slot with no counterpart on the target printer is
 // dropped -- its key goes to `dropped` and is missing from the result -- except the first slot,
 // which falls back to the target's first slot so single-extruder presets keep their changes.

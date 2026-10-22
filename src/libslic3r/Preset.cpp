@@ -978,8 +978,12 @@ std::vector<std::string> remap_variant_option_keys(
 {
     std::vector<std::string> remapped;
     remapped.reserve(keys.size());
-    // A target slot takes one old slot: the first one that pairs with it keeps it.
-    std::vector<bool> taken(new_variants.size(), false);
+    // Every old slot resolves to one target slot and every option on that old slot reuses the
+    // answer: the user's edits to one nozzle are a set of options, not a single one.
+    std::vector<size_t> slot_map(old_variants.size(), std::string::npos);
+    std::vector<bool>   slot_resolved(old_variants.size(), false);
+    // A target slot takes one old slot: the first old slot that pairs with it keeps it.
+    std::vector<bool>   taken(new_variants.size(), false);
     // The extruder ids are only comparable when the config actually carries one per variant.
     const bool old_ids_match_variants = old_extruder_ids.size() == old_variants.size();
     const bool new_ids_match_variants = new_extruder_ids.size() == new_variants.size();
@@ -1005,26 +1009,34 @@ std::vector<std::string> remap_variant_option_keys(
         }
 
         size_t match = std::string::npos;
-        for (size_t j = 0; j < new_variants.size(); ++j) {
-            if (taken[j] || new_variants[j] != old_variants[slot])
-                continue;
-            if (old_ids_match_variants && new_ids_match_variants && new_extruder_ids[j] != old_extruder_ids[slot])
-                continue;
-            match = j;
-            break;
+        if (slot_resolved[slot]) {
+            // Same old slot as an earlier key: keep the slot resolved for it.
+            match = slot_map[slot];
+        } else {
+            for (size_t j = 0; j < new_variants.size(); ++j) {
+                if (taken[j] || new_variants[j] != old_variants[slot])
+                    continue;
+                if (old_ids_match_variants && new_ids_match_variants && new_extruder_ids[j] != old_extruder_ids[slot])
+                    continue;
+                match = j;
+                break;
+            }
+            // The first slot is the printer's default variant. When the target lists no variant of
+            // that name its own first slot still stands for it, which keeps a single-extruder preset's
+            // changes when switching between two printers with differently named defaults.
+            if (match == std::string::npos && slot == 0 && ! new_variants.empty() && ! taken[0])
+                match = 0;
+            slot_resolved[slot] = true;
+            slot_map[slot]      = match;
+            if (match != std::string::npos)
+                taken[match] = true;
         }
-        // The first slot is the printer's default variant. When the target lists no variant of that
-        // name its own first slot still stands for it, which keeps a single-extruder preset's changes
-        // when switching between two printers with differently named defaults.
-        if (match == std::string::npos && slot == 0 && ! new_variants.empty() && ! taken[0])
-            match = 0;
         if (match == std::string::npos) {
             if (dropped != nullptr)
                 dropped->push_back(key);
             continue;
         }
 
-        taken[match] = true;
         remapped.push_back(key.substr(0, sharp) + "#" + std::to_string(match));
         if (indices != nullptr)
             indices->emplace_back(slot, match);
