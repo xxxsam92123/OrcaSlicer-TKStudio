@@ -7733,10 +7733,15 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
 
                 if (!dropped_options.empty()) {
                     wxString names;
+                    std::vector<std::string> listed;
                     for (const std::string &key : dropped_options) {
                         const std::string opt_key = key.substr(0, key.find('#'));
                         const ConfigOptionDef *def = print_config_def.get(opt_key);
                         const std::string label = def == nullptr ? opt_key : (def->full_label.empty() ? def->label : def->full_label);
+                        // One option can lose several slots: name it once, in first-seen order.
+                        if (std::find(listed.begin(), listed.end(), label) != listed.end())
+                            continue;
+                        listed.push_back(label);
                         if (!names.IsEmpty())
                             names += ", ";
                         names += _L(label);
