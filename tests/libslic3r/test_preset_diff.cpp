@@ -255,3 +255,48 @@ TEST_CASE("a slot that moved keeps the value it had on the old printer", "[Prese
     REQUIRE_THAT(speed->values[4], Catch::Matchers::WithinAbs(0.f, 1e-4));
     REQUIRE_THAT(speed->values[2], Catch::Matchers::WithinAbs(0.f, 1e-4));
 }
+
+TEST_CASE("several options edited on one variant slot all migrate together", "[PresetDiff][PresetTransfer]")
+{
+    // A user who tunes one nozzle edits a set of speeds, not a single option: every key carrying the
+    // same old slot has to resolve to the same target slot instead of taking it away from each other.
+    const std::vector<std::string> keys {"outer_wall_speed#1", "inner_wall_speed#1",
+                                         "sparse_infill_speed#1", "travel_speed#1"};
+    std::vector<std::string> dropped;
+    std::vector<std::pair<size_t, size_t>> indices;
+
+    const std::vector<std::string> remapped =
+        remap_variant_option_keys(keys, P1S_VARIANTS, P1S_EXTRUDERS, H2S_VARIANTS, H2S_EXTRUDERS, &dropped, &indices);
+
+    REQUIRE(remapped == keys);
+    REQUIRE(dropped.empty());
+    REQUIRE(indices == std::vector<std::pair<size_t, size_t>>{{1, 1}, {1, 1}, {1, 1}, {1, 1}});
+}
+
+TEST_CASE("several options on the default variant slot all migrate together", "[PresetDiff][PresetTransfer]")
+{
+    const std::vector<std::string> keys {"outer_wall_speed#0", "inner_wall_speed#0", "travel_speed#0"};
+    std::vector<std::string> dropped;
+    std::vector<std::pair<size_t, size_t>> indices;
+
+    const std::vector<std::string> remapped =
+        remap_variant_option_keys(keys, P1S_VARIANTS, P1S_EXTRUDERS, H2S_VARIANTS, H2S_EXTRUDERS, &dropped, &indices);
+
+    REQUIRE(remapped == keys);
+    REQUIRE(dropped.empty());
+    REQUIRE(indices == std::vector<std::pair<size_t, size_t>>{{0, 0}, {0, 0}, {0, 0}});
+}
+
+TEST_CASE("a second old slot competing for one target slot drops each of its options", "[PresetDiff][PresetTransfer]")
+{
+    // Two old slots describe the same (extruder, variant) and only one target slot exists: the old
+    // slot that resolves first keeps it and every option of the other one is dropped.
+    std::vector<std::string> dropped;
+    const std::vector<std::string> remapped = remap_variant_option_keys(
+        {"outer_wall_speed#0", "inner_wall_speed#0", "outer_wall_speed#1", "inner_wall_speed#1"},
+        {"Direct Drive Standard", "Direct Drive Standard"}, {1, 1},
+        {"Direct Drive Standard"}, {1}, &dropped);
+
+    REQUIRE(remapped == std::vector<std::string>{"outer_wall_speed#0", "inner_wall_speed#0"});
+    REQUIRE(dropped == std::vector<std::string>{"outer_wall_speed#1", "inner_wall_speed#1"});
+}
