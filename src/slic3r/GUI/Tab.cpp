@@ -7709,7 +7709,10 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
 
                 // apply_only() reads the source and writes the target at one and the same slot index,
                 // so a slot that changed index carries its value over in a copy of the old config.
-                for (size_t i = 0; i < remapped.size(); ++i) {
+                // remap_variant_option_keys() emits one slot pair per returned key.
+                assert(slots.size() == remapped.size());
+                const size_t moved = std::min(remapped.size(), slots.size());
+                for (size_t i = 0; i < moved; ++i) {
                     const size_t from = slots[i].first;
                     const size_t to   = slots[i].second;
                     if (from == std::string::npos || from == to)
