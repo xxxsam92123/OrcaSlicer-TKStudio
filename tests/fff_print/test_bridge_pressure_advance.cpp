@@ -100,14 +100,41 @@ bool is_bridge_role(const std::string &role)
     return role == "Bridge" || role == "Internal Bridge";
 }
 
-// How many times the extrusion sequence switches into or out of a bridge role.
-size_t count_bridge_flips(const std::string &gcode)
+// How many times the extrusion sequence switches into and out of a bridge role.
+struct BridgeFlips
+{
+    size_t entries = 0; // non-bridge -> bridge
+    size_t exits   = 0; // bridge -> non-bridge
+};
+
+BridgeFlips count_bridge_flips(const std::string &gcode)
 {
     const std::vector<std::pair<std::string, double>> samples = pa_by_role(gcode);
-    size_t flips = 0;
-    for (size_t i = 1; i < samples.size(); ++i)
-        flips += is_bridge_role(samples[i - 1].first) != is_bridge_role(samples[i].first) ? 1 : 0;
+    BridgeFlips flips;
+    for (size_t i = 1; i < samples.size(); ++i) {
+        const bool was_bridge = is_bridge_role(samples[i - 1].first);
+        const bool is_bridge  = is_bridge_role(samples[i].first);
+        if (was_bridge == is_bridge)
+            continue;
+        if (is_bridge)
+            ++flips.entries;
+        else
+            ++flips.exits;
+    }
     return flips;
+}
+
+// The markers this branch writes on a bridge-state flip, so the counts below attribute to it alone.
+constexpr const char *kEntryMarker = "; Bridge static pressure advance\n";
+constexpr const char *kExitMarker  = "; Bridge static pressure advance reverted\n";
+
+size_t count_marker(const std::string &gcode, const char *marker)
+{
+    const std::string needle(marker);
+    size_t            n = 0;
+    for (size_t pos = gcode.find(needle); pos != std::string::npos; pos = gcode.find(needle, pos + needle.size()))
+        ++n;
+    return n;
 }
 
 // Every distinct PA value an extrusion of `role` runs with.
@@ -192,12 +219,17 @@ TEST_CASE("Bridge static pressure advance applies to bridge infill without adapt
     for (double value : non_bridge_values)
         REQUIRE(std::abs(value - 0.035) < 1e-6);
 
-    // One PA command per bridge-state flip plus the filament's initial one: the branch must emit on a
-    // transition only, so a per-path emission shows up here as an inflated count.
-    const size_t flips   = count_bridge_flips(gcode);
-    const size_t emitted = count_pa_commands(gcode);
-    INFO("emitted " << emitted << " PA commands, expected 1 + " << flips << " bridge-state flips");
-    REQUIRE(emitted == 1 + flips);
+    // One marker per bridge-state flip, each of the branch's own: counting PA commands instead would also
+    // count the ones the start G-code, the wipe tower and filament changes emit, so a failure could not be
+    // attributed. The branch emits on a transition only, so a per-path emission shows up here as a surplus
+    // of markers, and a missing revert shows up in the exit count.
+    const BridgeFlips flips   = count_bridge_flips(gcode);
+    const size_t      entries = count_marker(gcode, kEntryMarker);
+    const size_t      exits   = count_marker(gcode, kExitMarker);
+    INFO("entries: " << entries << " markers for " << flips.entries << " bridge entries; exits: " << exits
+                     << " markers for " << flips.exits << " bridge exits");
+    REQUIRE(entries == flips.entries);
+    REQUIRE(exits == flips.exits);
 }
 
 TEST_CASE("A zero bridge override leaves the static pressure advance untouched", "[BridgePA]")
@@ -223,16 +255,37 @@ TEST_CASE("Adaptive pressure advance keeps sole control of the bridge pressure a
     const std::string gcode = slice_bridge(config);
 
     // The static bridge branch is gated on adaptive PA being off, so it must not emit anything here.
-    // init_print() forces gcode_comments on (tests/fff_print/test_helpers.cpp:258), so a static-branch
-    // emission would always carry this marker. The positive control in the first test case pins that
-    // coupling: if the helper ever stops forcing the flag, that assertion fails loudly instead of this
-    // one silently passing.
+    // init_print() sets gcode_comments unconditionally after config.apply(), so a static-branch emission
+    // would always carry this marker. The positive control in the first test case pins that coupling: if
+    // the helper ever stops forcing the flag, that assertion fails loudly instead of this one silently
+    // passing.
     REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
 
     // The adaptive processor still applies the bridge override by itself.
     const std::vector<double> bridge_values = pa_values_for_role(gcode, "Bridge");
     REQUIRE(!bridge_values.empty());
     for (double value : bridge_values)
+        REQUIRE(std::abs(value - 0.02) < 1e-6);
+
+    // The distinction the 0.02 above rests on: the model string holds a single flow point, so the
+    // interpolator fails and every path outside the override runs at the extruder's static PA. Pinning
+    // that keeps the bridge assertion honest: give the model a second point and it would pass on the
+    // model's own value without distinguishing the override.
+    size_t non_bridge_samples = 0;
+    for (const auto &sample : pa_by_role(gcode)) {
+        if (is_bridge_role(sample.first) || sample.first == "Overhang wall")
+            continue;
+        INFO("role " << sample.first << " ran at " << sample.second);
+        REQUIRE(std::abs(sample.second - 0.035) < 1e-6);
+        ++non_bridge_samples;
+    }
+    REQUIRE(non_bridge_samples > 0);
+
+    // Overhang perimeters belong to the override's scope while adaptive PA is on - the BR flag carries
+    // both roles - which is the scope the option's tooltip states.
+    const std::vector<double> overhang_values = pa_values_for_role(gcode, "Overhang wall");
+    REQUIRE(!overhang_values.empty());
+    for (double value : overhang_values)
         REQUIRE(std::abs(value - 0.02) < 1e-6);
 }
 

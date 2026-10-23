@@ -10054,9 +10054,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                                      : "; Bridge static pressure advance reverted\n";
         }
         // Note: the revert is emitted on the next path that goes through _extrude. Wipe-tower extrusion is
-        // generated outside this function, so a layer that ends inside a bridge leaves the tower running the
-        // bridge value until the next object path or a toolchange. This is the same class of window the
-        // adaptive PA path has, which also restores only on the next tagged extrusion.
+        // generated outside this function, so a layer that ends inside a bridge leaves the tower at the last
+        // emitted PA value (the tower emits its own M900 K0 while ramming) until the next object path or a
+        // toolchange. This is the same class of window the adaptive PA path has, which also restores only on
+        // the next tagged extrusion.
     }
 
     if (!requires_segmented_extrusion) {
