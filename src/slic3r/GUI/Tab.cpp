@@ -7674,22 +7674,83 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
     else if (dlg.transfer_changes()) // move selected changes
     {
         std::vector<std::string> selected_options = dlg.get_selected_options();
+        // The moved options address the per-variant slots ("key#i", one slot per entry of
+        // printer_extruder_variant) of the printer the preset was edited for, while the tab they are
+        // applied to belongs to the new printer. Pair those slots by (extruder id, variant name) and
+        // re-encode the keys, so a change follows its own nozzle instead of being dropped wholesale
+        // or landing on a same-named variant of another extruder.
+        DynamicPrintConfig      remapped_source;
+        bool                    source_copied = false;
+        std::vector<std::string> dropped_options;
         if (!no_transfer && no_transfer_variant) {
-            auto & options_list = wxGetApp().get_tab(presets->type())->m_options_list;
-            bool has_variants = false;
-            for (auto &opt : selected_options) {
-                if (auto n = opt.find('#'); n != std::string::npos) {
-                    auto iter = options_list.lower_bound(opt.substr(0, n));
-                    if (iter == options_list.end() || opt.compare(0, n, iter->first)) {
-                        has_variants = true;
-                        opt.clear();
+            auto variants_of = [](const Preset *printer, std::vector<std::string> &variants, std::vector<int> &extruder_ids) {
+                if (printer == nullptr)
+                    return;
+                if (const auto *variant_opt = dynamic_cast<const ConfigOptionStrings *>(printer->config.option("printer_extruder_variant")); variant_opt != nullptr)
+                    variants = variant_opt->values;
+                if (const auto *id_opt = dynamic_cast<const ConfigOptionInts *>(printer->config.option("printer_extruder_id")); id_opt != nullptr)
+                    extruder_ids = id_opt->values;
+            };
+
+            const Preset *new_printer = m_preset_bundle->printers.find_preset(new_printer_name, true);
+            if (new_printer != nullptr) {
+                std::vector<std::string> old_variants, new_variants;
+                std::vector<int>         old_extruder_ids, new_extruder_ids;
+                variants_of(&m_preset_bundle->printers.get_edited_preset(), old_variants, old_extruder_ids);
+                variants_of(new_printer, new_variants, new_extruder_ids);
+
+                std::vector<std::pair<size_t, size_t>> slots;
+                std::vector<std::string> remapped = remap_variant_option_keys(selected_options,
+                    old_variants, old_extruder_ids, new_variants, new_extruder_ids, &dropped_options, &slots);
+
+                // apply_only() reads the source and writes the target at one and the same slot index,
+                // so a slot that changed index carries its value over in a copy of the old config.
+                for (size_t i = 0; i < remapped.size(); ++i) {
+                    const size_t from = slots[i].first;
+                    const size_t to   = slots[i].second;
+                    if (from == std::string::npos || from == to)
+                        continue;
+                    const size_t sharp = remapped[i].find('#');
+                    if (sharp == std::string::npos)
+                        continue;
+                    const std::string base = remapped[i].substr(0, sharp);
+                    if (!source_copied) {
+                        remapped_source = presets->get_edited_preset().config;
+                        source_copied   = true;
                     }
+                    // Read from the unmodified preset, write into the copy, so moving two slots of one
+                    // option in opposite directions cannot read a value the other move already wrote.
+                    const auto *src = dynamic_cast<const ConfigOptionVectorBase *>(presets->get_edited_preset().config.option(base));
+                    auto       *dst = dynamic_cast<ConfigOptionVectorBase *>(remapped_source.option(base));
+                    if (src != nullptr && dst != nullptr)
+                        dst->set_at(src, to, from);
                 }
-            }
-            if (has_variants) {
-                auto msg = _L("Switching to a printer with different extruder types or numbers will discard or reset changes to extruder or multi-nozzle-related parameters.");
-                MessageDialog(wxGetApp().plater(), msg, _L("Use Modified Value"), wxOK | wxICON_WARNING).ShowModal();
-                selected_options.erase(std::remove(selected_options.begin(), selected_options.end(), ""), selected_options.end());
+                selected_options = std::move(remapped);
+
+                if (!dropped_options.empty()) {
+                    wxString names;
+                    for (const std::string &key : dropped_options) {
+                        const std::string opt_key = key.substr(0, key.find('#'));
+                        const ConfigOptionDef *def = print_config_def.get(opt_key);
+                        const std::string label = def == nullptr ? opt_key : (def->full_label.empty() ? def->label : def->full_label);
+                        if (!names.IsEmpty())
+                            names += ", ";
+                        names += _L(label);
+                    }
+                    wxString msg = _L("Switching to a printer with different extruder types or numbers will discard or reset changes to extruder or multi-nozzle-related parameters.");
+                    msg += "\n\n";
+                    msg += names;
+                    MessageDialog(wxGetApp().plater(), msg, _L("Use Modified Value"), wxOK | wxICON_WARNING).ShowModal();
+                }
+
+                std::string dropped_keys;
+                for (const std::string &key : dropped_options) {
+                    if (!dropped_keys.empty())
+                        dropped_keys += ",";
+                    dropped_keys += key;
+                }
+                BOOST_LOG_TRIVIAL(info) << boost::format("transfer options remapped: kept=%1% dropped=%2%") % selected_options.size() % dropped_options.size()
+                                        << ", dropped_keys=" << dropped_keys;
             }
         }
 
@@ -7706,10 +7767,10 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
             }
 
             // copy selected options to the cache from edited preset
-            cache_config_diff(selected_options);
+            cache_config_diff(selected_options, source_copied ? &remapped_source : nullptr);
         }
         else
-            wxGetApp().get_tab(presets->type())->cache_config_diff(selected_options);
+            wxGetApp().get_tab(presets->type())->cache_config_diff(selected_options, source_copied ? &remapped_source : nullptr);
     }
 
     return true;
