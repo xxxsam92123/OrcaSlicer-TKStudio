@@ -4861,7 +4861,8 @@ void PrintObject::discover_horizontal_shells()
                 {
 //                    Slic3r::debugf "  looking for neighbors on layer %d...\n", $n;
                     // Reference to the lower layer of a TOP surface, or an upper layer of a BOTTOM surface.
-                    LayerRegion *neighbor_layerm = m_layers[n]->regions()[region_id];
+                    Layer        *neighbor_layer  = m_layers[n];
+                    LayerRegion *neighbor_layerm = neighbor_layer->regions()[region_id];
 
                     // find intersection between neighbor and current layer's surfaces
                     // intersections have contours and holes
@@ -4874,11 +4875,25 @@ void PrintObject::discover_horizontal_shells()
                     // upper perimeter as an obstacle and shell will not be propagated to more upper layers
                     //FIXME How does it work for stInternalBRIDGE? This is set for sparse infill. Likely this does not work.
                     Polygons new_internal_solid;
+                    // A layer_config_range splits the object into a region that only exists inside the
+                    // range, so this region may hold no surfaces at all on the neighbor layer while other
+                    // regions of that layer carry the geometry the shells have to continue into. Then
+                    // propagate over the geometry of the whole layer; the shells are written back to the
+                    // regions that carry the geometry below, so the shell count stays geometric instead
+                    // of being cut short at the range boundary.
+                    bool neighbor_layer_spans_regions = false;
                     {
                         Polygons internal;
                         for (const Surface &surface : neighbor_layerm->fill_surfaces.surfaces)
                             if (surface.surface_type == stInternal || surface.surface_type == stInternalSolid)
                                 polygons_append(internal, to_polygons(surface.expolygon));
+                        neighbor_layer_spans_regions = internal.empty() && neighbor_layer->regions().size() > 1;
+                        if (neighbor_layer_spans_regions)
+                            for (const LayerRegion *other_layerm : neighbor_layer->regions())
+                                if (other_layerm != neighbor_layerm)
+                                    for (const Surface &surface : other_layerm->fill_surfaces.surfaces)
+                                        if (surface.surface_type == stInternal || surface.surface_type == stInternalSolid)
+                                            polygons_append(internal, to_polygons(surface.expolygon));
                         new_internal_solid = intersection(solid, internal, ApplySafetyOffset::Yes);
                     }
                     if (new_internal_solid.empty()) {
@@ -4950,6 +4965,12 @@ void PrintObject::discover_horizontal_shells()
                             for (const Surface &surface : neighbor_layerm->fill_surfaces.surfaces)
                                 if (surface.is_internal() && !surface.is_bridge())
                                     polygons_append(internal, to_polygons(surface.expolygon));
+                            if (neighbor_layer_spans_regions)
+                                for (const LayerRegion *other_layerm : neighbor_layer->regions())
+                                    if (other_layerm != neighbor_layerm)
+                                        for (const Surface &surface : other_layerm->fill_surfaces.surfaces)
+                                            if (surface.is_internal() && !surface.is_bridge())
+                                                polygons_append(internal, to_polygons(surface.expolygon));
                             polygons_append(new_internal_solid,
                                 intersection(
                                     expand(too_narrow, +margin),
@@ -4964,27 +4985,47 @@ void PrintObject::discover_horizontal_shells()
                     }
 
                     // internal-solid are the union of the existing internal-solid surfaces
-                    // and new ones
-                    SurfaceCollection backup = std::move(neighbor_layerm->fill_surfaces);
-                    polygons_append(new_internal_solid, to_polygons(backup.filter_by_type(stInternalSolid)));
-                    ExPolygons internal_solid = union_ex(new_internal_solid);
-                    // assign new internal-solid surfaces to layer
-                    neighbor_layerm->fill_surfaces.set(internal_solid, stInternalSolid);
-                    // subtract intersections from layer surfaces to get resulting internal surfaces
-                    Polygons polygons_internal = to_polygons(std::move(internal_solid));
-                    ExPolygons internal = diff_ex(backup.filter_by_type(stInternal), polygons_internal, ApplySafetyOffset::Yes);
-                    // assign resulting internal surfaces to layer
-                    neighbor_layerm->fill_surfaces.append(internal, stInternal);
-                    polygons_append(polygons_internal, to_polygons(std::move(internal)));
-                    // assign top and bottom surfaces to layer
-                    backup.keep_types({ stTop, stBottom, stBottomBridge });
-                    std::vector<SurfacesPtr> top_bottom_groups;
-                    backup.group(&top_bottom_groups);
-                    for (SurfacesPtr &group : top_bottom_groups)
-                        neighbor_layerm->fill_surfaces.append(
-                            diff_ex(group, polygons_internal),
-                            // Use an existing surface as a template, it carries the bridge angle etc.
-                            *group.front());
+                    // and new ones. Rebuild the fill surfaces of `target` from its own surfaces plus
+                    // the shells `new_solid` adds to it.
+                    auto apply_shells_to_layerm = [](LayerRegion *target, Polygons &&new_solid) {
+                        SurfaceCollection backup = std::move(target->fill_surfaces);
+                        polygons_append(new_solid, to_polygons(backup.filter_by_type(stInternalSolid)));
+                        ExPolygons internal_solid = union_ex(new_solid);
+                        // assign new internal-solid surfaces to layer
+                        target->fill_surfaces.set(internal_solid, stInternalSolid);
+                        // subtract intersections from layer surfaces to get resulting internal surfaces
+                        Polygons polygons_internal = to_polygons(std::move(internal_solid));
+                        ExPolygons internal = diff_ex(backup.filter_by_type(stInternal), polygons_internal, ApplySafetyOffset::Yes);
+                        // assign resulting internal surfaces to layer
+                        target->fill_surfaces.append(internal, stInternal);
+                        polygons_append(polygons_internal, to_polygons(std::move(internal)));
+                        // assign top and bottom surfaces to layer
+                        backup.keep_types({ stTop, stBottom, stBottomBridge });
+                        std::vector<SurfacesPtr> top_bottom_groups;
+                        backup.group(&top_bottom_groups);
+                        for (SurfacesPtr &group : top_bottom_groups)
+                            target->fill_surfaces.append(
+                                diff_ex(group, polygons_internal),
+                                // Use an existing surface as a template, it carries the bridge angle etc.
+                                *group.front());
+                    };
+
+                    if (! neighbor_layer_spans_regions) {
+                        apply_shells_to_layerm(neighbor_layerm, std::move(new_internal_solid));
+                    } else {
+                        // Give each region the part of the shells that falls inside its own geometry.
+                        for (LayerRegion *target : neighbor_layer->regions()) {
+                            Polygons region_internal;
+                            for (const Surface &surface : target->fill_surfaces.surfaces)
+                                if (surface.surface_type == stInternal || surface.surface_type == stInternalSolid)
+                                    polygons_append(region_internal, to_polygons(surface.expolygon));
+                            if (region_internal.empty())
+                                continue;
+                            Polygons region_solid = intersection(new_internal_solid, region_internal, ApplySafetyOffset::Yes);
+                            if (! region_solid.empty())
+                                apply_shells_to_layerm(target, std::move(region_solid));
+                        }
+                    }
                 }
 		EXTERNAL:;
             } // foreach type (stTop, stBottom, stBottomBridge)
