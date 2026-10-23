@@ -10036,7 +10036,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     // With adaptive PA off for the active filament the bridge override is emitted as a plain static
     // PA on bridge paths (external and internal) and reverted on the next non-bridge path. With
     // adaptive PA on the AdaptivePAProcessor already applies the same value for external bridges
-    // (AdaptivePAProcessor.cpp:269), so this branch stays out of the way and the G-code is unchanged.
+    // (the isBridge branch of AdaptivePAProcessor), so this branch stays out of the way and the
+    // G-code is unchanged.
     if (!is_pa_calib && !adaptive_pa
         && m_config.enable_pressure_advance.get_at(pa_config_index)
         && m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index) > EPSILON) {
@@ -10052,6 +10053,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                 gcode += want_bridge ? "; Bridge static pressure advance\n"
                                      : "; Bridge static pressure advance reverted\n";
         }
+        // Note: the revert is emitted on the next path that goes through _extrude. Wipe-tower extrusion is
+        // generated outside this function, so a layer that ends inside a bridge leaves the tower running the
+        // bridge value until the next object path or a toolchange. This is the same class of window the
+        // adaptive PA path has, which also restores only on the next tagged extrusion.
     }
 
     if (!requires_segmented_extrusion) {

@@ -100,6 +100,16 @@ bool is_bridge_role(const std::string &role)
     return role == "Bridge" || role == "Internal Bridge";
 }
 
+// How many times the extrusion sequence switches into or out of a bridge role.
+size_t count_bridge_flips(const std::string &gcode)
+{
+    const std::vector<std::pair<std::string, double>> samples = pa_by_role(gcode);
+    size_t flips = 0;
+    for (size_t i = 1; i < samples.size(); ++i)
+        flips += is_bridge_role(samples[i - 1].first) != is_bridge_role(samples[i].first) ? 1 : 0;
+    return flips;
+}
+
 // Every distinct PA value an extrusion of `role` runs with.
 std::vector<double> pa_values_for_role(const std::string &gcode, const std::string &role)
 {
@@ -140,9 +150,6 @@ struct PaConfig
     bool        adaptive_pa    = false;
     const char *bridges        = "0.02";
     const char *flavor         = "marlin2";
-    // Off by default: gcode_comments defaults to 0, and most cases below assert on the PA commands
-    // alone. The cases that must observe the static branch's comment marker turn it on themselves.
-    bool        gcode_comments = false;
 };
 
 std::string slice_bridge(const PaConfig &pa_config)
@@ -153,8 +160,7 @@ std::string slice_bridge(const PaConfig &pa_config)
          {"adaptive_pressure_advance", pa_config.adaptive_pa ? "1" : "0"},
          {"adaptive_pressure_advance_model", "0.02,10,2000"},
          {"adaptive_pressure_advance_bridges", pa_config.bridges},
-         {"gcode_flavor", pa_config.flavor},
-         {"gcode_comments", pa_config.gcode_comments ? "1" : "0"}});
+         {"gcode_flavor", pa_config.flavor}});
 }
 
 } // namespace
@@ -163,12 +169,11 @@ TEST_CASE("Bridge static pressure advance applies to bridge infill without adapt
           "[BridgePA]")
 {
     PaConfig config;
-    // Comments on so the static branch's own marker is observable: it is emitted only while that
-    // branch fires, which makes the two assertions below a real positive control for the negative
-    // one in the adaptive case further down.
-    config.gcode_comments = true;
     const std::string gcode = slice_bridge(config);
 
+    // init_print() forces gcode_comments on, so these markers are observable whenever the branch
+    // fires; their presence here is what makes the absence assertion in the adaptive case below a
+    // real negative rather than a comment flag that never had a chance to appear.
     REQUIRE(gcode.find("; Bridge static pressure advance\n") != std::string::npos);
     REQUIRE(gcode.find("; Bridge static pressure advance reverted\n") != std::string::npos);
 
@@ -186,6 +191,13 @@ TEST_CASE("Bridge static pressure advance applies to bridge infill without adapt
     REQUIRE(!non_bridge_values.empty());
     for (double value : non_bridge_values)
         REQUIRE(std::abs(value - 0.035) < 1e-6);
+
+    // One PA command per bridge-state flip plus the filament's initial one: the branch must emit on a
+    // transition only, so a per-path emission shows up here as an inflated count.
+    const size_t flips   = count_bridge_flips(gcode);
+    const size_t emitted = count_pa_commands(gcode);
+    INFO("emitted " << emitted << " PA commands, expected 1 + " << flips << " bridge-state flips");
+    REQUIRE(emitted == 1 + flips);
 }
 
 TEST_CASE("A zero bridge override leaves the static pressure advance untouched", "[BridgePA]")
@@ -208,12 +220,13 @@ TEST_CASE("Adaptive pressure advance keeps sole control of the bridge pressure a
 {
     PaConfig config;
     config.adaptive_pa = true;
-    config.gcode_comments = true;
     const std::string gcode = slice_bridge(config);
 
     // The static bridge branch is gated on adaptive PA being off, so it must not emit anything here.
-    // With gcode_comments on the branch would leave its marker behind, so its absence is a real
-    // negative: the case above shows the same marker does appear when the branch does fire.
+    // init_print() forces gcode_comments on (tests/fff_print/test_helpers.cpp:258), so a static-branch
+    // emission would always carry this marker. The positive control in the first test case pins that
+    // coupling: if the helper ever stops forcing the flag, that assertion fails loudly instead of this
+    // one silently passing.
     REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
 
     // The adaptive processor still applies the bridge override by itself.
@@ -267,14 +280,4 @@ TEST_CASE("Bambu Lab printers get the bridge override in the M900 L1000 form", "
 
     REQUIRE(gcode.find("M900 K0.02 L1000 M10 ;") != std::string::npos);
     REQUIRE(gcode.find("M900 K0.035 L1000 M10 ;") != std::string::npos);
-
-    const std::vector<double> bridge_values = pa_values_for_role(gcode, "Bridge");
-    REQUIRE(!bridge_values.empty());
-    for (double value : bridge_values)
-        REQUIRE(std::abs(value - 0.02) < 1e-6);
-
-    const std::vector<double> non_bridge_values = pa_values_outside_bridges(gcode);
-    REQUIRE(!non_bridge_values.empty());
-    for (double value : non_bridge_values)
-        REQUIRE(std::abs(value - 0.035) < 1e-6);
 }

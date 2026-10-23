@@ -3138,7 +3138,7 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("adaptive_pressure_advance_bridges", coFloats);
     def->label = L("Static pressure advance for bridges");
-    def->tooltip = L("Static pressure advance for bridges. Applied to external and internal bridge infill, whether or not adaptive pressure advance is enabled. Set to 0 to use the pressure advance of equivalent walls (the adaptive model when adaptive PA is enabled).\n\n"
+    def->tooltip = L("Static pressure advance for bridges. With adaptive pressure advance off it is applied to external and internal bridge infill; with adaptive pressure advance on the adaptive model still governs internal bridges and this value overrides external bridge infill only. Set to 0 to use the pressure advance of equivalent walls (the adaptive model when adaptive PA is enabled).\n\n"
                     "A lower PA value when printing bridges helps reduce the appearance of slight under-extrusion immediately after bridges. "
                     "This is caused by the pressure drop in the nozzle when printing in the air and a lower PA helps counteract this.");
     def->max = 2;
