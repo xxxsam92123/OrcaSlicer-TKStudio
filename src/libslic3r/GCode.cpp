@@ -10032,6 +10032,28 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         }
     };
 
+    // Orca: bridge static PA, independent of adaptive PA.
+    // With adaptive PA off for the active filament the bridge override is emitted as a plain static
+    // PA on bridge paths (external and internal) and reverted on the next non-bridge path. With
+    // adaptive PA on the AdaptivePAProcessor already applies the same value for external bridges
+    // (AdaptivePAProcessor.cpp:269), so this branch stays out of the way and the G-code is unchanged.
+    if (!is_pa_calib && !adaptive_pa
+        && m_config.enable_pressure_advance.get_at(pa_config_index)
+        && m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index) > EPSILON) {
+        const bool want_bridge = path.role() == erBridgeInfill || path.role() == erInternalBridgeInfill;
+        if (want_bridge != m_bridge_pa_active) {
+            const double pa = want_bridge ? m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index)
+                                          : m_config.pressure_advance.get_at(pa_config_index);
+            gcode += m_writer.set_pressure_advance(pa,
+                imex_pem_tool_for((int) m_writer.filament()->id(), m_imex_parallel_mode,
+                                  m_config.physical_extruder_map));
+            m_bridge_pa_active = want_bridge;
+            if (m_config.gcode_comments)
+                gcode += want_bridge ? "; Bridge static pressure advance\n"
+                                     : "; Bridge static pressure advance reverted\n";
+        }
+    }
+
     if (!requires_segmented_extrusion) {
         // F is mm per minute.
         if( (std::abs(writer().get_current_speed() - F) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON) ){
@@ -11510,6 +11532,7 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
 std::string GCode::set_filament_pressure_advance(unsigned int filament_id, int tool)
 {
     const size_t fi = get_filament_config_index(filament_id);
+    m_bridge_pa_active = false;
     if (!m_config.enable_pressure_advance.get_at(fi))
         return {};
     // Orca: Adaptive PA
@@ -11517,6 +11540,7 @@ std::string GCode::set_filament_pressure_advance(unsigned int filament_id, int t
     m_pa_processor->resetPreviousPA(m_config.pressure_advance.get_at(fi));
     // tool >= 0 addresses one IMEX carriage explicitly; -1 omits the qualifier, so every
     // caller that does not pass one emits exactly what it did before.
+    m_bridge_pa_active = false;
     return m_writer.set_pressure_advance(m_config.pressure_advance.get_at(fi), tool);
 }
 

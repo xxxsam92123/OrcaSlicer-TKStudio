@@ -16745,13 +16745,14 @@ msgstr "桥接的静态 Pressure Advance"
 
 # AI Translated
 msgid ""
-"Static pressure advance value for bridges. Set to 0 to apply the same pressure advance as \n"
-"equivalent walls (using adaptive settings if enabled).\n"
+"Static pressure advance for bridges. Applied to external and internal bridge infill, whether or not "
+"adaptive pressure advance is enabled. Set to 0 to use the pressure advance of equivalent walls (the "
+"adaptive model when adaptive PA is enabled).\n"
 "\n"
 "A lower PA value when printing bridges helps reduce the appearance of slight under-extrusion immediately after bridges. This is caused by the pressure drop in the nozzle when printing in the air and a lower PA helps counteract this."
 msgstr ""
-"桥接的静态 Pressure Advance 值。设为 0 可应用与 \n"
-"等效墙相同的 Pressure Advance（如果启用，则使用自适应设置）。\n"
+"桥接的静态 Pressure Advance。无论是否启用自适应 Pressure Advance，都会应用到外部与内部桥接填充。"
+"设为 0 则使用等效墙的 Pressure Advance（启用自适应 PA 时使用自适应模型）。\n"
 "\n"
 "打印桥接时较低的 PA 值有助于减少桥接之后紧接着出现的轻微欠挤出现象。这是由于在空中打印时喷嘴内压力下降所致，较低的 PA 有助于抵消这种情况。"
 
