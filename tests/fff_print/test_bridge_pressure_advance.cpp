@@ -140,6 +140,9 @@ struct PaConfig
     bool        adaptive_pa    = false;
     const char *bridges        = "0.02";
     const char *flavor         = "marlin2";
+    // Off by default: gcode_comments defaults to 0, and most cases below assert on the PA commands
+    // alone. The cases that must observe the static branch's comment marker turn it on themselves.
+    bool        gcode_comments = false;
 };
 
 std::string slice_bridge(const PaConfig &pa_config)
@@ -150,7 +153,8 @@ std::string slice_bridge(const PaConfig &pa_config)
          {"adaptive_pressure_advance", pa_config.adaptive_pa ? "1" : "0"},
          {"adaptive_pressure_advance_model", "0.02,10,2000"},
          {"adaptive_pressure_advance_bridges", pa_config.bridges},
-         {"gcode_flavor", pa_config.flavor}});
+         {"gcode_flavor", pa_config.flavor},
+         {"gcode_comments", pa_config.gcode_comments ? "1" : "0"}});
 }
 
 } // namespace
@@ -159,7 +163,14 @@ TEST_CASE("Bridge static pressure advance applies to bridge infill without adapt
           "[BridgePA]")
 {
     PaConfig config;
+    // Comments on so the static branch's own marker is observable: it is emitted only while that
+    // branch fires, which makes the two assertions below a real positive control for the negative
+    // one in the adaptive case further down.
+    config.gcode_comments = true;
     const std::string gcode = slice_bridge(config);
+
+    REQUIRE(gcode.find("; Bridge static pressure advance\n") != std::string::npos);
+    REQUIRE(gcode.find("; Bridge static pressure advance reverted\n") != std::string::npos);
 
     const std::vector<double> bridge_values = pa_values_for_role(gcode, "Bridge");
     REQUIRE(!bridge_values.empty());
@@ -197,10 +208,12 @@ TEST_CASE("Adaptive pressure advance keeps sole control of the bridge pressure a
 {
     PaConfig config;
     config.adaptive_pa = true;
+    config.gcode_comments = true;
     const std::string gcode = slice_bridge(config);
 
-    // The static bridge branch is gated on adaptive PA being off, so it must not emit anything here:
-    // with gcode_comments on, its comment marker is the proof it never fired.
+    // The static bridge branch is gated on adaptive PA being off, so it must not emit anything here.
+    // With gcode_comments on the branch would leave its marker behind, so its absence is a real
+    // negative: the case above shows the same marker does appear when the branch does fire.
     REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
 
     // The adaptive processor still applies the bridge override by itself.

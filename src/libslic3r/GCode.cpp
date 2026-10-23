@@ -11540,7 +11540,6 @@ std::string GCode::set_filament_pressure_advance(unsigned int filament_id, int t
     m_pa_processor->resetPreviousPA(m_config.pressure_advance.get_at(fi));
     // tool >= 0 addresses one IMEX carriage explicitly; -1 omits the qualifier, so every
     // caller that does not pass one emits exactly what it did before.
-    m_bridge_pa_active = false;
     return m_writer.set_pressure_advance(m_config.pressure_advance.get_at(fi), tool);
 }
 
