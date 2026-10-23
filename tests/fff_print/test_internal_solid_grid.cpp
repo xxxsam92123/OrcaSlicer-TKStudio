@@ -1,8 +1,10 @@
 #include <catch2/catch_all.hpp>
+#include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -11,6 +13,7 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Fill/FillBase.hpp"
+#include "libslic3r/Fill/FillInternalSolidGrid.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/InternalSolidGrid.hpp"
 #include "libslic3r/Layer.hpp"
@@ -86,7 +89,7 @@ void require_grid_paths_and_walls(TriangleMesh mesh)
     size_t wall_paths = 0;
     size_t solid_paths = 0;
     std::vector<const ExtrusionPath *> grid_walls;
-    for (const Layer *layer : print.objects().front()->layers())
+    for (const Layer *layer : print.objects().front()->layers()) {
         for (const LayerRegion *region : layer->regions()) {
             for (const ExtrusionEntity *entity : region->fills.entities) {
                 const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity);
@@ -111,6 +114,7 @@ void require_grid_paths_and_walls(TriangleMesh mesh)
                     ++solid_paths;
                 }
         }
+    }
 
     REQUIRE(wall_paths > 0);
     REQUIRE_FALSE(grid_walls.empty());
@@ -118,6 +122,30 @@ void require_grid_paths_and_walls(TriangleMesh mesh)
 }
 
 } // namespace
+
+TEST_CASE("Internal solid grid cell angle advances one step per cell and folds at 180 degrees", "[InternalSolidGrid]")
+{
+    using Catch::Matchers::WithinAbs;
+    const float step = float(Geometry::deg2rad(15.));
+    const float base = float(Geometry::deg2rad(0.));
+
+    // step == 0 keeps every cell on the base angle.
+    REQUIRE_THAT(detail::cell_angle(base, 0, 4, 0.f), WithinAbs(base, 1e-6));
+    REQUIRE_THAT(detail::cell_angle(base, 7, 4, 0.f), WithinAbs(base, 1e-6));
+
+    // 4x4 cells: index = y * cells_x + x, offset = (x + y) % 12 for a 15 degree step.
+    // The checkerboard +/-step implementation returns base - step for index 1 and index 6,
+    // so these assertions fail if it is reverted.
+    REQUIRE_THAT(detail::cell_angle(base, 0, 4, step), WithinAbs(base + 0.f * step, 1e-5));  // (0,0)
+    REQUIRE_THAT(detail::cell_angle(base, 1, 4, step), WithinAbs(base + 1.f * step, 1e-5));  // (1,0)
+    REQUIRE_THAT(detail::cell_angle(base, 5, 4, step), WithinAbs(base + 2.f * step, 1e-5));  // (1,1)
+    REQUIRE_THAT(detail::cell_angle(base, 6, 4, step), WithinAbs(base + 3.f * step, 1e-5));  // (2,1)
+
+    // Fold-back: a 15 degree step gives 12 slots, so (x + y) == 12 returns the base angle again.
+    REQUIRE_THAT(detail::cell_angle(base, 12, 16, step), WithinAbs(base, 1e-5));             // (12,0)
+    // A 30 degree step gives 6 slots, so (x + y) == 6 folds back as well.
+    REQUIRE_THAT(detail::cell_angle(base, 6, 16, float(Geometry::deg2rad(30.))), WithinAbs(base, 1e-5));
+}
 
 TEST_CASE("Internal solid grid partitions regular, concave, and holed surfaces", "[InternalSolidGrid]")
 {
