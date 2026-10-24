@@ -49,6 +49,7 @@
 #include "CalibUtils.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/ParameterUtils.hpp"
 #include "libslic3r/Color.hpp"
 #include "format.hpp"
 #include "ConfigValueFormatter.hpp"
@@ -1543,9 +1544,13 @@ void UnsavedChangesDialog::update_tree(Preset::Type type, DynamicConfig * config
                 Tab::translate_category(from_u8(def->category), type) : _L("Others")).ToStdWstring();
         }
         auto category = option.category_local;
-        auto opt = dynamic_cast<ConfigOptionVectorBase*>(config->option(opt_key));
-        std::string           value_from    = opt->vserialize()[from];
-        std::string           value_to    = opt->vserialize()[to];
+        auto *opt = dynamic_cast<ConfigOptionVectorBase *>(config->option(opt_key));
+        std::string           value_from, value_to;
+        if (opt == nullptr)
+            continue;
+        if (!variant_column_value(*opt, from, value_from) || !variant_column_value(*opt, to, value_to))
+            continue; // the index is not a slot of this array (a single-value or per-plate option), so skip it
+                      // instead of reading past its end
         PresetItem            pi            = {type, opt_key, category, option.group_local, option.label_local, into_u8(value_from), into_u8(value_to)};
         m_presetitems.push_back(pi);
     }

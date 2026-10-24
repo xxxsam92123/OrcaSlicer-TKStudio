@@ -12,6 +12,7 @@
 #include <catch2/catch_approx.hpp>
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Preset.hpp"
+#include "libslic3r/ParameterUtils.hpp"
 
 using namespace Slic3r;
 
@@ -1003,4 +1004,39 @@ TEST_CASE("The mixed filament metadata is sized to the filament count", "[Config
     resize_mixed_filament_metadata(config, 2, 4);
     REQUIRE(config.option<ConfigOptionBools>("filament_is_mixed")->values == std::vector<unsigned char>({false, false, false, false}));
     REQUIRE(config.option<ConfigOptionStrings>("filament_mixed_components")->values == std::vector<std::string>({"", "", "", ""}));
+}
+
+TEST_CASE("Only options sized to the nozzle variant columns count as variant columns", "[Config]")
+{
+    // The print layout of the project that crashed the sync: two toolheads sharing one 7-column variant grid.
+    const std::vector<std::string> print_variants = {"Direct Drive Standard", "Direct Drive High Flow", "Direct Drive E3D High Flow",
+                                                     "Direct Drive Standard", "Direct Drive High Flow", "Direct Drive TPU High Flow",
+                                                     "Direct Drive E3D High Flow"};
+    DynamicPrintConfig config;
+    config.option<ConfigOptionInts>("print_extruder_id", true)->values       = {1, 1, 1, 2, 2, 2, 2};
+    config.option<ConfigOptionStrings>("print_extruder_variant", true)->values = print_variants;
+    config.option<ConfigOptionFloats>("outer_wall_speed", true)->values      = {300., 300., 300., 300., 300., 500., 300.};
+    // One value for the whole print rather than one per nozzle, so "small_support_perimeter_speed#0" is not a nozzle slot.
+    config.option<ConfigOptionFloatsOrPercentsNullable>("small_support_perimeter_speed", true)->values = {{30., false}};
+    config.option<ConfigOptionFloatsNullable>("small_support_perimeter_threshold", true)->values        = {5.};
+
+    REQUIRE(is_variant_column_option(config, "outer_wall_speed", "print_extruder_variant", 1));
+    REQUIRE_FALSE(is_variant_column_option(config, "small_support_perimeter_speed", "print_extruder_variant", 1));
+    REQUIRE_FALSE(is_variant_column_option(config, "small_support_perimeter_threshold", "print_extruder_variant", 1));
+
+    const auto *small = dynamic_cast<const ConfigOptionVectorBase *>(config.option("small_support_perimeter_speed"));
+    REQUIRE(small != nullptr);
+    std::string value = "untouched";
+    REQUIRE_FALSE(variant_column_value(*small, 3, value));
+    REQUIRE(value == "untouched");
+    REQUIRE(variant_column_value(*small, 0, value));
+    REQUIRE(value == "30");
+
+    // The motion ability options hold a (normal, silent) pair per variant column, so 7 columns make 14 values.
+    DynamicPrintConfig motion;
+    motion.option<ConfigOptionStrings>("printer_extruder_variant", true)->values = print_variants;
+    motion.option<ConfigOptionFloats>("machine_max_speed_x", true)->values      = std::vector<double>(14, 500.);
+    REQUIRE(is_variant_column_option(motion, "machine_max_speed_x", "printer_extruder_variant", 2));
+    motion.option<ConfigOptionFloats>("machine_max_speed_x", true)->values = std::vector<double>(7, 500.);
+    REQUIRE_FALSE(is_variant_column_option(motion, "machine_max_speed_x", "printer_extruder_variant", 2));
 }
