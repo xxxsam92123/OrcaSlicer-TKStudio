@@ -1,4 +1,5 @@
 #include "ParameterUtils.hpp"
+#include "Config.hpp"
 #include "PrintConfig.hpp"
 #include <cassert>
 #include <vector>

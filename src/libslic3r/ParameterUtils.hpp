@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include "Config.hpp"
 #include "PrintConfig.hpp"
 
 namespace Slic3r {
