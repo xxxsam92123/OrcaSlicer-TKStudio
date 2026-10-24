@@ -4634,6 +4634,7 @@ void TabFilament::build()
         optgroup->append_single_option_line("pressure_advance", "material_flow_ratio_and_pressure_advance#pressure-advance", 0);
         // Orca: the bridge override works with or without adaptive PA, so it sits next to the static PA rather
         // than in the adaptive group below.
+        optgroup->append_single_option_line("enable_bridge_pressure_advance", "material_flow_ratio_and_pressure_advance#pressure-advance-for-bridges", 0);
         optgroup->append_single_option_line("adaptive_pressure_advance_bridges", "material_flow_ratio_and_pressure_advance#pressure-advance-for-bridges", 0);
 
         // Orca: adaptive pressure advance and calibration model
@@ -5089,7 +5090,10 @@ void TabFilament::toggle_options()
         bool has_adaptive_pa = m_config->opt_bool("adaptive_pressure_advance", variant_index);
         toggle_line("adaptive_pressure_advance_overhangs", has_adaptive_pa && pa, 0);
         toggle_line("adaptive_pressure_advance_model", has_adaptive_pa && pa, 0);
-        // Orca: the bridge override applies without adaptive PA, so it only follows the PA switch.
+        // Orca: the bridge override applies without adaptive PA, so it only follows the PA switch. Its own
+        // switch stays independently editable: a preset with the switch off and a non-zero value is still
+        // an override, so the value line must not be locked behind the switch.
+        toggle_option("enable_bridge_pressure_advance", pa, 0);
         toggle_line("adaptive_pressure_advance_bridges", pa, 0);
 
         bool is_pellet_printer = printer_cfg.opt_bool("pellet_modded_printer");

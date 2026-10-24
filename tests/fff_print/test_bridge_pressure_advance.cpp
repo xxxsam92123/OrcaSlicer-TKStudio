@@ -178,6 +178,7 @@ struct PaConfig
     bool        enable_pa      = true;
     const char *pressure_advance = "0.035";
     bool        adaptive_pa    = false;
+    bool        bridge_switch  = false;
     const char *bridges        = "0.02";
     const char *flavor         = "marlin2";
 };
@@ -189,6 +190,7 @@ std::string slice_bridge(const PaConfig &pa_config)
          {"pressure_advance", pa_config.pressure_advance},
          {"adaptive_pressure_advance", pa_config.adaptive_pa ? "1" : "0"},
          {"adaptive_pressure_advance_model", "0.02,10,2000"},
+         {"enable_bridge_pressure_advance", pa_config.bridge_switch ? "1" : "0"},
          {"adaptive_pressure_advance_bridges", pa_config.bridges},
          {"gcode_flavor", pa_config.flavor}});
 }
@@ -336,4 +338,88 @@ TEST_CASE("Bambu Lab printers get the bridge override in the M900 L1000 form", "
 
     REQUIRE(gcode.find("M900 K0.02 L1000 M10 ;") != std::string::npos);
     REQUIRE(gcode.find("M900 K0.035 L1000 M10 ;") != std::string::npos);
+}
+
+// The switch makes 0 a real value on the static channel: the bridge is entered at PA 0 and left again
+// at the filament's own PA. The markers still count the flips one for one, so the zero is emitted on a
+// transition and not per path.
+TEST_CASE("A zero bridge override is applied when the bridge pressure advance switch is on", "[BridgePA]")
+{
+    PaConfig config;
+    config.bridges       = "0";
+    config.bridge_switch = true;
+    const std::string gcode = slice_bridge(config);
+
+    for (const char *role : {"Bridge", "Internal Bridge"}) {
+        const std::vector<double> values = pa_values_for_role(gcode, role);
+        INFO("role " << role);
+        REQUIRE(!values.empty());
+        for (double value : values)
+            REQUIRE(std::abs(value) < 1e-9);
+    }
+
+    // The revert restores the extruder's own PA, so the switch stays scoped to the bridge paths.
+    const std::vector<double> non_bridge_values = pa_values_outside_bridges(gcode);
+    REQUIRE(!non_bridge_values.empty());
+    for (double value : non_bridge_values)
+        REQUIRE(std::abs(value - 0.035) < 1e-6);
+
+    const BridgeFlips flips   = count_bridge_flips(gcode);
+    const size_t      entries = count_marker(gcode, kEntryMarker);
+    const size_t      exits   = count_marker(gcode, kExitMarker);
+    INFO("entries: " << entries << " markers for " << flips.entries << " bridge entries; exits: " << exits
+                     << " markers for " << flips.exits << " bridge exits");
+    REQUIRE(entries == flips.entries);
+    REQUIRE(exits == flips.exits);
+}
+
+// Switched on, a non-zero value behaves exactly as it did while the switch did not exist.
+TEST_CASE("The bridge pressure advance switch leaves a non-zero override unchanged", "[BridgePA]")
+{
+    PaConfig config;
+    config.bridge_switch = true;
+    const std::string gcode = slice_bridge(config);
+
+    for (const char *role : {"Bridge", "Internal Bridge"}) {
+        const std::vector<double> values = pa_values_for_role(gcode, role);
+        INFO("role " << role);
+        REQUIRE(!values.empty());
+        for (double value : values)
+            REQUIRE(std::abs(value - 0.02) < 1e-6);
+    }
+
+    const std::vector<double> non_bridge_values = pa_values_outside_bridges(gcode);
+    REQUIRE(!non_bridge_values.empty());
+    for (double value : non_bridge_values)
+        REQUIRE(std::abs(value - 0.035) < 1e-6);
+}
+
+// The adaptive channel honours the switch on its own: with adaptive PA on the static branch is out of
+// the picture, so a PA of 0 on bridge infill here can only come from the AdaptivePAProcessor override.
+TEST_CASE("The bridge pressure advance switch makes zero override the adaptive model", "[BridgePA]")
+{
+    PaConfig config;
+    config.adaptive_pa   = true;
+    config.bridges       = "0";
+    config.bridge_switch = true;
+    const std::string gcode = slice_bridge(config);
+
+    REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
+
+    const std::vector<double> bridge_values = pa_values_for_role(gcode, "Bridge");
+    REQUIRE(!bridge_values.empty());
+    for (double value : bridge_values)
+        REQUIRE(std::abs(value) < 1e-9);
+
+    // Overhang perimeters share the bridge override on this channel (the PA_Change tag carries both
+    // roles), so they are excluded from the "everything else keeps the extruder PA" set.
+    size_t non_bridge_samples = 0;
+    for (const auto &sample : pa_by_role(gcode)) {
+        if (is_bridge_role(sample.first) || sample.first == "Overhang wall")
+            continue;
+        INFO("role " << sample.first << " ran at " << sample.second);
+        REQUIRE(std::abs(sample.second - 0.035) < 1e-6);
+        ++non_bridge_samples;
+    }
+    REQUIRE(non_bridge_samples > 0);
 }

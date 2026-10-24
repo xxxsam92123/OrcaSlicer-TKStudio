@@ -8479,6 +8479,12 @@ void GCode::append_full_config(const Print &print, std::string &str)
         // consumer. Banning it from the g-code config dump keeps the H2D/A2L/X2D/P2S leaves that carry it
         // byte-identical, while still registering it as a known, validated config key.
         "deretract_speed_extruder_change"sv,
+        // enable_bridge_pressure_advance is a newly-registered filament option whose default is off, so
+        // the slicing body is unchanged for every existing preset. Leaving it in the dump would still add
+        // an `; enable_bridge_pressure_advance = 0` line to every config block, so it is excluded to keep
+        // the dump byte-identical. The switch is read from m_config while slicing, and the value it
+        // switches (adaptive_pressure_advance_bridges) stays in the dump.
+        "enable_bridge_pressure_advance"sv,
         // farthest_point_timelapse is a newly-registered printer key (corexy-only timelapse refinement).
         // Excluding it from the config block keeps the config-dump byte-identical for the whole shipping
         // fleet — otherwise every printer's dump would gain a `= 0` line vs the previous baseline, and
@@ -10038,12 +10044,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     // adaptive PA on the AdaptivePAProcessor already applies the same value for external bridges
     // (the isBridge branch of AdaptivePAProcessor), so this branch stays out of the way and the
     // G-code is unchanged.
+    const bool   bridge_pa_switch = m_config.enable_bridge_pressure_advance.get_at(pa_config_index);
+    const double bridge_pa_value  = m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index);
     if (!is_pa_calib && !adaptive_pa
         && m_config.enable_pressure_advance.get_at(pa_config_index)
-        && m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index) > EPSILON) {
+        && (bridge_pa_switch || bridge_pa_value > EPSILON)) {
         const bool want_bridge = path.role() == erBridgeInfill || path.role() == erInternalBridgeInfill;
         if (want_bridge != m_bridge_pa_active) {
-            const double pa = want_bridge ? m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index)
+            const double pa = want_bridge ? bridge_pa_value
                                           : m_config.pressure_advance.get_at(pa_config_index);
             gcode += m_writer.set_pressure_advance(pa,
                 imex_pem_tool_for((int) m_writer.filament()->id(), m_imex_parallel_mode,
