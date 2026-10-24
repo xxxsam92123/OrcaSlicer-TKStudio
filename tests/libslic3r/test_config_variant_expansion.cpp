@@ -798,7 +798,7 @@ TEST_CASE("pressure advance family is stored per filament variant column", "[Con
     SECTION("the family is registered for per-variant storage") {
         for (const char *key : {"enable_pressure_advance", "pressure_advance", "adaptive_pressure_advance",
                                 "adaptive_pressure_advance_overhangs", "adaptive_pressure_advance_bridges",
-                                "adaptive_pressure_advance_model"})
+                                "adaptive_pressure_advance_model", "enable_bridge_pressure_advance"})
             REQUIRE(filament_options_with_variant.count(key) == 1);
     }
 
@@ -821,6 +821,7 @@ TEST_CASE("pressure advance family is stored per filament variant column", "[Con
         config.option<ConfigOptionBools>("adaptive_pressure_advance", true)->values = {true, false, true, false};
         config.option<ConfigOptionBools>("adaptive_pressure_advance_overhangs", true)->values = {false, true, false, true};
         config.option<ConfigOptionFloats>("adaptive_pressure_advance_bridges", true)->values = {0.051, 0.062, 0.073, 0.084};
+        config.option<ConfigOptionBools>("enable_bridge_pressure_advance", true)->values = {true, false, true, false};
         // One model for both filaments: the expansion gives every filament variant of a filament
         // that filament's model.
         config.option<ConfigOptionStrings>("adaptive_pressure_advance_model", true)->values = {"model-a"};
@@ -853,6 +854,7 @@ TEST_CASE("pressure advance family is stored per filament variant column", "[Con
         REQUIRE(config.option<ConfigOptionBools>("adaptive_pressure_advance")->values == std::vector<unsigned char>({true, false}));
         REQUIRE(config.option<ConfigOptionBools>("adaptive_pressure_advance_overhangs")->values == std::vector<unsigned char>({false, true}));
         REQUIRE(config.option<ConfigOptionFloats>("adaptive_pressure_advance_bridges")->values == std::vector<double>({0.051, 0.084}));
+        REQUIRE(config.option<ConfigOptionBools>("enable_bridge_pressure_advance")->values == std::vector<unsigned char>({true, false}));
         REQUIRE(config.option<ConfigOptionStrings>("adaptive_pressure_advance_model")->values == std::vector<std::string>({"model-a", "model-a"}));
     }
 

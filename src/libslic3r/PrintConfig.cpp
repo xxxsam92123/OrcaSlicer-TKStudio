@@ -3140,7 +3140,7 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Enable bridge static pressure advance");
     def->tooltip = L("Apply the bridge static pressure advance value below even when it is 0.\n\n"
                      "Off: a value of 0 means \"use the pressure advance of equivalent walls\", and a non-zero value only overrides the adaptive model.\n\n"
-                     "On: 0 is a real value - bridge infill is printed with no pressure advance.");
+                     "On: 0 is a real value - bridge infill is printed with no pressure advance (with adaptive pressure advance on, overhang perimeters are printed with 0 as well).");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBools{ false });
 

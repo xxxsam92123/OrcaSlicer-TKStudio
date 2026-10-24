@@ -8484,6 +8484,10 @@ void GCode::append_full_config(const Print &print, std::string &str)
         // an `; enable_bridge_pressure_advance = 0` line to every config block, so it is excluded to keep
         // the dump byte-identical. The switch is read from m_config while slicing, and the value it
         // switches (adaptive_pressure_advance_bridges) stays in the dump.
+        // Cost: the config block is also what "Import Configs" / ConfigBase::load_from_gcode_file reads back,
+        // so a G-code round-trip loses this switch. An enabled switch with value 0 therefore comes back as the
+        // legacy "0 = use equivalent walls" semantics. Accepted for the same reason the keys above accept it:
+        // keeping the config dump byte-identical matters more than a lossy round-trip of a brand-new key.
         "enable_bridge_pressure_advance"sv,
         // farthest_point_timelapse is a newly-registered printer key (corexy-only timelapse refinement).
         // Excluding it from the config block keeps the config-dump byte-identical for the whole shipping

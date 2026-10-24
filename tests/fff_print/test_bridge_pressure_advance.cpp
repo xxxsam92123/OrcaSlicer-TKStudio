@@ -294,6 +294,34 @@ TEST_CASE("Adaptive pressure advance keeps sole control of the bridge pressure a
         REQUIRE(std::abs(value - 0.02) < 1e-6);
 }
 
+// The switch off leaves the adaptive channel as it was: 0 is not a value, so nothing overrides the
+// model and the bridge paths fall back like every other path. This quadrant is the one that keeps the
+// switch's gate from widening into a bare isBridge check - drop the switch and the value test from the
+// override condition and this case is the only one that notices.
+TEST_CASE("A zero bridge override does not disturb the adaptive model while the switch is off", "[BridgePA]")
+{
+    PaConfig config;
+    config.adaptive_pa = true;
+    config.bridges     = "0";
+    const std::string gcode = slice_bridge(config);
+
+    // The model holds a single flow point, so interpolation fails and the extruder's static PA is what
+    // each of these roles runs at - the same footing the adaptive case above establishes for its
+    // non-bridge paths, applied here to the roles the override would have taken.
+    for (const char *role : {"Bridge", "Internal Bridge"}) {
+        const std::vector<double> values = pa_values_for_role(gcode, role);
+        INFO("role " << role);
+        REQUIRE(!values.empty());
+        for (double value : values)
+            REQUIRE(std::abs(value - 0.035) < 1e-6);
+    }
+
+    // init_print() forces gcode_comments on, so an override emission would carry its comment here. The
+    // static branch is gated on adaptive PA being off, so its marker cannot appear either.
+    REQUIRE(gcode.find("; APA Model Override (bridge)") == std::string::npos);
+    REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
+}
+
 TEST_CASE("A bridge override without pressure advance enabled emits nothing", "[BridgePA]")
 {
     PaConfig config;
