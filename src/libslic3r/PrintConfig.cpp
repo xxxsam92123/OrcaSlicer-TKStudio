@@ -5315,7 +5315,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("ironingarchimedeanspiral");
     def->enum_labels.push_back(L("Rectilinear"));
     def->enum_labels.push_back(L("Concentric"));
-    def->enum_labels.push_back(L("Archimedean Spiral"));
+    def->enum_labels.push_back(L("Archimedean Chords"));
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
     

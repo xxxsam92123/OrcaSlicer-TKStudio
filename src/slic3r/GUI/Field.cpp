@@ -95,6 +95,18 @@
 
 namespace Slic3r { namespace GUI {
 
+// Orca: some enum values alias an existing pattern and have no SVG of their own (the ironing-only
+// Archimedean spiral renders with the Archimedean Chords generator). Point them at that pattern's
+// icon so the drop-down stays visually consistent without duplicating the asset.
+static std::string param_icon_key(const std::string &enum_value)
+{
+    static const std::map<std::string, std::string> s_aliases = {
+        { "ironingarchimedeanspiral", "archimedeanchords" },
+    };
+    auto it = s_aliases.find(enum_value);
+    return "param_" + (it == s_aliases.end() ? enum_value : it->second);
+}
+
 wxString double_to_string(double const value, const int max_precision /*= 4*/)
 {
 // Style_NoTrailingZeroes does not work on OSX. It also does not work correctly with some locales on Windows.
@@ -1620,7 +1632,7 @@ void Choice::BUILD()
             boost::filesystem::path image_path(Slic3r::resources_dir());
             image_path /= "images";
             for (auto el : m_opt.enum_labels) {
-                auto icon_name = "param_" + m_opt.enum_values[i];
+                std::string icon_name = param_icon_key(m_opt.enum_values[i]);
                 if (boost::filesystem::exists(image_path / (icon_name + ".svg"))) {
                     ScalableBitmap bm(temp, icon_name, 24);
 				    temp->Append(_(el), bm.bmp());
@@ -2074,7 +2086,7 @@ void Choice::msw_rescale()
         int i = 0;
         auto temp = dynamic_cast<choice_ctrl *>(window);
         for (auto el : m_opt.enum_values) {
-            auto icon_name = "param_" + m_opt.enum_values[i];
+            std::string icon_name = param_icon_key(m_opt.enum_values[i]);
             if (boost::filesystem::exists(image_path / (icon_name + ".svg"))) {
                 ScalableBitmap bm(window, icon_name, 24);
                 temp->SetItemBitmap(i, bm.bmp());
