@@ -180,6 +180,7 @@ struct PaConfig
     bool        adaptive_pa    = false;
     bool        bridge_switch  = false;
     const char *bridges        = "0.02";
+    const char *adaptive_model = "0.02,10,2000";
     const char *flavor         = "marlin2";
 };
 
@@ -189,7 +190,7 @@ std::string slice_bridge(const PaConfig &pa_config)
         {{"enable_pressure_advance", pa_config.enable_pa ? "1" : "0"},
          {"pressure_advance", pa_config.pressure_advance},
          {"adaptive_pressure_advance", pa_config.adaptive_pa ? "1" : "0"},
-         {"adaptive_pressure_advance_model", "0.02,10,2000"},
+         {"adaptive_pressure_advance_model", pa_config.adaptive_model},
          {"enable_bridge_pressure_advance", pa_config.bridge_switch ? "1" : "0"},
          {"adaptive_pressure_advance_bridges", pa_config.bridges},
          {"gcode_flavor", pa_config.flavor}});
@@ -201,6 +202,7 @@ TEST_CASE("Bridge static pressure advance applies to bridge infill without adapt
           "[BridgePA]")
 {
     PaConfig config;
+    config.bridge_switch = true;
     const std::string gcode = slice_bridge(config);
 
     // init_print() forces gcode_comments on, so these markers are observable whenever the branch
@@ -256,7 +258,8 @@ TEST_CASE("A zero bridge override leaves the static pressure advance untouched",
 TEST_CASE("Adaptive pressure advance keeps sole control of the bridge pressure advance", "[BridgePA]")
 {
     PaConfig config;
-    config.adaptive_pa = true;
+    config.adaptive_pa   = true;
+    config.bridge_switch = true;
     const std::string gcode = slice_bridge(config);
 
     // The static bridge branch is gated on adaptive PA being off, so it must not emit anything here.
@@ -266,7 +269,7 @@ TEST_CASE("Adaptive pressure advance keeps sole control of the bridge pressure a
     // passing.
     REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
 
-    // The adaptive processor still applies the bridge override by itself.
+    // The adaptive processor still applies the bridge override by itself, on the switch's authority.
     const std::vector<double> bridge_values = pa_values_for_role(gcode, "Bridge");
     REQUIRE(!bridge_values.empty());
     for (double value : bridge_values)
@@ -335,6 +338,7 @@ TEST_CASE("A bridge override without pressure advance enabled emits nothing", "[
 TEST_CASE("Bridge static pressure advance covers internal bridge infill", "[BridgePA]")
 {
     PaConfig config;
+    config.bridge_switch = true;
     const std::string gcode = slice_bridge(config);
 
     const std::vector<double> internal_values = pa_values_for_role(gcode, "Internal Bridge");
@@ -351,13 +355,15 @@ TEST_CASE("Bridge static pressure advance covers internal bridge infill", "[Brid
 
 TEST_CASE("Bambu Lab printers get the bridge override in the M900 L1000 form", "[BridgePA]")
 {
-    PaConfig    config;
+    PaConfig       config;
     Slic3r::Print  print;
     Slic3r::Model  model;
+    config.bridge_switch = true;
     init_print({mesh(TestMesh::bridge)}, print, model,
         {{"enable_pressure_advance", "1"},
          {"pressure_advance", config.pressure_advance},
          {"adaptive_pressure_advance", "0"},
+         {"enable_bridge_pressure_advance", "1"},
          {"adaptive_pressure_advance_bridges", config.bridges},
          {"gcode_flavor", config.flavor}});
     print.is_BBL_printer() = true;
@@ -450,4 +456,67 @@ TEST_CASE("The bridge pressure advance switch makes zero override the adaptive m
         ++non_bridge_samples;
     }
     REQUIRE(non_bridge_samples > 0);
+}
+
+// The switch is the master switch of the feature: while it is off the value is inert even when it is
+// non-zero, so the static channel must leave the G-code exactly as it is with the value at 0 - one PA
+// command for the filament and nothing per bridge.
+TEST_CASE("A non-zero bridge override is inert while the switch is off", "[BridgePA]")
+{
+    PaConfig config;
+    config.bridges       = "0.02";
+    config.bridge_switch = false;
+    const std::string gcode = slice_bridge(config);
+
+    for (const auto &sample : pa_by_role(gcode)) {
+        INFO("role " << sample.first << " ran at " << sample.second);
+        REQUIRE(std::abs(sample.second - 0.035) < 1e-6);
+    }
+    REQUIRE(!pa_by_role(gcode).empty());
+
+    // Only the filament's initial PA, nothing emitted per bridge.
+    REQUIRE(count_pa_commands(gcode) == 1);
+
+    // init_print() forces gcode_comments on, so a static-branch emission would carry its marker.
+    REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
+}
+
+// The adaptive channel obeys the same master switch: with adaptive PA on and the switch off, a non-zero
+// bridge value must leave the model's own output alone. The model holds two flow points at one
+// acceleration, so the interpolator really initialises and every path reaches the override branch - a
+// single-point model falls back before that branch is even considered, which is what made an earlier
+// version of this case pass with the value ungated. Its PA values sit far from the bridge value under
+// test, so a leak of that value into the model's output cannot pass unnoticed. The proof is a pair of
+// slices that differ only in the bridge value: with the switch off they must agree sample for sample.
+TEST_CASE("The switch off stops the adaptive bridge override", "[BridgePA]")
+{
+    PaConfig with_value;
+    with_value.adaptive_pa    = true;
+    with_value.adaptive_model = "0.06,10,2000\n0.08,20,2000";
+    with_value.bridges        = "0.02";
+    with_value.bridge_switch  = false;
+
+    PaConfig with_zero  = with_value;
+    with_zero.bridges   = "0";
+
+    const std::string gcode_with_value = slice_bridge(with_value);
+    const std::string gcode_with_zero  = slice_bridge(with_zero);
+
+    const std::vector<std::pair<std::string, double>> samples_with_value = pa_by_role(gcode_with_value);
+    const std::vector<std::pair<std::string, double>> samples_with_zero  = pa_by_role(gcode_with_zero);
+    REQUIRE(!samples_with_value.empty());
+    REQUIRE(samples_with_value.size() == samples_with_zero.size());
+    for (size_t i = 0; i < samples_with_value.size(); ++i) {
+        INFO("sample " << i << ": role " << samples_with_value[i].first << " at " << samples_with_value[i].second
+                       << " against role " << samples_with_zero[i].first << " at " << samples_with_zero[i].second);
+        REQUIRE(samples_with_value[i].first == samples_with_zero[i].first);
+        REQUIRE(std::abs(samples_with_value[i].second - samples_with_zero[i].second) < 1e-9);
+    }
+
+    // init_print() forces gcode_comments on, so an override emission would carry its comment - and that
+    // comment sits under the same condition as the override itself.
+    REQUIRE(gcode_with_value.find("; APA Model Override (bridge)") == std::string::npos);
+
+    // The static branch is gated on adaptive PA being off, so its marker cannot appear either.
+    REQUIRE(gcode_with_value.find("; Bridge static pressure advance") == std::string::npos);
 }

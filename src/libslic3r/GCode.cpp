@@ -10043,16 +10043,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
     };
 
     // Orca: bridge static PA, independent of adaptive PA.
-    // With adaptive PA off for the active filament the bridge override is emitted as a plain static
+    // enable_bridge_pressure_advance is the gate for the whole feature on both channels. With it on
+    // and adaptive PA off for the active filament, the bridge override is emitted as a plain static
     // PA on bridge paths (external and internal) and reverted on the next non-bridge path. With
     // adaptive PA on the AdaptivePAProcessor already applies the same value for external bridges
     // (the isBridge branch of AdaptivePAProcessor), so this branch stays out of the way and the
-    // G-code is unchanged.
+    // G-code is unchanged. switch off = the option is inert: bridge_pa_value takes no part in slicing,
+    // not even a non-zero one.
     const bool   bridge_pa_switch = m_config.enable_bridge_pressure_advance.get_at(pa_config_index);
     const double bridge_pa_value  = m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index);
     if (!is_pa_calib && !adaptive_pa
         && m_config.enable_pressure_advance.get_at(pa_config_index)
-        && (bridge_pa_switch || bridge_pa_value > EPSILON)) {
+        && bridge_pa_switch) {
         const bool want_bridge = path.role() == erBridgeInfill || path.role() == erInternalBridgeInfill;
         if (want_bridge != m_bridge_pa_active) {
             const double pa = want_bridge ? bridge_pa_value

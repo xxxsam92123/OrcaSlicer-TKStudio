@@ -5090,11 +5090,12 @@ void TabFilament::toggle_options()
         bool has_adaptive_pa = m_config->opt_bool("adaptive_pressure_advance", variant_index);
         toggle_line("adaptive_pressure_advance_overhangs", has_adaptive_pa && pa, 0);
         toggle_line("adaptive_pressure_advance_model", has_adaptive_pa && pa, 0);
-        // Orca: the bridge override applies without adaptive PA, so it only follows the PA switch. Its own
-        // switch stays independently editable: a preset with the switch off and a non-zero value is still
-        // an override, so the value line must not be locked behind the switch.
+        // Orca: enable_bridge_pressure_advance is the master switch of the bridge static PA feature. Off
+        // means the feature is disabled entirely - the value takes no part in slicing - so the value line
+        // is hidden unconditionally rather than only when it is zero.
         toggle_option("enable_bridge_pressure_advance", pa, 0);
-        toggle_line("adaptive_pressure_advance_bridges", pa, 0);
+        toggle_line("adaptive_pressure_advance_bridges",
+                    pa && m_config->opt_bool("enable_bridge_pressure_advance", variant_index), 0);
 
         bool is_pellet_printer = printer_cfg.opt_bool("pellet_modded_printer");
         toggle_line("pellet_flow_coefficient", is_pellet_printer);

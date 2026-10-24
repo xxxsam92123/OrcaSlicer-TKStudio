@@ -3138,15 +3138,15 @@ void PrintConfigDef::init_fff_params()
 
     def = this->add("enable_bridge_pressure_advance", coBools);
     def->label = L("Enable bridge static pressure advance");
-    def->tooltip = L("Apply the bridge static pressure advance value below even when it is 0.\n\n"
-                     "Off: a value of 0 means \"use the pressure advance of equivalent walls\", and a non-zero value only overrides the adaptive model.\n\n"
-                     "On: 0 is a real value - bridge infill is printed with no pressure advance (with adaptive pressure advance on, overhang perimeters are printed with 0 as well).");
+    def->tooltip = L("Enable the bridge static pressure advance below.\n\n"
+                     "Off: the feature is disabled entirely - the value takes no part in slicing, even when it is non-zero.\n\n"
+                     "On: bridge infill is printed with the value below; 0 is a real value and means no pressure advance on bridges (with adaptive pressure advance on, overhang perimeters follow the same value).");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBools{ false });
 
     def = this->add("adaptive_pressure_advance_bridges", coFloats);
     def->label = L("Static pressure advance for bridges");
-    def->tooltip = L("Static pressure advance for bridges. Applied when \"Enable bridge static pressure advance\" is on (then 0 is a real value: bridge infill runs with no pressure advance) or when the value is greater than 0 (legacy override). With adaptive pressure advance off it is applied to external and internal bridge infill only; with adaptive pressure advance on the adaptive model still governs internal bridges and this value overrides the pressure advance of external bridge infill and overhang perimeters.\n\n"
+    def->tooltip = L("Static pressure advance for bridges. Takes effect only while \"Enable bridge static pressure advance\" is on; 0 is then a real value and bridge infill runs with no pressure advance. With adaptive pressure advance off it is applied to external and internal bridge infill only; with adaptive pressure advance on the adaptive model still governs internal bridges and this value overrides the pressure advance of external bridge infill and overhang perimeters.\n\n"
                     "A lower PA value when printing bridges helps reduce the appearance of slight under-extrusion immediately after bridges. "
                     "This is caused by the pressure drop in the nozzle when printing in the air and a lower PA helps counteract this.");
     def->max = 2;
