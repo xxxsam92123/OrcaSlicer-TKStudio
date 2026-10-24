@@ -3279,11 +3279,9 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
 // free functions called by GCode::_do_export()
 namespace DoExport {
-    static void init_gcode_processor(const PrintConfig& config, GCodeProcessor& processor, bool& silent_time_estimator_enabled,
+    static void init_gcode_processor(const PrintConfig& config, GCodeProcessor& processor,
                                      const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase>& nozzle_group_result = nullptr)
     {
-        silent_time_estimator_enabled = (config.gcode_flavor == gcfMarlinLegacy || config.gcode_flavor == gcfMarlinFirmware)
-                                        && config.silent_mode;
         processor.reset();
         // Slot-resolution context for the streaming replay (reset() just cleared it). This is NOT
         // the post-stream result-field handover at the end of do_export, which gates the richer
@@ -3292,7 +3290,6 @@ namespace DoExport {
         processor.initialize_result_moves();
         processor.apply_config(config);
         processor.configure_exclusion_volume_path_check(config);
-        processor.enable_stealth_time_estimator(silent_time_estimator_enabled);
     }
 
 #if 0
@@ -3585,9 +3582,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // init as filament map
     update_layer_related_config(0);
 
-    // modifies m_silent_time_estimator_enabled
-    DoExport::init_gcode_processor(print.config(), m_processor, m_silent_time_estimator_enabled,
-                                   print.get_layered_nozzle_group_result());
+    DoExport::init_gcode_processor(print.config(), m_processor, print.get_layered_nozzle_group_result());
     set_mass_locator(m_processor, print);
     const bool is_bbl_printers = print.is_BBL_printer();
     const bool skip_config_block = print.config().gcode_skip_config_block;
@@ -5693,7 +5688,9 @@ int GCode::get_highest_bed_temperature(const bool is_first_layer, const Print& p
 {
     auto bed_type = m_config.curr_bed_type;
     int bed_temp = 0;
-    for (auto fidx : print.get_slice_used_filaments(is_first_layer)) {
+    // Only the filaments printed on the first layer touch the bed, so a filament that starts higher up, such as a
+    // support interface, must not raise the bed temperature for the rest of the print.
+    for (auto fidx : print.get_slice_used_filaments(true)) {
         bed_temp = std::max(bed_temp, get_bed_temperature(fidx, is_first_layer, bed_type));
     }
     return bed_temp;
@@ -7382,30 +7379,23 @@ LayerResult GCode::process_layer(
                             }
                         };
 
+                        const auto is_inner = [](const ExtrusionEntity *entity) { return is_inner_wall(*entity); };
+                        const size_t inner_count = entity_type == ObjectByExtruder::Island::Region::PERIMETERS ?
+                            std::count_if(extrusions->entities.begin(), extrusions->entities.end(), is_inner) : 0;
                         bool split_mixed_perimeters =
-                            entity_type == ObjectByExtruder::Island::Region::PERIMETERS &&
                             region.config().outer_wall_filament_id.value != region.config().inner_wall_filament_id.value &&
-                            extrusions->role() == erMixed;
+                            inner_count > 0 && inner_count < extrusions->entities.size();
 
                         if (split_mixed_perimeters) {
                             auto outer_perimeters = std::make_unique<ExtrusionEntityCollection>();
                             auto inner_perimeters = std::make_unique<ExtrusionEntityCollection>();
-                            for (const ExtrusionEntity *entity : extrusions->entities) {
-                                const ExtrusionRole role = entity->role();
-                                if (role == erExternalPerimeter || role == erOverhangPerimeter)
-                                    outer_perimeters->append(*entity);
-                                else if (role == erPerimeter)
-                                    inner_perimeters->append(*entity);
-                            }
+                            for (const ExtrusionEntity *entity : extrusions->entities)
+                                (is_inner(entity) ? inner_perimeters : outer_perimeters)->append(*entity);
 
-                            if (!outer_perimeters->entities.empty()) {
-                                split_perimeter_storage.emplace_back(std::move(outer_perimeters));
-                                process_extrusions(split_perimeter_storage.back().get(), nullptr, false);
-                            }
-                            if (!inner_perimeters->entities.empty()) {
-                                split_perimeter_storage.emplace_back(std::move(inner_perimeters));
-                                process_extrusions(split_perimeter_storage.back().get(), nullptr, false);
-                            }
+                            split_perimeter_storage.emplace_back(std::move(outer_perimeters));
+                            process_extrusions(split_perimeter_storage.back().get(), nullptr, false);
+                            split_perimeter_storage.emplace_back(std::move(inner_perimeters));
+                            process_extrusions(split_perimeter_storage.back().get(), nullptr, false);
                         } else {
                             process_extrusions(extrusions, extrusions, true);
                         }
