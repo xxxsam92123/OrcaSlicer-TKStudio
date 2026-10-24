@@ -789,7 +789,7 @@ static std::pair<size_t, double> ironing_extent(const Print &print)
 
 TEST_CASE("Ironing spacing below the minimum irons at the minimum spacing", "[Fill]")
 {
-    const std::string pattern      = GENERATE("rectilinear", "concentric");
+    const std::string pattern      = GENERATE("rectilinear", "concentric", "ironingarchimedeanspiral");
     const bool        via_filament = GENERATE(false, true);
     const double      spacing      = GENERATE(0., 0.001);
     CAPTURE(pattern, via_filament, spacing);
@@ -814,6 +814,102 @@ TEST_CASE("Ironing spacing below the minimum irons at the minimum spacing", "[Fi
     REQUIRE(minimum.first > 0);
     CHECK(clamped.first == minimum.first);
     CHECK_THAT(clamped.second, Catch::Matchers::WithinRel(minimum.second, 1e-9));
+}
+
+// The ironing toolpaths of a sliced print, in the order they are printed.
+static Polylines ironing_paths(const Print &print)
+{
+    Polylines paths;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->fills.flatten().entities)
+                if (ironing_role(entity->role()))
+                    paths.emplace_back(entity->as_polyline());
+    return paths;
+}
+
+TEST_CASE("Ironing spiral runs from the center outward and skips holes", "[Fill][IroningSpiral]")
+{
+    constexpr double ironing_spacing = 0.1;
+    // The pattern is generated around the object's bounding box centre.
+    auto ironed = [](const char *pattern, const TriangleMesh &mesh) {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({{"ironing_type", "top"},
+                                       {"ironing_pattern", pattern},
+                                       {"ironing_spacing", 0.1},
+                                       {"layer_height", 0.2}});
+        Print print;
+        Slic3r::Test::init_and_process_print({mesh}, print, config);
+        const BoundingBox bbox = print.objects().front()->bounding_box();
+        return std::make_pair(ironing_paths(print),
+                              Vec2d(unscale<double>(bbox.center().x()), unscale<double>(bbox.center().y())));
+    };
+
+    const auto cube_spiral      = ironed("ironingarchimedeanspiral", Slic3r::Test::cube(20));
+    const auto hole_spiral      = ironed("ironingarchimedeanspiral", Slic3r::Test::mesh(Test::TestMesh::cube_with_hole));
+    const auto cube_concentric  = ironed("concentric", Slic3r::Test::cube(20));
+
+    const Vec2d centre = cube_spiral.second;
+    auto radius = [&centre](const Point &p) {
+        return std::hypot(unscale<double>(p.x()) - centre.x(), unscale<double>(p.y()) - centre.y());
+    };
+    auto inside_square = [&centre](const Point &p, double half_extent) {
+        return std::abs(unscale<double>(p.x()) - centre.x()) < half_extent - 1e-3 &&
+               std::abs(unscale<double>(p.y()) - centre.y()) < half_extent - 1e-3;
+    };
+
+    CHECK(!cube_spiral.first.empty());
+    CHECK(!hole_spiral.first.empty());
+
+    // The innermost three line spacings are skipped, so apart from the centre point the radial
+    // lead-in starts from, the first ironed arc is well outside them.
+    size_t points_in_centre = 0;
+    for (const Polyline &path : cube_spiral.first)
+        for (const Point &p : path.points)
+            if (radius(p) < 2.5 * ironing_spacing)
+                ++points_in_centre;
+    CAPTURE(points_in_centre);
+    CHECK(points_in_centre == 1);
+
+    // The hole splits the spiral into separate pieces, each printed away from the centre.
+    REQUIRE(hole_spiral.first.size() >= 2);
+    size_t inward_paths = 0;
+    for (const Polyline &path : hole_spiral.first)
+        if (radius(path.points.front()) > radius(path.points.back()) + 0.5 * ironing_spacing)
+            ++inward_paths;
+    CAPTURE(inward_paths);
+    CHECK(inward_paths == 0);
+
+    // The 10x10 hole is left bare.
+    size_t points_in_hole = 0;
+    for (const Polyline &path : hole_spiral.first)
+        for (const Point &p : path.points)
+            if (inside_square(p, 5.))
+                ++points_in_hole;
+    CAPTURE(points_in_hole);
+    CHECK(points_in_hole == 0);
+
+    // Pieces are emitted in increasing start radius: the surface is ironed from the inside out.
+    size_t out_of_order = 0;
+    for (size_t i = 1; i < hole_spiral.first.size(); ++i)
+        if (radius(hole_spiral.first[i].points.front()) + 0.5 * ironing_spacing <
+            radius(hole_spiral.first[i - 1].points.front()))
+            ++out_of_order;
+    CAPTURE(out_of_order);
+    CHECK(out_of_order == 0);
+
+    // The spiral is a toolpath of its own, not a silent fallback to the concentric pattern.
+    auto extent = [](const Polylines &paths) {
+        double length = 0.;
+        for (const Polyline &path : paths)
+            length += unscale<double>(path.length());
+        return std::make_pair(paths.size(), length);
+    };
+    const auto spiral      = extent(cube_spiral.first);
+    const auto concentric  = extent(cube_concentric.first);
+    CAPTURE(spiral.first, concentric.first, spiral.second, concentric.second);
+    CHECK(spiral.first != concentric.first);
+    CHECK(std::abs(spiral.second - concentric.second) > 0.001 * concentric.second);
 }
 
 TEST_CASE("Concentric fill at zero spacing returns without paths", "[Fill]")

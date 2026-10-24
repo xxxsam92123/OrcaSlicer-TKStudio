@@ -133,6 +133,8 @@ enum InfillPattern : int {
     ipCrossHatch, ipTpmsD, ipTpmsFK, ipGyroid,
     ipConcentric, ipSpiralInset, ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral,
     ipSupportBase, ipConcentricInternal, ipInternalSolidGrid,
+    // Orca: ironing-only pattern. Appended right before ipCount so every existing value keeps its number.
+    ipIroningArchimedeanSpiral,
     ipCount,
 };
 

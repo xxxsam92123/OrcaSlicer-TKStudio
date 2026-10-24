@@ -1,4 +1,5 @@
 #include "../ClipperUtils.hpp"
+#include "../EdgeGrid.hpp"
 #include "../ShortestPath.hpp"
 
 #include "libslic3r/BoundingBox.hpp"
@@ -81,6 +82,27 @@ void InfillPolylineClipper::add_point(const Vec2d &fpt)
     }
 }
 
+// Squared distance to the pattern origin, which FillPlanePath places at the geometric center.
+static inline double radius_sq(const Point &p)
+{
+    return double(p.x()) * double(p.x()) + double(p.y()) * double(p.y());
+}
+
+// Simplest ironing spiral: the clipped Archimedean path is already generated from the geometric
+// center outward. Orient every clipped piece outward and emit them in increasing start-radius
+// order. Holes stay as travel moves; no chaining, no region clustering, no extra connectors.
+static Polylines spiral_center_out_skip_holes(Polylines &&pieces)
+{
+    for (Polyline &pl : pieces)
+        if (radius_sq(pl.first_point()) > radius_sq(pl.last_point()))
+            pl.reverse();
+    if (pieces.size() > 1)
+        std::sort(pieces.begin(), pieces.end(), [](const Polyline &a, const Polyline &b) {
+            return radius_sq(a.first_point()) < radius_sq(b.first_point());
+        });
+    return std::move(pieces);
+}
+
 void FillPlanePath::_fill_surface_single(
     const FillParams                &params, 
     unsigned int                     thickness_layers,
@@ -89,6 +111,9 @@ void FillPlanePath::_fill_surface_single(
     Polylines                       &polylines_out)
 {
     expolygon.rotate(-direction.first);
+
+    const bool archimedean         = dynamic_cast<FillArchimedeanChords *>(this) != nullptr;
+    const bool archimedean_ironing = archimedean && params.extrusion_role == erIroning;
 
     //FIXME Vojtech: We are not sure whether the user expects the fill patterns on visible surfaces to be aligned across all the islands of a single layer.
     // One may align for this->centered() to align the patterns for Archimedean Chords and Octagram Spiral patterns.
@@ -117,9 +142,11 @@ void FillPlanePath::_fill_surface_single(
     expolygon.translate(-shift.x(), -shift.y());
     bounding_box.translate(-shift.x(), -shift.y());
 
+    // Hoisted out of the generation block below: the Archimedean ironing lead-in needs the same
+    // line spacing to decide which inner turns to skip.
+    const double distance_between_lines = scaled<double>(this->spacing) * params.multiline / params.density;
     Polyline polyline;
     {
-        auto distance_between_lines = scaled<double>(this->spacing) * params.multiline / params.density;
         auto min_x = coord_t(ceil(coordf_t(bounding_box.min.x()) / distance_between_lines));
         auto min_y = coord_t(ceil(coordf_t(bounding_box.min.y()) / distance_between_lines));
         auto max_x = coord_t(ceil(coordf_t(bounding_box.max.x()) / distance_between_lines));
@@ -139,6 +166,19 @@ void FillPlanePath::_fill_surface_single(
         }
     }
 
+    if (archimedean_ironing && polyline.points.size() > 1) {
+        // Keep the geometric center, skip the inner spiral up to the requested radius, then connect
+        // the center directly to the first retained arc. This leaves the very middle of the surface
+        // un-ironed and matches the top-surface Archimedean pattern's short radial lead-in.
+        constexpr double start_radius_in_spacings = 3.;
+        const double start_radius_sq = start_radius_in_spacings * start_radius_in_spacings *
+                                       distance_between_lines * distance_between_lines;
+        auto first = std::find_if(polyline.points.begin(), polyline.points.end(),
+                                  [start_radius_sq](const Point &p) { return radius_sq(p) >= start_radius_sq; });
+        if (first != polyline.points.end())
+            polyline.points.erase(polyline.points.begin() + 1, first);
+    }
+
     Polylines polylines = {polyline};
 
     // Apply multiline offset if needed
@@ -147,8 +187,50 @@ void FillPlanePath::_fill_surface_single(
     if (polyline.size() >= 2) {
         polylines = intersection_pl(std::move(polylines), expolygon);
         if (!polylines.empty()) {
+            // Drop the tiny tangency slivers the spiral leaves along the faceted rim (ported from
+            // BambuStudio). Clipping makes every piece start and end on a fresh boundary crossing,
+            // so a piece is a sliver purely when its representative midpoint hugs the boundary; a
+            // piece that dives inside has a deep midpoint and is kept.
+            if (params.full_infill() && archimedean && polylines.size() > 1) {
+                const double  max_sliver_depth = scaled<double>(this->spacing) * 0.1;
+                const coord_t search_radius    = coord_t(std::ceil(max_sliver_depth));
+                const size_t  min_protected_vertex_count = 5;
+
+                coord_t grid_resolution = coord_t(scaled<double>(this->spacing));
+                if (grid_resolution < 1)
+                    grid_resolution = 1;
+                EdgeGrid::Grid boundary_grid;
+                boundary_grid.create(expolygon, grid_resolution);
+
+                Polylines kept;
+                kept.reserve(polylines.size());
+                for (Polyline &pl : polylines) {
+                    // Representative midpoint: a blend of chord midpoint and middle vertex for three
+                    // points, the midpoint of the two central vertices for an even count, the central
+                    // vertex otherwise. It sits at the arc's deepest bulge.
+                    const size_t n = pl.points.size();
+                    Point        mid;
+                    if (n == 3)
+                        mid = ((pl.points.front() + pl.points.back()) / 2 + pl.points[1]) / 2;
+                    else if (n % 2 == 0)
+                        mid = (pl.points[n / 2 - 1] + pl.points[n / 2]) / 2;
+                    else
+                        mid = pl.points[n / 2];
+                    coordf_t   dist      = 0.0;
+                    const bool is_sliver = n < min_protected_vertex_count &&
+                                           boundary_grid.signed_distance_edges(mid, search_radius, dist) &&
+                                           std::abs(dist) < max_sliver_depth;
+                    if (! is_sliver)
+                        kept.push_back(std::move(pl));
+                }
+                if (!kept.empty())
+                    polylines = std::move(kept);
+            }
+
             Polylines chained;
-            if (params.dont_connect() || params.density > 0.5) {
+            if (archimedean_ironing)
+                chained = spiral_center_out_skip_holes(std::move(polylines));
+            else if (params.dont_connect() || params.density > 0.5) {
                 // ORCA: special flag for flow rate calibration. The chords chained ahead of the
                 // inside-out center spiral collide with it in opposing directions, raising a
                 // tactile lip that the calibration reads. Only applies while the fill order is

@@ -1771,6 +1771,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(const FillAdapti
         case ipTpmsFK:
         case ipHilbertCurve:
         case ipArchimedeanChords:
+        case ipIroningArchimedeanSpiral:
         case ipOctagramSpiral:
         case ipZigZag:
         case ipCrossZag:
@@ -1986,6 +1987,9 @@ void Layer::make_ironing()
     FillParams 			fill_params;
     fill_params.density 	 = 1.;
     fill_params.monotonic    = true;
+    // Orca: tag the ironing pass with its own role, so the pattern generators can tell an ironing
+    // surface apart from a plain solid fill (the Archimedean spiral ironing order keys off it).
+    fill_params.extrusion_role = erIroning;
     InfillPattern         f_pattern = ipRectilinear;
     std::unique_ptr<Fill> f         = std::unique_ptr<Fill>(Fill::new_from_type(f_pattern));
     f->set_bounding_box(this->object()->bounding_box());

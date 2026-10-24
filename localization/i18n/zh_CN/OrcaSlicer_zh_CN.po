@@ -18511,6 +18511,10 @@ msgstr "所有实心层"
 msgid "Ironing Pattern"
 msgstr "熨烫图案"
 
+# AI Translated
+msgid "Archimedean Spiral"
+msgstr "阿基米德螺旋"
+
 msgid "The pattern that will be used when ironing."
 msgstr "熨烫时将使用的图案"
 
