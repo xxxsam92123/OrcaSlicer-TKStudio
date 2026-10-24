@@ -2082,3 +2082,143 @@ TEST_CASE("A height range that keeps the global layer height does not trigger th
         CHECK(err.string.empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Horizontal shells across height ranges
+// ---------------------------------------------------------------------------
+namespace {
+
+// The shells of one layer, which is what discover_horizontal_shells() leaves behind.
+struct ShellSummary
+{
+    double print_z        = 0.;
+    bool   top            = false; // stTop, the visible top skin
+    bool   internal_solid = false; // stInternalSolid, the shells propagated under it
+};
+
+// A height range modifier on [z0, z1] overriding `key` to `value`; no modifier when `key` is null.
+struct HeightRangeOverride
+{
+    const char *key   = nullptr;
+    double      z0    = 0.;
+    double      z1    = 0.;
+    double      value = 0.;
+};
+
+// Slice a 20 x 20 x 25.6mm cube - 128 layers at 0.2mm - with `override` applied as a height range
+// modifier, and report the shells of every layer from the bottom up. A height range splits the
+// object into a region that only exists inside the range, which is what the shells have to keep
+// propagating through.
+std::vector<ShellSummary> slice_shells(const HeightRangeOverride &override)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "layer_height",                    0.2 },
+        { "initial_layer_print_height",      0.2 },
+        { "top_shell_layers",                3 },
+        { "top_shell_thickness",             1.0 },
+        { "top_surface_line_width",          0.35 },
+        { "bottom_shell_layers",             3 },
+        { "wall_loops",                      3 },
+        { "sparse_infill_density",           "30%" },
+        { "only_one_wall_top",               true },
+        { "wall_generator",                  "classic" },
+        // ensure_all hands the vertical shell work to discover_vertical_shells() and skips the
+        // propagation covered here; the weaker settings are what a height range project prints with.
+        { "ensure_vertical_shell_thickness", "ensure_moderate" },
+    });
+
+    Model model;
+    ModelObject *object = model.add_object();
+    object->add_volume(make_cube(20., 20., 25.6));
+    object->add_instance();
+    object->ensure_on_bed();
+    if (override.key != nullptr) {
+        DynamicPrintConfig range_config;
+        range_config.set_deserialize_strict({ { override.key, override.value } });
+        // Every height range must carry a layer_height (see layer_height_profile_from_ranges).
+        range_config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
+        object->layer_config_ranges[{ override.z0, override.z1 }].assign_config(std::move(range_config));
+    }
+
+    Print print;
+    print.apply(model, config);
+    print.process();
+
+    std::vector<ShellSummary> shells;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        ShellSummary summary;
+        summary.print_z = layer->print_z;
+        for (const LayerRegion *region : layer->regions()) {
+            // A layer may hold several regions once a height range cuts the object in two.
+            summary.top            |= ! region->fill_surfaces.filter_by_type(stTop).empty();
+            summary.internal_solid |= ! region->fill_surfaces.filter_by_type(stInternalSolid).empty();
+        }
+        shells.push_back(summary);
+    }
+    return shells;
+}
+
+// How many solid layers sit directly below the top skin. top_shell_layers asks for three.
+int top_shell_layers_below_skin(const std::vector<ShellSummary> &shells)
+{
+    for (int i = int(shells.size()) - 1; i >= 0; -- i)
+        if (shells[size_t(i)].top) {
+            int count = 0;
+            for (int j = i - 1; j >= 0 && shells[size_t(j)].internal_solid; -- j)
+                ++ count;
+            return count;
+        }
+    return 0;
+}
+
+// Check that two slices carry the same shells on the same layers.
+void check_same_shells(const std::vector<ShellSummary> &actual, const std::vector<ShellSummary> &expected)
+{
+    REQUIRE(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size() && i < expected.size(); ++ i) {
+        INFO("layer at z = " << actual[i].print_z);
+        CHECK_THAT(actual[i].print_z, Catch::Matchers::WithinAbs(expected[i].print_z, 1e-6));
+        CHECK(actual[i].top == expected[i].top);
+        CHECK(actual[i].internal_solid == expected[i].internal_solid);
+    }
+}
+
+} // namespace
+
+TEST_CASE("Height ranges keep the top shells under the top surface", "[HorizontalShell][LayerRange]")
+{
+    // Neither key changes the shell count, only the flow widths of the range's own region, and the
+    // range covers just the top of the object. top_shell_layers asks for 3 solid layers under the
+    // top skin and top_shell_thickness for 1.0mm / 0.2mm = 5, so they reach down to 24.6 - below
+    // the 25.2 floor of the range modifier.
+    const char *key = GENERATE("top_surface_line_width", "inner_wall_line_width");
+    const std::vector<ShellSummary> reference = slice_shells({});
+    const std::vector<ShellSummary> shells    = slice_shells({ key, 25.2, 25.6, 0.3 });
+
+    REQUIRE(shells.size() == 128); // 25.6mm of 0.2mm layers
+    CHECK(shells.back().top);
+    CHECK_THAT(shells.back().print_z, Catch::Matchers::WithinAbs(25.6, 1e-6));
+    CHECK(top_shell_layers_below_skin(reference) == 5);
+    CHECK(top_shell_layers_below_skin(shells) == 5);
+    check_same_shells(shells, reference);
+}
+
+TEST_CASE("A height range repeating the global top surface line width leaves the shells alone", "[HorizontalShell][LayerRange]")
+{
+    const std::vector<ShellSummary> reference = slice_shells({});
+    REQUIRE(top_shell_layers_below_skin(reference) == 5);
+    check_same_shells(slice_shells({ "top_surface_line_width", 25.2, 25.6, 0.35 }), reference);
+}
+
+TEST_CASE("A height range away from the top surface leaves the top shells alone", "[HorizontalShell][LayerRange]")
+{
+    const std::vector<ShellSummary> reference = slice_shells({});
+    REQUIRE(top_shell_layers_below_skin(reference) == 5);
+
+    // A range below the top surface, and one covering the whole object, both leave it unchanged.
+    const HeightRangeOverride override = GENERATE(
+        HeightRangeOverride{ "top_surface_line_width", 10.0, 10.4, 0.3 },
+        HeightRangeOverride{ "top_surface_line_width", 0.0, 25.6, 0.3 });
+    check_same_shells(slice_shells(override), reference);
+}
