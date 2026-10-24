@@ -137,7 +137,7 @@ static void append_innermost_overhang_boundaries(const ExtrusionEntityCollection
 // The lower layer arrives as a flat ring set, so a point over one of its voids is inside the outer
 // contour alone and a per-ring test would call it supported. Only the even-odd rule tells a void from
 // material.
-static bool point_is_supported(const Polygons &supported_area, const Point &point)
+bool point_is_supported(const Polygons &supported_area, const Point &point)
 {
     return Slic3r::contains(supported_area, point, true);
 }
