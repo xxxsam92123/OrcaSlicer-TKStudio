@@ -964,6 +964,86 @@ bool is_compatible_with_printer(const DynamicPrintConfig &preset_config, Preset:
                                       PresetWithVendorProfile(printer, nullptr));
 }
 
+// ORCA: see the header. Slot i of a per-variant option describes old_variants[i], so a slot is
+// matched by the pair (extruder id, variant name) rather than by its index: the target printer
+// may list more variants, or list them in another order (X2D carries a different variant list per
+// nozzle size). Keys the old printer cannot describe, or the target cannot take, are dropped
+// instead of taking a same-named variant on a different extruder with them.
+std::vector<std::string> remap_variant_option_keys(
+    const std::vector<std::string> &keys,
+    const std::vector<std::string> &old_variants, const std::vector<int> &old_extruder_ids,
+    const std::vector<std::string> &new_variants, const std::vector<int> &new_extruder_ids,
+    std::vector<std::string> *dropped,
+    std::vector<std::pair<size_t, size_t>> *indices)
+{
+    std::vector<std::string> remapped;
+    remapped.reserve(keys.size());
+    // Every old slot resolves to one target slot and every option on that old slot reuses the
+    // answer: the user's edits to one nozzle are a set of options, not a single one.
+    std::vector<size_t> slot_map(old_variants.size(), std::string::npos);
+    std::vector<bool>   slot_resolved(old_variants.size(), false);
+    // A target slot takes one old slot: the first old slot that pairs with it keeps it.
+    std::vector<bool>   taken(new_variants.size(), false);
+    // The extruder ids are only comparable when the config actually carries one per variant.
+    const bool old_ids_match_variants = old_extruder_ids.size() == old_variants.size();
+    const bool new_ids_match_variants = new_extruder_ids.size() == new_variants.size();
+
+    for (const std::string &key : keys) {
+        const size_t sharp = key.find('#');
+        if (sharp == std::string::npos) {
+            remapped.push_back(key);
+            if (indices != nullptr)
+                indices->emplace_back(std::string::npos, std::string::npos);
+            continue;
+        }
+
+        const std::string slot_text = key.substr(sharp + 1);
+        char *slot_end = nullptr;
+        const size_t slot = size_t(std::strtoul(slot_text.c_str(), &slot_end, 10));
+        // Reject an empty value and trailing garbage; a negative number lands out of range below.
+        const bool slot_parsed = slot_end != nullptr && slot_end != slot_text.c_str() && *slot_end == '\0';
+        if (! slot_parsed || slot >= old_variants.size()) {
+            if (dropped != nullptr)
+                dropped->push_back(key);
+            continue;
+        }
+
+        size_t match = std::string::npos;
+        if (slot_resolved[slot]) {
+            // Same old slot as an earlier key: keep the slot resolved for it.
+            match = slot_map[slot];
+        } else {
+            for (size_t j = 0; j < new_variants.size(); ++j) {
+                if (taken[j] || new_variants[j] != old_variants[slot])
+                    continue;
+                if (old_ids_match_variants && new_ids_match_variants && new_extruder_ids[j] != old_extruder_ids[slot])
+                    continue;
+                match = j;
+                break;
+            }
+            // The first slot is the printer's default variant. When the target lists no variant of
+            // that name its own first slot still stands for it, which keeps a single-extruder preset's
+            // changes when switching between two printers with differently named defaults.
+            if (match == std::string::npos && slot == 0 && ! new_variants.empty() && ! taken[0])
+                match = 0;
+            slot_resolved[slot] = true;
+            slot_map[slot]      = match;
+            if (match != std::string::npos)
+                taken[match] = true;
+        }
+        if (match == std::string::npos) {
+            if (dropped != nullptr)
+                dropped->push_back(key);
+            continue;
+        }
+
+        remapped.push_back(key.substr(0, sharp) + "#" + std::to_string(match));
+        if (indices != nullptr)
+            indices->emplace_back(slot, match);
+    }
+    return remapped;
+}
+
 void Preset::set_visible_from_appconfig(const AppConfig &app_config)
 {
     //BBS: add config related log
