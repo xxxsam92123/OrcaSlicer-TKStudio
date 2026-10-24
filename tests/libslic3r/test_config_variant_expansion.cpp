@@ -1039,4 +1039,19 @@ TEST_CASE("Only options sized to the nozzle variant columns count as variant col
     REQUIRE(is_variant_column_option(motion, "machine_max_speed_x", "printer_extruder_variant", 2));
     motion.option<ConfigOptionFloats>("machine_max_speed_x", true)->values = std::vector<double>(7, 500.);
     REQUIRE_FALSE(is_variant_column_option(motion, "machine_max_speed_x", "printer_extruder_variant", 2));
+
+    // Degenerate inputs: a missing option, a missing or empty variant column, and a zero stride carry no column.
+    REQUIRE_FALSE(is_variant_column_option(config, "no_such_option", "print_extruder_variant", 1));
+    REQUIRE_FALSE(is_variant_column_option(config, "outer_wall_speed", "no_such_variant_column", 1));
+    REQUIRE_FALSE(is_variant_column_option(config, "outer_wall_speed", "print_extruder_variant", 0));
+    DynamicPrintConfig empty_columns;
+    empty_columns.option<ConfigOptionStrings>("print_extruder_variant", true)->values = {};
+    empty_columns.option<ConfigOptionFloats>("outer_wall_speed", true)->values        = {};
+    REQUIRE_FALSE(is_variant_column_option(empty_columns, "outer_wall_speed", "print_extruder_variant", 1));
+
+    // Two values for a two-extruder machine is a per-extruder array, not a column per (extruder x variant).
+    DynamicPrintConfig per_extruder;
+    per_extruder.option<ConfigOptionStrings>("print_extruder_variant", true)->values = print_variants;
+    per_extruder.option<ConfigOptionFloats>("nozzle_diameter", true)->values         = {0.4, 0.4};
+    REQUIRE_FALSE(is_variant_column_option(per_extruder, "nozzle_diameter", "print_extruder_variant", 1));
 }

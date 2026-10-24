@@ -9330,6 +9330,8 @@ void Tab::sync_excluder()
             // it would grow it past the length config_origin keeps, which the dialog then reads out of bounds.
             if (!is_variant_column_option(*m_config, key, variant_keys.second, stride))
                 continue;
+            // Defensive only: the check above already guarantees dest_index + stride fits, since the array is
+            // exactly one column per variant. Kept so a future layout change cannot turn this into a grow.
             if (dest_index + int(stride) > int(option->size()))
                 continue;
             auto option2 = dynamic_cast<ConfigOptionVectorBase*>(option->clone());

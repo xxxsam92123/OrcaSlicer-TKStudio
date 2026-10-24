@@ -89,7 +89,7 @@ bool is_variant_column_option(const DynamicPrintConfig &config, const std::strin
     if (option == nullptr)
         return false;
     const auto *variants = dynamic_cast<const ConfigOptionStrings *>(config.option(variant_name));
-    if (variants == nullptr)
+    if (variants == nullptr || variants->values.empty())
         return false;
     return option->size() == variants->values.size() * stride;
 }
