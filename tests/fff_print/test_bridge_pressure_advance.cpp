@@ -441,12 +441,16 @@ TEST_CASE("The bridge pressure advance switch makes zero override the adaptive m
     REQUIRE(gcode.find("; Bridge static pressure advance") == std::string::npos);
 
     const std::vector<double> bridge_values = pa_values_for_role(gcode, "Bridge");
-    REQUIRE(!bridge_values.empty());
-    for (double value : bridge_values)
-        REQUIRE(std::abs(value) < 1e-9);
+    const std::vector<double> internal_bridge_values = pa_values_for_role(gcode, "Internal Bridge");
+    for (const auto &role_values : {std::pair<const char *, const std::vector<double> &>{"Bridge", bridge_values},
+                                    {"Internal Bridge", internal_bridge_values}}) {
+        INFO("role " << role_values.first);
+        REQUIRE(!role_values.second.empty());
+        for (double value : role_values.second)
+            REQUIRE(std::abs(value) < 1e-9);
+    }
 
-    // Overhang perimeters share the bridge override on this channel (the PA_Change tag carries both
-    // roles), so they are excluded from the "everything else keeps the extruder PA" set.
+    // The static branch is out of the picture when adaptive PA is enabled.
     size_t non_bridge_samples = 0;
     for (const auto &sample : pa_by_role(gcode)) {
         if (is_bridge_role(sample.first) || sample.first == "Overhang wall")

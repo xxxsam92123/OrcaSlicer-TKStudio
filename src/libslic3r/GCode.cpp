@@ -9937,7 +9937,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                     pa_config_index,
                     m_multi_flow_segment_path_average_mm3_per_mm,
                     acceleration_i,
-                    ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                    ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                     role_change,
                     isOverhangPerimeter);
             gcode += buf;
@@ -9950,7 +9950,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                     pa_config_index,
                     _mm3_per_mm,
                     acceleration_i,
-                    ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                    ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                     role_change,
                     isOverhangPerimeter);
             gcode += buf;
@@ -10093,7 +10093,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                             pa_config_index,
                             _mm3_per_mm,
                             acceleration_i,
-                            ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                            ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                             1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                             // the properties of the extrusion in the overhang are different so it behaves similarly to a role
                             // change for the Adaptive PA post processor.
@@ -10108,7 +10108,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                             pa_config_index,
                             _mm3_per_mm,
                             acceleration_i,
-                            ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                            ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                             1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                             // the properties of the extrusion in the overhang are different so it is technically similar to a role
                             // change for the Adaptive PA post processor.
@@ -10320,7 +10320,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                                 pa_config_index,
                                 _mm3_per_mm,
                                 acceleration_i,
-                                ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                                ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                                 1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                                 // the properties of the extrusion in the overhang are different so it is technically similar to a role
                                 // change for the Adaptive PA post processor.
@@ -10335,7 +10335,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                                 pa_config_index,
                                 _mm3_per_mm,
                                 acceleration_i,
-                                ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                                ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                                 1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                                 // the properties of the extrusion in the overhang are different so it is technically similar to a role
                                 // change for the Adaptive PA post processor.
