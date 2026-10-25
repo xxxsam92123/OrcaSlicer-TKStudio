@@ -398,6 +398,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "wipe_inward",
         "wipe_inward_distance",
         "gcode_comments",
+        "high_precision_gcode",
         "gcode_label_objects", 
         "exclude_object",
         "exclude_object_tolerance",
@@ -1988,6 +1989,23 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     if (extruders.empty())
         return { L("No extrusions under current settings.") };
+
+    // A flow ratio of 0 would extrude nothing, and a nil one would write NaN extrusion lengths.
+    {
+        const std::vector<double> &flow_ratios = m_config.filament_flow_ratio.values;
+        const std::vector<int>    &self_index  = m_config.filament_self_index.values;
+        for (size_t column = 0; column < flow_ratios.size(); ++column) {
+            // filament_self_index maps a column to its filament once the filament arrays hold one column per variant
+            const unsigned int filament_id = self_index.size() == flow_ratios.size() ? self_index[column] - 1 : column;
+            if (flow_ratios[column] > 0. || !std::binary_search(extruders.begin(), extruders.end(), filament_id))
+                continue;
+            StringObjectException err;
+            // TRN %1% is the filament number as shown in the filament list, starting from 1.
+            err.string  = Slic3r::format(L("The flow ratio of filament %1% must be greater than 0."), filament_id + 1);
+            err.opt_key = "filament_flow_ratio";
+            return err;
+        }
+    }
 
     // IDEX/IQEX: block multi-color in non-primary parallel modes when the active
     // configuration can't physically support it (no within-gantry toolchange path

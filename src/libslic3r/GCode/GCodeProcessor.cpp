@@ -2311,6 +2311,14 @@ void GCodeProcessor::PreCoolingInjector::build_extruder_free_blocks(const std::v
         build_by_extruder_blocks(extruder_usage_blocks);
 }
 
+// ConfigOptionVector::get_at() for the vectors copied out of the config.
+template<class T> static T value_at_or_front(const std::vector<T>& v, int i, T fallback)
+{
+    if (v.empty())
+        return fallback;
+    return i >= 0 && i < (int) v.size() ? v[i] : v.front();
+}
+
 // The core injector. Measures the idle-window duration from move.time[valid_machine_id], bails if it is
 // below the threshold, and emits pre-cool M104 at the window start and pre-heat M104 (relocated out of
 // SKIPPABLE blocks) at the back-solved heating-start move.
@@ -2322,13 +2330,13 @@ void GCodeProcessor::PreCoolingInjector::inject_cooling_heating_command(TimeProc
     };
 
     auto is_pre_cooling_valid = [&nozzle_temps = this->filament_nozzle_temps, &pre_cooling_temps = this->filament_pre_cooling_temps](int idx) -> bool {
-        if (idx < 0)
+        if (idx < 0 || idx >= (int) pre_cooling_temps.size() || idx >= (int) nozzle_temps.size())
             return false;
         return pre_cooling_temps[idx] > 0 && pre_cooling_temps[idx] < nozzle_temps[idx];
     };
 
     auto get_partial_free_cooling_thres = [&](int idx) -> float {
-        if (idx < 0)
+        if (idx < 0 || idx >= (int) filament_nozzle_temps.size() || idx >= (int) filament_pre_cooling_temps.size())
             return 30.f;
         float temp_in_tower = filament_nozzle_temps[idx];
         return temp_in_tower - (float) (filament_pre_cooling_temps[idx]);
@@ -2428,12 +2436,10 @@ void GCodeProcessor::PreCoolingInjector::inject_cooling_heating_command(TimeProc
 
     int extruder_id = get_valid_extruder_id(block.last_nozzle_id);
     // Same per-extruder metadata caveat as the M632 branch below: the hotend rates default to a
-    // single entry ({2}) while a print may use more extruders, so fall back to the option's
-    // documented default instead of reading past the end.
-    const bool has_extruder_rates = extruder_id >= 0 && extruder_id < static_cast<int>(heating_rate.size()) &&
-                                    extruder_id < static_cast<int>(cooling_rate.size());
-    float ext_heating_rate = has_extruder_rates ? static_cast<float>(heating_rate[extruder_id]) : 2.f;
-    float ext_cooling_rate = has_extruder_rates ? static_cast<float>(cooling_rate[extruder_id]) : 2.f;
+    // single entry ({2}) while a print may use more extruders, so read through value_at_or_front()
+    // rather than past the end of the vector.
+    float ext_heating_rate = value_at_or_front(heating_rate, extruder_id, 1.0);
+    float ext_cooling_rate = value_at_or_front(cooling_rate, extruder_id, 1.0);
 
     auto add_M104_lines = [&](int gcode_id, int target_extruder, int target_temp, int target_filament, bool skippable, int next_filament_idx, int next_nozzle_id, TimeProcessor::InsertLineType type, const std::string& comment = std::string()) {
         auto format_line_M104 = [&](int target_extruder, int target_temp, int target_filament, bool skippable, int next_filament_idx, int next_nozzle_id, const std::string& comment = std::string()) -> std::vector<std::string> {
@@ -2443,11 +2449,7 @@ void GCodeProcessor::PreCoolingInjector::inject_cooling_heating_command(TimeProc
                 std::string m632_line = "M632 S" + std::to_string(next_filament_idx);
                 if (support_dynamic_nozzle_map)
                     m632_line += " H" + std::to_string(next_nozzle_id);
-                // The per-extruder machine metadata is sized by the printer profile; a config whose
-                // vector is shorter than the extruder count must not read past the end. 1 is the
-                // option's documented default (one nozzle per extruder).
-                if (target_extruder >= 0 && target_extruder < static_cast<int>(extruder_max_nozzle_count.size()) &&
-                    extruder_max_nozzle_count[target_extruder] > 1)
+                if (value_at_or_front(extruder_max_nozzle_count, target_extruder, 1) > 1)
                     m632_line += " N R";
                 m632_line += " W\n";
                 buffer.emplace_back(std::move(m632_line));
@@ -2458,8 +2460,9 @@ void GCodeProcessor::PreCoolingInjector::inject_cooling_heating_command(TimeProc
                 M104_line += (" I" + std::to_string(target_filament == -1 ? next_filament_idx : target_filament));
             } else if (target_extruder != -1) {
                 // Same per-extruder metadata as above: the map is sized by the printer profile, so a
-                // config that leaves it shorter than the extruder count must not read past the end.
-                // Out of range -> the extruder id, as physical_extruder_id_for_tool() does.
+                // config that leaves it shorter than the extruder count must not read past the end,
+                // and a negative index must not either (upstream's `i < size()` test alone lets one
+                // through). Out of range -> the extruder id, as physical_extruder_id_for_tool() does.
                 const bool has_physical_map = target_extruder >= 0 && target_extruder < static_cast<int>(physical_extruder_map.size());
                 const int  physical_id      = has_physical_map ? physical_extruder_map[target_extruder] : target_extruder;
                 M104_line += (" T" + std::to_string(physical_id));
@@ -3947,6 +3950,8 @@ DynamicConfig GCodeProcessor::export_config_for_render() const
     config.set_key_value("filament_is_support", new ConfigOptionBools(m_parser.get_config().filament_is_support.values));
     config.set_key_value("filament_type", new ConfigOptionStrings(m_parser.get_config().filament_type.values));
     config.set_key_value("filament_map", new ConfigOptionInts(m_parser.get_config().filament_map.values));
+    // The tool position readout shows coordinates with the precision the file was exported with.
+    config.set_key_value("high_precision_gcode", new ConfigOptionBool(m_parser.get_config().high_precision_gcode.value));
     // += clones the options; apply() would need a definition this config does not have.
     config += m_belt_render_config;
     return config;
