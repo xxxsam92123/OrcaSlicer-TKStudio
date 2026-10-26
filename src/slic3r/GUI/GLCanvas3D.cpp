@@ -3921,6 +3921,19 @@ void GLCanvas3D::bind_event_handlers()
                 render();
                 evt.Skip();
             });
+        // ORCA If the mouse capture is lost while a button is held (Alt+Tab, dialog, lock screen), the button-up
+        // never arrives and ImGui keeps the widget active. Cancel the interaction: clear the active widget
+        // before releasing the buttons so the release is not taken as a click.
+        m_canvas->Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent&) {
+                if (GImGui != nullptr) {
+                    ImGui::ClearActiveID();
+                    ImGuiIO& io = ImGui::GetIO();
+                    for (bool& down : io.MouseDown)
+                        down = false;
+                }
+                m_navigator_dragging = false;
+                render();
+            });
         m_event_handlers_bound = true;
 
         m_canvas->Bind(wxEVT_GESTURE_PAN, &GLCanvas3D::on_gesture, this);
@@ -4200,15 +4213,11 @@ bool GLCanvas3D::handle_shortcut(const KeyChord& chord)
         m_dirty = true;
         break;
     case Shortcut::Mouse3DSettings: {
-#ifdef _WIN32
-        if (wxGetApp().app_config->get("use_legacy_3DConnexion") == "true") {
-#endif //_WIN32
-            Mouse3DController& controller = wxGetApp().plater()->get_mouse3d_controller();
+        Mouse3DController& controller = wxGetApp().plater()->get_mouse3d_controller();
+        if (controller.can_show_settings_dialog()) {
             controller.show_settings_dialog(!controller.is_settings_dialog_shown());
             m_dirty = true;
-#ifdef _WIN32
         }
-#endif //_WIN32
         break;
     }
     case Shortcut::ReloadDevicePage:
