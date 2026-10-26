@@ -1724,6 +1724,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable,      filament_flow_ratio))
     ((ConfigOptionBools,               enable_pressure_advance))
     ((ConfigOptionFloats,              pressure_advance))
+    // Orca: the bridge static PA switch, independent of the adaptive PA family below
+    ((ConfigOptionBools,               enable_bridge_pressure_advance))
     // Orca: adaptive pressure advance and calibration model
     ((ConfigOptionBools,                adaptive_pressure_advance))
     ((ConfigOptionBools,                adaptive_pressure_advance_overhangs))

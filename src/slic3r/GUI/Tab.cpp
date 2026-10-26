@@ -4768,11 +4768,14 @@ void TabFilament::build()
         // Orca: pressure advance family follows the filament variant tabs, exactly like filament_flow_ratio
         optgroup->append_single_option_line("enable_pressure_advance", "material_flow_ratio_and_pressure_advance#pressure-advance", 0);
         optgroup->append_single_option_line("pressure_advance", "material_flow_ratio_and_pressure_advance#pressure-advance", 0);
+        // Orca: the bridge override works with or without adaptive PA, so it sits next to the static PA rather
+        // than in the adaptive group below.
+        optgroup->append_single_option_line("enable_bridge_pressure_advance", "material_flow_ratio_and_pressure_advance#pressure-advance-for-bridges", 0);
+        optgroup->append_single_option_line("adaptive_pressure_advance_bridges", "material_flow_ratio_and_pressure_advance#pressure-advance-for-bridges", 0);
 
         // Orca: adaptive pressure advance and calibration model
         optgroup->append_single_option_line("adaptive_pressure_advance", "material_flow_ratio_and_pressure_advance#enable-adaptive-pressure-advance-beta", 0);
         optgroup->append_single_option_line("adaptive_pressure_advance_overhangs", "material_flow_ratio_and_pressure_advance#enable-adaptive-pressure-advance-for-overhangs-beta", 0);
-        optgroup->append_single_option_line("adaptive_pressure_advance_bridges", "material_flow_ratio_and_pressure_advance#pressure-advance-for-bridges", 0);
 
         Option option = optgroup->get_option("adaptive_pressure_advance_model", 0);
         option.opt.full_width = true;
@@ -5223,7 +5226,12 @@ void TabFilament::toggle_options()
         bool has_adaptive_pa = m_config->opt_bool("adaptive_pressure_advance", variant_index);
         toggle_line("adaptive_pressure_advance_overhangs", has_adaptive_pa && pa, 0);
         toggle_line("adaptive_pressure_advance_model", has_adaptive_pa && pa, 0);
-        toggle_line("adaptive_pressure_advance_bridges", has_adaptive_pa && pa, 0);
+        // Orca: enable_bridge_pressure_advance is the master switch of the bridge static PA feature. Off
+        // means the feature is disabled entirely - the value takes no part in slicing - so the value line
+        // is hidden unconditionally rather than only when it is zero.
+        toggle_option("enable_bridge_pressure_advance", pa, 0);
+        toggle_line("adaptive_pressure_advance_bridges",
+                    pa && m_config->opt_bool("enable_bridge_pressure_advance", variant_index), 0);
 
         bool is_pellet_printer = printer_cfg.opt_bool("pellet_modded_printer");
         toggle_line("pellet_flow_coefficient", is_pellet_printer);

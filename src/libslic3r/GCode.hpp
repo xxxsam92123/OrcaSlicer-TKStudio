@@ -847,6 +847,8 @@ protected:
     //double                              m_volumetric_speed;
     // Support for the extrusion role markers. Which marker is active?
     ExtrusionRole                       m_last_extrusion_role;
+    // Orca: whether the last pressure advance this generator emitted was the bridge override.
+    bool                                m_bridge_pa_active{false};
     // To ignore gapfill role for retract_lift_enforce
     ExtrusionRole                       m_last_notgapfill_extrusion_role;
     // Support for G-Code Processor

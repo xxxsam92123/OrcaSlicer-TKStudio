@@ -8481,6 +8481,16 @@ void GCode::append_full_config(const Print &print, std::string &str)
         // consumer. Banning it from the g-code config dump keeps the H2D/A2L/X2D/P2S leaves that carry it
         // byte-identical, while still registering it as a known, validated config key.
         "deretract_speed_extruder_change"sv,
+        // enable_bridge_pressure_advance is a newly-registered filament option whose default is off, so
+        // the slicing body is unchanged for every existing preset. Leaving it in the dump would still add
+        // an `; enable_bridge_pressure_advance = 0` line to every config block, so it is excluded to keep
+        // the dump byte-identical. The switch is read from m_config while slicing, and the value it
+        // switches (adaptive_pressure_advance_bridges) stays in the dump.
+        // Cost: the config block is also what "Import Configs" / ConfigBase::load_from_gcode_file reads back,
+        // so a G-code round-trip loses this switch. An enabled switch with value 0 therefore comes back as the
+        // legacy "0 = use equivalent walls" semantics. Accepted for the same reason the keys above accept it:
+        // keeping the config dump byte-identical matters more than a lossy round-trip of a brand-new key.
+        "enable_bridge_pressure_advance"sv,
         // farthest_point_timelapse is a newly-registered printer key (corexy-only timelapse refinement).
         // Excluding it from the config block keeps the config-dump byte-identical for the whole shipping
         // fleet — otherwise every printer's dump would gain a `= 0` line vs the previous baseline, and
@@ -9936,7 +9946,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                     pa_config_index,
                     m_multi_flow_segment_path_average_mm3_per_mm,
                     acceleration_i,
-                    ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                    ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                     role_change,
                     isOverhangPerimeter);
             gcode += buf;
@@ -9949,7 +9959,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                     pa_config_index,
                     _mm3_per_mm,
                     acceleration_i,
-                    ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                    ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                     role_change,
                     isOverhangPerimeter);
             gcode += buf;
@@ -10041,6 +10051,38 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         }
     };
 
+    // Orca: bridge static PA, independent of adaptive PA.
+    // enable_bridge_pressure_advance is the gate for the whole feature on both channels. With it on
+    // and adaptive PA off for the active filament, the bridge override is emitted as a plain static
+    // PA on bridge paths (external and internal) and reverted on the next non-bridge path. With
+    // adaptive PA on the AdaptivePAProcessor already applies the same value for external bridges
+    // (the isBridge branch of AdaptivePAProcessor), so this branch stays out of the way and the
+    // G-code is unchanged. switch off = the option is inert: bridge_pa_value takes no part in slicing,
+    // not even a non-zero one.
+    const bool   bridge_pa_switch = m_config.enable_bridge_pressure_advance.get_at(pa_config_index);
+    const double bridge_pa_value  = m_config.adaptive_pressure_advance_bridges.get_at(pa_config_index);
+    if (!is_pa_calib && !adaptive_pa
+        && m_config.enable_pressure_advance.get_at(pa_config_index)
+        && bridge_pa_switch) {
+        const bool want_bridge = path.role() == erBridgeInfill || path.role() == erInternalBridgeInfill;
+        if (want_bridge != m_bridge_pa_active) {
+            const double pa = want_bridge ? bridge_pa_value
+                                          : m_config.pressure_advance.get_at(pa_config_index);
+            gcode += m_writer.set_pressure_advance(pa,
+                imex_pem_tool_for((int) m_writer.filament()->id(), m_imex_parallel_mode,
+                                  m_config.physical_extruder_map));
+            m_bridge_pa_active = want_bridge;
+            if (m_config.gcode_comments)
+                gcode += want_bridge ? "; Bridge static pressure advance\n"
+                                     : "; Bridge static pressure advance reverted\n";
+        }
+        // Note: the revert is emitted on the next path that goes through _extrude. Wipe-tower extrusion is
+        // generated outside this function, so a layer that ends inside a bridge leaves the tower at the last
+        // emitted PA value (the tower emits its own M900 K0 while ramming) until the next object path or a
+        // toolchange. This is the same class of window the adaptive PA path has, which also restores only on
+        // the next tagged extrusion.
+    }
+
     if (!requires_segmented_extrusion) {
         // F is mm per minute.
         if( (std::abs(writer().get_current_speed() - F) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON) ){
@@ -10060,7 +10102,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                             pa_config_index,
                             _mm3_per_mm,
                             acceleration_i,
-                            ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                            ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                             1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                             // the properties of the extrusion in the overhang are different so it behaves similarly to a role
                             // change for the Adaptive PA post processor.
@@ -10075,7 +10117,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                             pa_config_index,
                             _mm3_per_mm,
                             acceleration_i,
-                            ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                            ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                             1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                             // the properties of the extrusion in the overhang are different so it is technically similar to a role
                             // change for the Adaptive PA post processor.
@@ -10287,7 +10329,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                                 pa_config_index,
                                 _mm3_per_mm,
                                 acceleration_i,
-                                ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                                ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                                 1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                                 // the properties of the extrusion in the overhang are different so it is technically similar to a role
                                 // change for the Adaptive PA post processor.
@@ -10302,7 +10344,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                                 pa_config_index,
                                 _mm3_per_mm,
                                 acceleration_i,
-                                ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                                ((path.role() == erBridgeInfill) || (path.role() == erInternalBridgeInfill) || (path.role() == erOverhangPerimeter)),
                                 1, // Force a dummy "role change" & "overhang perimeter" for the post processor, as, while technically it is not a role change,
                                 // the properties of the extrusion in the overhang are different so it is technically similar to a role
                                 // change for the Adaptive PA post processor.
@@ -11519,6 +11561,7 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
 std::string GCode::set_filament_pressure_advance(unsigned int filament_id, int tool)
 {
     const size_t fi = get_filament_config_index(filament_id);
+    m_bridge_pa_active = false;
     if (!m_config.enable_pressure_advance.get_at(fi))
         return {};
     // Orca: Adaptive PA

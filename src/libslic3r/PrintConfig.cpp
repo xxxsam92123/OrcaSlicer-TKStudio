@@ -3149,10 +3149,17 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBools{ false });
 
+    def = this->add("enable_bridge_pressure_advance", coBools);
+    def->label = L("Enable bridge static pressure advance");
+    def->tooltip = L("Enable the bridge static pressure advance below.\n\n"
+                     "Off: the feature is disabled entirely - the value takes no part in slicing, even when it is non-zero.\n\n"
+                     "On: bridge infill is printed with the value below; 0 is a real value and means no pressure advance on bridges (with adaptive pressure advance on, overhang perimeters follow the same value).");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBools{ false });
+
     def = this->add("adaptive_pressure_advance_bridges", coFloats);
     def->label = L("Static pressure advance for bridges");
-    def->tooltip = L("Static pressure advance value for bridges. Set to 0 to apply the same pressure advance as \n"
-					"equivalent walls (using adaptive settings if enabled).\n\n"
+    def->tooltip = L("Static pressure advance for bridges. Takes effect only while \"Enable bridge static pressure advance\" is on; 0 is then a real value and bridge infill runs with no pressure advance. With adaptive pressure advance off it is applied to external and internal bridge infill only; with adaptive pressure advance on the adaptive model still governs internal bridges and this value overrides the pressure advance of external bridge infill and overhang perimeters.\n\n"
                     "A lower PA value when printing bridges helps reduce the appearance of slight under-extrusion immediately after bridges. "
                     "This is caused by the pressure drop in the nozzle when printing in the air and a lower PA helps counteract this.");
     def->max = 2;
@@ -10357,6 +10364,7 @@ std::set<std::string> filament_options_with_variant = {
     // Orca: pressure advance
     "enable_pressure_advance",
     "pressure_advance",
+    "enable_bridge_pressure_advance",
     "adaptive_pressure_advance",
     "adaptive_pressure_advance_model",
     "adaptive_pressure_advance_overhangs",
