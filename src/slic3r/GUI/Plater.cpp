@@ -7661,6 +7661,10 @@ struct Plater::priv
     // Slice all: give back every finished plate's slice resources, for the error path where the run
     // stops with the whole batch's results still resident.
     void release_finished_plate_resources_of_batch(int except_plate_index);
+    // Manual plate switch: the plate that was current before the switch is finished and the preview
+    // has moved off it, so its slice resources go back the same way a batch gives them back. Called
+    // once per switch, after the preview and the background process point at the new plate.
+    void release_plate_left_by_switch(int previous_plate_index);
     //BBS: change dark/light mode
     void on_change_color_mode(SimpleEvent& evt);
     void on_apple_change_color_mode(wxSysColourChangedEvent& evt);
@@ -13265,6 +13269,43 @@ void Plater::priv::release_finished_plate_resources(int plate_index)
 void Plater::priv::release_finished_plate_resources_of_batch(int except_plate_index)
 {
     partplate_list.release_finished_plate_resources(except_plate_index);
+}
+
+// A manual plate switch leaves a finished plate behind just as a batch moving on does, and that
+// plate's G-code file is still on disk: both the preview payload and the print's sliced objects can
+// go back to the heap there. The switch has already pointed the background process and the preview
+// at the new plate when this runs, which is the same order the batch releases in
+// (Plater::priv::on_process_completed()).
+//
+// Two things keep it away from what is still in use: a running batch releases its own plates, and
+// the G-code viewer reads the moves of the result it last loaded, so a plate whose result the viewer
+// still points at keeps them. Nothing here may fail the switch - the release entry only warns.
+void Plater::priv::release_plate_left_by_switch(int previous_plate_index)
+{
+    if (previous_plate_index < 0 || previous_plate_index == partplate_list.get_curr_plate_index())
+        return;
+    // Slice all drives its own release for every plate it leaves (see the batch entry above); a
+    // second one from here would run before its own bookkeeping for that plate.
+    if (m_is_slicing)
+        return;
+    // Loading a project selects its first plate while the list and the prints are still being
+    // rebuilt, which is not a switch away from a plate that is finished.
+    if (q != nullptr && q->is_loading_project())
+        return;
+
+    PartPlate *plate = partplate_list.get_plate(previous_plate_index);
+    if (plate == nullptr || !plate->is_slice_result_valid() || plate->get_slice_result() == nullptr)
+        return;
+
+    // The viewer holds the result it converted last and reads its moves for the moves slider. Until
+    // the switch has handed it the new plate's result, the old one is still in use.
+    GLCanvas3D *canvas = preview != nullptr ? preview->get_canvas3d() : nullptr;
+    if (canvas != nullptr && canvas->get_gcode_viewer().references_result(plate->get_slice_result())) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% keeps its slice resources, the G-code viewer still reads its result") % previous_plate_index;
+        return;
+    }
+
+    release_finished_plate_resources(previous_plate_index);
 }
 
 void Plater::priv::on_slicing_completed(wxCommandEvent & evt)
@@ -22718,6 +22759,8 @@ int Plater::select_plate(int plate_index, bool need_slice)
     int ret;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: plate %2%, need_slice %3% ")%__LINE__ %plate_index  %need_slice;
     take_snapshot("select partplate!");
+    // Whatever the switch does below, this is the plate the preview is on until it succeeds.
+    const int previous_plate_index = p->partplate_list.get_curr_plate_index();
     ret = p->partplate_list.select_plate(plate_index);
     if (!ret) {
         if (is_view3D_shown())
@@ -22866,6 +22909,13 @@ int Plater::select_plate(int plate_index, bool need_slice)
             }
         }
     }
+
+    // The preview, the background process and the G-code viewer are on the new plate by now, so the
+    // plate that was current before this call gives its slice resources back. A manual switch over a
+    // finished project would otherwise keep every plate visited since the last batch resident, which
+    // is what drove the footprint to the pagefile ceiling on a 19 plate project.
+    if (!ret)
+        p->release_plate_left_by_switch(previous_plate_index);
 
     SimpleEvent event(EVT_GLCANVAS_PLATE_SELECT);
     p->on_plate_selected(event);
@@ -23372,6 +23422,8 @@ int Plater::select_plate_by_hover_id(int hover_id, bool right_click, bool isModi
     action      = isModidyPlateName ? PartPlate::PLATE_NAME_HOVER_ID : hover_id % PartPlate::GRABBER_COUNT;
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": enter, hover_id %1%, plate_index %2%, action %3%")%hover_id % plate_index %action;
+    // Only action 0 switches plates; this is the plate it switches away from.
+    const int previous_plate_index = action == 0 ? p->partplate_list.get_curr_plate_index() : -1;
     if (action == 0)
     {
         //select plate
@@ -23627,6 +23679,12 @@ int Plater::select_plate_by_hover_id(int hover_id, bool right_click, bool isModi
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "invalid action %1%, with right_click=%2%" << action << right_click;
         ret = -1;
     }
+
+    // The plate the switch left behind gives its slice resources back here as well: this is the
+    // second way the user selects a plate (the 3D view's plate grabbers), and it must free exactly
+    // the same things as Plater::select_plate() does.
+    if (action == 0 && !ret)
+        p->release_plate_left_by_switch(previous_plate_index);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: return %2%")%__LINE__ % ret;
     return ret;
