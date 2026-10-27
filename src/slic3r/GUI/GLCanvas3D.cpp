@@ -10704,11 +10704,14 @@ void GLCanvas3D::_render_imgui_select_plate_toolbar()
             }
         }
 
-        // Changing parameters does not invalid all plates, need extra logic to validate
+        // A released result has no moves by design. What the all-plate statistics need is a valid
+        // slice result per non-empty plate: its metadata, print statistics and filament data stay
+        // resident even when the per-move preview payload was handed back.
         bool gcode_result_valid = true;
-        for (auto gcode_result : plate_list.get_nonempty_plates_slice_results()) {
-            if (gcode_result->moves.size() == 0) {
+        for (PartPlate *plate : plate_list.get_nonempty_plate_list()) {
+            if (!plate->is_slice_result_valid()) {
                 gcode_result_valid = false;
+                break;
             }
         }
         if (all_plates_stats_item->selected && all_plates_stats_item->slice_state == IMToolbarItem::SliceState::SLICED && gcode_result_valid) {

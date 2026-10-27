@@ -4,6 +4,7 @@
 #include "Circle.hpp"
 #include "Config.hpp"
 #include "GCode/GCodeProcessor.hpp"
+#include "GCode/GCodeStatistics.hpp"
 #include "Flow.hpp"
 #include "GCode/ThumbnailData.hpp"
 #include "GCode/ToolOrdering.hpp"
@@ -3257,6 +3258,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
                            path_tmp, path, ret.message()) + '\n');
     }
     else {
+        // The G-code of this result is now in place under result->filename: only from here on may
+        // the preview payload be dropped and read back from that file. A failure above leaves the
+        // result pointing at a path whose content is not this round's slice.
+        if (result != nullptr)
+            result->mark_export_completed();
         BOOST_LOG_TRIVIAL(info) << boost::format("rename_file from %1% to %2% successfully")% path_tmp % path;
     }
 
@@ -3275,8 +3281,13 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     // Orca: label_object_enabled reflects whether objects are labeled in the g-code (EXCLUDE_OBJECT /
     // M486), which is driven by exclude_object for every printer
-    if(result != nullptr)
+    if(result != nullptr) {
         result->label_object_enabled = m_enable_exclude_object;
+        // The per-layer statistics document is summed from moves, which a many-plate project
+        // releases after each plate's export. Produce it here, while they are the ones this export
+        // just wrote, so the 3MF and the statistics file read it back instead of the moves.
+        result->cache_statistics_json();
+    }
     // Write the profiler measurements to file
     PROFILE_UPDATE();
     PROFILE_OUTPUT(debug_out_path("gcode-export-profile.txt").c_str());

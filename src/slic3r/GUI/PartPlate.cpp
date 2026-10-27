@@ -65,6 +65,7 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/system/error_code.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/convert.hpp>
 #include <boost/nowide/cstdio.hpp>
@@ -4429,7 +4430,8 @@ bool PartPlate::is_valid_gcode_file()
 	if (get_gcode_filename().empty())
 		return false;
 	boost::filesystem::path gcode_file(m_gcode_result->filename);
-	if (!boost::filesystem::exists(gcode_file)) {
+	boost::system::error_code gcode_ec;
+	if (!boost::filesystem::exists(gcode_file, gcode_ec) || gcode_ec) {
 		BOOST_LOG_TRIVIAL(info) << "invalid gcode file, file is missing, file = " << m_gcode_result->filename;
 		return false;
 	}
@@ -5543,10 +5545,12 @@ int PartPlate::load_gcode_from_file(const std::string& filename)
     //	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("Failed to rename the output G-code file from %1% to %2%, error code %3%") % filename.c_str() % path.c_str() %
     //error.message(); 	return -1;
     //}
-	if (boost::filesystem::exists(filename)) {
+	boost::system::error_code gcode_ec;
+	if (boost::filesystem::exists(filename, gcode_ec) && !gcode_ec) {
 		assert(m_tmp_gcode_path.empty());
 		m_tmp_gcode_path = filename;
 		m_gcode_result->filename = filename;
+		m_gcode_result->mark_export_completed();
 		m_print->set_gcode_file_ready();
 
 		update_slice_result_valid_state(true);
@@ -5555,11 +5559,127 @@ int PartPlate::load_gcode_from_file(const std::string& filename)
 	}
 	else {
 		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": can not find gcode file %1%") % filename.c_str();
+		m_gcode_result->reset();
+		update_slice_result_valid_state(false);
 		ret = -1;
 	}
 
 	m_ready_for_slice = true;
 	return ret;
+}
+
+bool PartPlate::has_slice_payload() const
+{
+	return m_gcode_result != nullptr && m_gcode_result->has_preview_payload();
+}
+
+// Both the released payload and the plate's own "sliced" state rest on the result's G-code file:
+// the payload is re-read from it, and the plate keeps pointing the export and send paths at it.
+// GCodeProcessorResult::preview_payload_restorable() is the criterion, because a file merely being
+// on disk is not enough: a plate whose export failed still names an earlier round's file, and
+// reading that one back would show a slice this plate no longer has.
+static bool slice_payload_restorable(const GCodeProcessorResult *result)
+{
+	return result != nullptr && result->preview_payload_restorable();
+}
+
+bool PartPlate::release_slice_payload()
+{
+	if (!m_slice_result_valid || !has_slice_payload())
+		return false;
+	if (!slice_payload_restorable(m_gcode_result)) {
+		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": plate %1% keeps its preview payload, gcode file %2% is not this plate's readable slice result") % m_plate_index % m_gcode_result->filename;
+		return false;
+	}
+
+	const size_t moves = m_gcode_result->moves.size();
+	m_gcode_result->release_preview_payload();
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% released %2% moves, restorable from %3%") % m_plate_index % moves % m_gcode_result->filename;
+	return true;
+}
+
+bool PartPlate::restore_slice_payload()
+{
+	if (has_slice_payload())
+		return true;
+	// Nothing to restore from: an unsliced plate, a plate whose current round did not complete its
+	// G-code export (its result still names the file of an earlier round), a plate whose file is
+	// gone, or a plate without a print. The caller then falls back to re-slicing, which is what it
+	// did before the payload could be released at all.
+	if (!m_slice_result_valid || m_print == nullptr || !slice_payload_restorable(m_gcode_result))
+		return false;
+
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% restoring preview payload from %2%") % m_plate_index % m_gcode_result->filename;
+	// The same GCodeProcessor::process_file() path the preview uses for a reloaded project: the
+	// moves come back with the plate origin and nozzle-grouping context the export used.
+	bool restored = false;
+	try {
+		m_print->reload_gcode_moves(m_gcode_result);
+		restored = has_slice_payload();
+	} catch (...) {
+		// A released payload is not usable after an unsuccessful reload. Do not leave a
+		// valid plate pointing at an empty result, or let a later export write stale data.
+		update_slice_result_valid_state(false);
+		return false;
+	}
+	if (!restored) {
+	    update_slice_result_valid_state(false);
+	    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": plate %1% could not restore its preview payload from %2%") % m_plate_index % m_gcode_result->filename;
+	}
+	return restored;
+}
+
+bool PartPlate::release_finished_slice_resources()
+{
+	if (!m_slice_result_valid || m_print == nullptr)
+		return false;
+	// The payload is the condition for the rest: only a plate whose own G-code file is still on
+	// disk can be read back, and only then is giving up the sliced objects of the print safe.
+	if (!release_slice_payload())
+		return false;
+
+	// The print refuses while any of its steps is still running, and says so: the caller is the one
+	// that has to have stopped the background processing before it gets here.
+	if (!m_print->release_slicing_state())
+		return false;
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% released its slicing state, restorable from %2%") % m_plate_index % m_gcode_result->filename;
+	return true;
+}
+
+std::string PartPlate::slice_statistics_json()
+{
+	GCodeProcessorResult *result = m_gcode_result;
+	if (result == nullptr)
+		return {};
+	// The export cached the document while the moves were there, and a project saved with
+	// statistics handed it back on load: either way this is the cheapest source by far.
+	if (!result->statistics_json.empty())
+		return result->statistics_json;
+	if (has_gcode_statistics(*result)) {
+		// Still resident: sum it now, so a later release can drop the moves and keep the document.
+		// A result that never moved sums to a document with nothing in it, which is not cached and
+		// falls through to the file below.
+		result->cache_statistics_json();
+		if (!result->statistics_json.empty())
+			return result->statistics_json;
+	}
+	// Neither the document nor the moves: a plate loaded from a sliced 3MF whose entry had no
+	// statistics document has only its file. Sum the document out of that file, which keeps it on
+	// the result - the same project is exported again as often as the user asks, and every one of
+	// those would otherwise parse every plate's G-code again on this thread. Nothing here changes
+	// what the plate knows about itself; a file that cannot be read, or that holds no moves, leaves
+	// the document empty for the caller to report.
+	if (m_print == nullptr || !slice_payload_restorable(result))
+		return {};
+	try {
+		std::string statistics = m_print->gcode_statistics_from_file(*result);
+		if (statistics.empty())
+			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": plate %1% summed no statistics from %2%") % m_plate_index % result->filename;
+		return statistics;
+	} catch (const std::exception &ex) {
+		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": plate %1% cannot read its statistics from %2%: %3%") % m_plate_index % result->filename % ex.what();
+		return {};
+	}
 }
 
 int PartPlate::load_thumbnail_data(std::string filename, ThumbnailData& thumb_data)
@@ -6701,6 +6821,23 @@ int PartPlateList::duplicate_plate(int index)
 }
 
 
+// Slice all: a finished plate's preview payload and the sliced objects of its print are both
+// derived from its own G-code file and its model, so a batch gives them back as it moves on and
+// keeps only what every plate still reports. The plate the preview shows is never released: the
+// preview holds raw pointers into its result and reads its print's objects.
+int PartPlateList::release_finished_plate_resources(int keep_plate_index)
+{
+	int released = 0;
+	for (int plate_index = 0; plate_index < (int) m_plate_list.size(); ++plate_index) {
+		if (plate_index == keep_plate_index)
+			continue;
+		PartPlate *plate = m_plate_list[plate_index];
+		if (plate != nullptr && plate->release_finished_slice_resources())
+			++released;
+	}
+	return released;
+}
+
 //destroy print's objects and results
 int PartPlateList::destroy_print(int print_index)
 {
@@ -6957,7 +7094,7 @@ std::set<int> PartPlateList::get_extruders(bool conside_custom_gcode) const
 //select plate
 int PartPlateList::select_plate(int index)
 {
-	const std::lock_guard<std::mutex> local_lock(m_plates_mutex);
+	std::unique_lock<std::mutex> local_lock(m_plates_mutex);
 	if (m_plate_list.empty() || index >= m_plate_list.size()) {
 		return -1;
 	}
@@ -6996,12 +7133,37 @@ int PartPlateList::select_plate(int index)
 		camera.set_target(target);
 	}
 
-    if (previous_index != index && m_intialized && m_plater != nullptr && !m_plater->is_loading_project()) {
-        LifecycleEventContext ctx;
-        ctx.name = m_plate_list[index]->get_plate_name();
-        ctx.index = index;
-        fire_lifecycle_event(LifecycleEvent::PlateSelected, ctx);
-    }
+    // The plate's own slice result is restored below, outside the lock; the event that tells the
+    // rest of the application about the switch is fired after that, so a listener reading this
+    // plate's result does not see the empty payload a release left behind.
+	const bool notify_selected = previous_index != index && m_intialized && m_plater != nullptr && !m_plater->is_loading_project();
+	PartPlate *plate = m_plate_list[index];
+	LifecycleEventContext ctx;
+	if (notify_selected) {
+		ctx.name = plate->get_plate_name();
+		ctx.index = index;
+	}
+	// The plate list is in its new state; the lock has no business being held across the parse
+	// below.
+	local_lock.unlock();
+
+	// Slice all: the plate that becomes current owns the preview from here on, and an earlier
+	// release took its moves away. Read them back from its own G-code file now, before the caller
+	// hands the result to the preview, so an empty move list is never mistaken for a plate that has
+	// to be sliced again. A plate whose file is gone keeps an empty payload and falls back to
+	// re-slicing, exactly as it did before anything could be released.
+	//
+	// This runs outside m_plates_mutex on purpose: GCodeProcessor::process_file() reads and parses
+	// the plate's whole G-code file (100+ MB and tens of millions of moves for a full bed), and
+	// holding the plate list lock across that blocks every other PartPlateList user for as long as
+	// it takes. It still runs on the calling thread, which is the UI thread for both selection
+	// paths (Plater::select_plate() and the slice-all branch of
+	// Plater::priv::on_process_completed()), so the UI does freeze for that parse; moving it to a
+	// background task with a progress indicator is the next step, and is not done here.
+	plate->restore_slice_payload();
+
+	if (notify_selected)
+		fire_lifecycle_event(LifecycleEvent::PlateSelected, ctx);
 
 	return 0;
 }
@@ -8138,6 +8300,13 @@ void PartPlateList::update_slice_context_to_current_plate(BackgroundSlicingProce
 	current_plate = m_plate_list[m_current_plate];
 	assert(current_plate != NULL);
 
+	// The plate being switched to may have had its preview payload released by a slice-all run that
+	// has moved on; both the process and the preview need the moves, so read them back from the
+	// plate's own G-code file before the context is handed over. A plate this cannot restore keeps an
+	// empty result, and the caller falls back to re-slicing it, as it did before the payload could be
+	// released at all.
+	current_plate->restore_slice_payload();
+
 	current_plate->update_slice_context(process);
 
 	return;
@@ -8427,7 +8596,7 @@ int PartPlateList::rebuild_plates_after_arrangement(bool recycle_plates, bool ex
 	return ret;
 }
 
-int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool with_slice_info, int plate_idx, bool with_statistics)
+int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool with_slice_info, int plate_idx, bool with_statistics, bool statistics_required)
 {
 	int ret = 0;
 
@@ -8501,8 +8670,26 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 					}
 					//parse filament info
 					plate_data_item->parse_filament_info(m_plate_list[i]->get_slice_result());
-					if (with_statistics)
-						plate_data_item->statistics = gcode_statistics_json(*m_plate_list[i]->get_slice_result());
+					if (with_statistics) {
+						// The per-layer statistics document is summed from the moves. A plate
+						// sliced earlier in a slice-all run released them to keep the footprint
+						// flat, so the export cached the document while it still had them; a plate
+						// loaded from a sliced 3MF only has its file, and slice_statistics_json()
+						// reads the document back out of it. A plate whose document cannot be had at
+						// all is written without one - bbs_3mf skips the entry, so the project is
+						// complete but this plate has no statistics - unless the caller requires
+						// them, which is what the command line's --export-statistics does.
+						const std::string statistics = m_plate_list[i]->slice_statistics_json();
+						if (statistics.empty()) {
+							if (statistics_required) {
+								ret = -1;
+								BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": plate %1% has neither cached statistics nor a readable G-code file to sum them from") % m_plate_list[i]->m_plate_index;
+							} else {
+								BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": plate %1% is saved without its statistics, none could be collected from %2%") % m_plate_list[i]->m_plate_index % m_plate_list[i]->m_gcode_result->filename;
+							}
+						} else
+							plate_data_item->statistics = statistics;
+					}
 
 					// Record mixed (virtual) filaments actually used on this plate.
 					// Source is ToolOrdering::used_mixed_filaments (slots that appeared in
@@ -8601,6 +8788,20 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		}
 		if (Print *print = dynamic_cast<Print*>(fff_print))
 			print->set_slice_used_mixed_filaments(gcode_result->used_mixed_filaments);
+
+		// The archive carried this plate's statistics document: hand it to the result as its cache,
+		// so an export after loading a sliced project serves it instead of parsing the plate's whole
+		// G-code file - 100+ MB per plate on a full bed, on the UI thread, for every plate of the
+		// project. A document that is there but holds no statistics (see
+		// statistics_json_has_data()) is dropped, so the file fallback runs and reports what it found
+		// with the usual warning or error semantics.
+		if (!plate_data_list[i]->statistics.empty()) {
+			if (statistics_json_has_data(plate_data_list[i]->statistics)) {
+				gcode_result->statistics_json = plate_data_list[i]->statistics;
+				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% took its statistics document from the project, %2% bytes") % i % gcode_result->statistics_json.size();
+			} else
+				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": plate %1% carries a statistics document without statistics in it, it is summed from the G-code instead") % i;
+		}
 
         // Reconstruct the device-side nozzle grouping from the loaded 3mf so
         // the monitor/preview can map filaments to physical nozzles.

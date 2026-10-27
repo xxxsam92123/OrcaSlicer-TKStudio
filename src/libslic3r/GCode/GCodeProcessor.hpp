@@ -16,6 +16,7 @@
 #include "libslic3r/GCode/ExclusionVolumePathCheck.hpp"
 #include "libslic3r/GCode/MachineFrameTransform.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cassert>
 #include <cstdint>
@@ -132,7 +133,9 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         PrintEstimatedStatistics() { reset(); }
 
         void reset() {
-            for (auto m : modes) {
+            // By reference: resetting a copy left every mode's time and prepare time uninitialized, so
+            // a result that never had a slice behind it summed a document reporting garbage.
+            for (auto &m : modes) {
                 m.reset();
             }
             volumes_per_color_change.clear();
@@ -309,6 +312,15 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         };
 
         std::string filename;
+        // Set only by mark_export_completed(): whether `filename` was written by this result's own
+        // export. See preview_payload_restorable().
+        bool export_completed { false };
+        // The per-layer statistics document of the exported G-code, computed once the export filled
+        // the moves in. It is the only part of them the 3MF writer needs, and the moves it is
+        // summed from may be gone by then (release_preview_payload()), so it is kept as the text
+        // the export produced. Empty for a result that was not exported in this process; see
+        // cache_statistics_json() and gcode_statistics_json().
+        std::string statistics_json;
         unsigned int id;
         std::vector<MoveVertex> moves;
         ObjectMass plate_mass;
@@ -404,6 +416,32 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         BedType bed_type = BedType::btCount;
         void reset();
 
+        // Free the per-move preview payload (moves, lines_ends) while keeping everything else the
+        // result carries: filename, print_statistics, filament data, warnings and the per-layer
+        // filament maps. The owner of the G-code file the result came from can bring the payload
+        // back with GCodeProcessor::process_file() (Print::reload_gcode_moves()), so a project with
+        // many plates does not have to keep every plate's moves resident at the same time.
+        void release_preview_payload();
+        // Whether the per-move payload is resident.
+        bool has_preview_payload() const { return !moves.empty(); }
+        // Whether this result's payload may be dropped now and read back from `filename` later.
+        // Both conditions matter: the file has to be the one this result's own export wrote, and it
+        // has to be readable at this moment. A result whose export failed or never ran may still
+        // point at a file an earlier round left behind (reset() keeps the filename), and reading
+        // that one back would present the old slice as the current one. A path that cannot be
+        // probed (an unmounted device, a vanished network share) counts as not readable, so this
+        // never throws on the UI thread.
+        bool preview_payload_restorable() const;
+        // Sets the first half of preview_payload_restorable(): called once the export that wrote
+        // `filename` has completed and the file is in place. reset() and every assignment from a
+        // fresh processor result leave the result not restorable.
+        void mark_export_completed() { export_completed = true; }
+        // Fill statistics_json from the moves this result currently holds. Called once the export
+        // has produced them; gcode_statistics_json() then serves it without touching the moves.
+        // Takes result_mutex (the other writers of the field do) and keeps nothing when the result
+        // has no moves: what it would sum is an empty document, not statistics.
+        void cache_statistics_json();
+
         //BBS: add mutex for protection of gcode result
         mutable std::mutex result_mutex;
         GCodeProcessorResult& operator=(const GCodeProcessorResult &other) { assign(other); return *this; }
@@ -413,6 +451,8 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         template<class Other> void assign(Other &&other)
         {
             filename = std::forward<Other>(other).filename;
+            export_completed = std::forward<Other>(other).export_completed;
+            statistics_json = std::forward<Other>(other).statistics_json;
             id = std::forward<Other>(other).id;
             moves = std::forward<Other>(other).moves;
             plate_mass = std::forward<Other>(other).plate_mass;
@@ -647,7 +687,13 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         static const float Wipe_Width;
         static const float Wipe_Height;
 
-        static bool s_IsBBLPrinter;
+        // Process-wide, and written from more than one thread: the slicing pipeline sets it on the
+        // background worker (GCode.cpp, WipeTower), the GUI sets it before it processes a file on
+        // the UI thread. Atomic, so a parse reading it concurrently sees one of the two values
+        // rather than a torn or stale one. That a later write also changes the reserved tags of a
+        // parse already running is a property of the process-wide design, not something the type
+        // can prevent.
+        static std::atomic<bool> s_IsBBLPrinter;
 
     private:
         using AxisCoords = std::array<double, 4>;

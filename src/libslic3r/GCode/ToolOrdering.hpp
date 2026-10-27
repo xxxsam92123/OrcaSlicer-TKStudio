@@ -290,6 +290,22 @@ public:
         m_stats_by_multi_extruder_curr.clear();
     }
 
+    // Drop everything that points into the print's objects, keeping the scalars a finished plate
+    // still reports. A print that gives its PrintObjects back (Print::release_slicing_state()) has
+    // to call this before deleting them: the layer tools carry the wiping maps keyed by PrintObject
+    // and ExtrusionEntity pointers, and the per-object gradient bookkeeping is keyed by PrintObject
+    // as well. first_extruder() / last_extruder() / all_extruders() stay valid, because the CLI 3MF
+    // metadata (OrcaSlicer.cpp) and the GUI plate bounding box (Plater.cpp) read them from a plate
+    // whose slicing state is already released. Everything cleared here is rebuilt by the next
+    // process().
+    void    release_object_references() {
+        clear();
+        m_mixed_object_layers.clear();
+        m_object_all_layer_indices.clear();
+        m_gradient_volume_layers.clear();
+        m_print_object_ptr = nullptr;
+    }
+
     // Only valid for non-sequential print:
 	// Assign a pointer to a custom G-code to the respective ToolOrdering::LayerTools.
 	// Ignore color changes, which are performed on a layer and for such an extruder, that the extruder will not be printing above that layer.

@@ -7283,6 +7283,19 @@ int CLI::run(int argc, char **argv)
                                 record_exit_reson(outfile_dir, CLI_SLICING_ERROR, index+1, cli_errors[CLI_SLICING_ERROR], sliced_info);
                                 flush_and_exit(CLI_SLICING_ERROR);
                             }
+                            // Slice all: this plate's G-code is exported and its file is on disk,
+                            // so the preview payload of the result and the sliced objects of its
+                            // print are derived data from here on - both are read back from that
+                            // file or rebuilt from the model when a later step needs them. Hand
+                            // them back before the next plate allocates its own, or the run grows
+                            // with the plate count until an allocation fails. Release is an
+                            // optimisation and never fails a slice: whatever it cannot verify it
+                            // leaves resident.
+                            try {
+                                part_plate->release_finished_slice_resources();
+                            } catch (const std::exception &ex) {
+                                BOOST_LOG_TRIVIAL(warning) << "plate " << index + 1 << ": slice resources were not released: " << ex.what();
+                            }
                         }
                     }
                     if (pre_check&& (partplate_list.get_plate_count() > 1))
@@ -7341,7 +7354,14 @@ int CLI::run(int argc, char **argv)
         std::vector<ThumbnailData *> thumbnails, no_light_thumbnails, top_thumbnails, pick_thumbnails;
         std::vector<PlateBBoxData*> plate_bboxes;
         PlateDataPtrs plate_data_list;
-        partplate_list.store_to_3mf_structure(plate_data_list, true, -1, export_statistics);
+        // A plate whose statistics could not be produced fails the export only when the caller asked
+        // for the statistics explicitly: writing the project with a sliced plate and an empty
+        // statistics document would look like a complete result.
+        if (const int statistics_ret = partplate_list.store_to_3mf_structure(plate_data_list, true, -1, export_statistics, export_statistics); statistics_ret != 0) {
+            BOOST_LOG_TRIVIAL(error) << "failed to collect plate statistics for the 3mf export, ret=" << statistics_ret;
+            record_exit_reson(outfile_dir, CLI_EXPORT_STATISTICS_ERROR, 0, cli_errors[CLI_EXPORT_STATISTICS_ERROR], sliced_info);
+            flush_and_exit(CLI_EXPORT_STATISTICS_ERROR);
+        }
 
         if (sliced_plate == -1) {
             for (int i = 0; i < plate_data_list.size(); i++) {

@@ -11,6 +11,7 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/GCodeStatistics.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Print.hpp"
@@ -21,8 +22,14 @@
 #include "test_utils.hpp"
 
 #include <algorithm>
+#include <boost/filesystem/operations.hpp>
+#include <boost/system/error_code.hpp>
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <initializer_list>
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Point.hpp"
@@ -904,4 +911,193 @@ TEST_CASE("A filament mapped to no nozzle has no errors listed under a nozzle", 
     check_path_in_nozzle_area(inset_nozzle_area(2), path, Vec2d(0., 0.), result, 0);
 
     CHECK(result.gcode_check_result.print_area_error_infos.count(-1) == 0);
+}
+
+TEST_CASE("A released preview payload keeps its metadata and comes back from the plate's G-code file", "[GCodeProcessor]")
+{
+    // A real slice, so the result carries everything a plate reports from it: filename, statistics,
+    // filament data and the per-move payload.
+    Print print;
+    Model model;
+    Test::init_print({ Test::cube(20) }, print, model, DynamicPrintConfig::full_print_config());
+
+    GCodeProcessorResult result;
+    const std::string    gcode_text = Test::gcode(print, &result);
+    REQUIRE(result.moves.size() > 0);
+
+    // The plate keeps its G-code file after releasing the payload, and restores from it.
+    ScopedTemporaryFile gcode_file(".gcode");
+    {
+        std::ofstream output(gcode_file.string());
+        output << gcode_text;
+    }
+    result.filename = gcode_file.string();
+
+    constexpr size_t normal   = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal);
+    const size_t     moves    = result.moves.size();
+    const size_t     lines    = result.lines_ends.size();
+    const double     time     = result.print_statistics.modes[normal].time;
+    const size_t     extruders = result.filaments_count;
+    REQUIRE(time > 0.0);
+
+    // The per-layer statistics document was produced by the export, while the moves were there.
+    const std::string statistics = gcode_statistics_json(result);
+    REQUIRE_FALSE(statistics.empty());
+
+    result.release_preview_payload();
+
+    // The per-move payload is what a project with many plates must not keep for every plate, and
+    // clear-and-shrink is what actually gives the memory back.
+    CHECK(result.moves.empty());
+    CHECK(result.moves.capacity() == 0);
+    CHECK(result.lines_ends.empty());
+    // Everything the plate list, the all-plate statistics and the 3MF export read stays put.
+    CHECK(result.filename == gcode_file.string());
+    CHECK(result.filaments_count == extruders);
+    CHECK_THAT(result.print_statistics.modes[normal].time, Catch::Matchers::WithinAbs(time, 1e-9));
+    // Including the statistics document itself: it is not summed from moves again, so it is the
+    // same text the export produced and the 3MF export can still write it.
+    CHECK(gcode_statistics_json(result) == statistics);
+
+    // Restoring is the same GCodeProcessor::process_file() path a reloaded project takes.
+    print.reload_gcode_moves(&result);
+
+    CHECK(result.moves.size() == moves);
+    CHECK(result.lines_ends.size() == lines);
+    // Reading the moves back must not rewrite the statistics the plate already reports.
+    CHECK_THAT(result.print_statistics.modes[normal].time, Catch::Matchers::WithinAbs(time, 1e-9));
+
+    // A plate that has the file but neither the document nor the moves - what opening a sliced 3MF
+    // gives - produces the document by summing the file instead of reporting empty statistics.
+    // Clearing the cache is what forces that path; it is the fallback the plate relies on.
+    result.statistics_json.clear();
+    const std::string from_file = print.gcode_statistics_from_file(result);
+    CHECK_FALSE(from_file.empty());
+    // And the fallback keeps what it summed, so the next export of this plate does not parse the
+    // file again.
+    CHECK(result.statistics_json == from_file);
+    // The document of an empty move list has no layers; this file has them.
+    CHECK(from_file.find("\"layers\": []") == std::string::npos);
+}
+
+TEST_CASE("Statistics availability follows the cached document and the moves", "[GCodeProcessor]")
+{
+    Print print;
+    Model model;
+    Test::init_print({ Test::cube(20) }, print, model, DynamicPrintConfig::full_print_config());
+
+    GCodeProcessorResult result;
+    const std::string    gcode_text = Test::gcode(print, &result);
+    REQUIRE(result.moves.size() > 0);
+
+    // Resident moves are enough to sum the document from, and are what the export has.
+    CHECK(has_gcode_statistics(result));
+    const std::string from_moves = gcode_statistics_json(result);
+    REQUIRE_FALSE(from_moves.empty());
+    // Empty, non-empty; the document is summed either way.
+    CHECK(from_moves.find("\"layers\": []") == std::string::npos);
+
+    result.cache_statistics_json();
+    REQUIRE_FALSE(result.statistics_json.empty());
+    // The cache is what keeps the document available once the moves are gone.
+    result.release_preview_payload();
+    REQUIRE(result.moves.empty());
+    CHECK(has_gcode_statistics(result));
+    CHECK(gcode_statistics_json(result) == result.statistics_json);
+
+    // A copy carries both, so a result handed between the export and the plate data keeps its
+    // document.
+    GCodeProcessorResult copy;
+    copy = result;
+    CHECK(copy.statistics_json == result.statistics_json);
+    CHECK(copy.moves.empty());
+
+    // reset() starts a new round: the payload and the document of the round it named are dropped,
+    // so nothing may serve them as if they described the new one.
+    result.reset();
+    CHECK(result.statistics_json.empty());
+    CHECK(result.moves.empty());
+    CHECK_FALSE(has_gcode_statistics(result));
+    // The filename survives a reset, so "there is a file" must not be taken for "there is a
+    // document or a payload".
+    result.filename = "some/earlier/plate.gcode";
+    CHECK_FALSE(has_gcode_statistics(result));
+}
+
+TEST_CASE("A statistics document without layers holds no statistics", "[GCodeProcessor]")
+{
+    // The document a result without moves sums to: well formed, and empty. It is what an export
+    // would otherwise write while reporting success, so "the string is not empty" is not the test.
+    GCodeProcessorResult empty;
+    const std::string    empty_document = gcode_statistics_json(empty);
+    REQUIRE_FALSE(empty_document.empty());
+    CHECK(empty_document.find("\"layers\": []") != std::string::npos);
+    CHECK_FALSE(statistics_json_has_data(empty_document));
+
+    for (const char *not_a_document : { "{ this is not json", "[]", "" })
+        CHECK_FALSE(statistics_json_has_data(not_a_document));
+
+    Print print;
+    Model model;
+    Test::init_print({ Test::cube(20) }, print, model, DynamicPrintConfig::full_print_config());
+    GCodeProcessorResult result;
+    Test::gcode(print, &result);
+    result.cache_statistics_json();
+    REQUIRE_FALSE(result.statistics_json.empty());
+    CHECK(statistics_json_has_data(result.statistics_json));
+}
+
+TEST_CASE("A preview payload is restorable only from the G-code its own export completed", "[GCodeProcessor]")
+{
+    // A plate that gets re-sliced goes through GCodeProcessorResult::reset(), and reset() keeps the
+    // filename: until the new export has completed, the result still names the file of the earlier
+    // round, and that file is still on disk. Dropping the payload against it - or reading that file
+    // back - would present an old slice as the current one, which is exactly the state a plate is
+    // left in when its slice or its G-code export fails.
+    ScopedTemporaryFile gcode_file(".gcode");
+    {
+        std::ofstream output(gcode_file.string());
+        output << "; G-code of an earlier round, still on disk\n";
+    }
+
+    GCodeProcessorResult result;
+    result.filename = gcode_file.string();
+    // The file exists, but no export of this result wrote it.
+    CHECK_FALSE(result.preview_payload_restorable());
+
+    // The export that wrote this file completed: now the payload may go and come back from it.
+    result.mark_export_completed();
+    CHECK(result.preview_payload_restorable());
+
+    // Dropping the payload must not drop the source - that is what makes releasing it safe.
+    result.moves.resize(4);
+    result.lines_ends = { 10, 20, 30 };
+    result.release_preview_payload();
+    CHECK(result.moves.empty());
+    CHECK(result.moves.capacity() == 0);
+    CHECK(result.preview_payload_restorable());
+
+    // A new round starts and fails before its export completes: reset() drops the payload and the
+    // "export completed" state, while the earlier round's filename is left pointing at a file that
+    // is still there. Neither of those may be taken for a source of this round's result.
+    result.reset();
+    result.filename = gcode_file.string();
+    CHECK_FALSE(result.preview_payload_restorable());
+
+    // A restorable result whose file has gone is not restorable, and probing it must not throw.
+    result.mark_export_completed();
+    CHECK(result.preview_payload_restorable());
+    boost::system::error_code remove_ec;
+    boost::filesystem::remove(gcode_file.string(), remove_ec);
+    REQUIRE_FALSE(remove_ec);
+    CHECK_FALSE(result.preview_payload_restorable());
+
+    // An existing directory is not a readable G-code source either.
+    result.filename = boost::filesystem::path(gcode_file.string()).parent_path().string();
+    result.mark_export_completed();
+    CHECK_FALSE(result.preview_payload_restorable());
+
+    // Nor is a path that cannot be probed at all: a removed drive, or a vanished share.
+    result.filename = (boost::filesystem::path(gcode_file.string()).parent_path() / "gone" / "plate.gcode").string();
+    CHECK_FALSE(result.preview_payload_restorable());
 }

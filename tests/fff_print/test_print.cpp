@@ -43,6 +43,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/GCodeStatistics.hpp"
 #include "libslic3r/Exception.hpp"
 #include "libslic3r/LifecycleEvents.hpp"
 #include "libslic3r/Utils.hpp"
@@ -52,6 +53,8 @@
 
 #include <algorithm>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/system/error_code.hpp>
 #include <cstdlib>
 #include <sstream>
 #include <initializer_list>
@@ -2421,4 +2424,364 @@ TEST_CASE("Changing G-code precision invalidates only G-code export", "[Print][R
     CHECK(print.is_step_done(psSkirtBrim));
     CHECK(print.objects().front()->is_step_done(posSlice));
     CHECK(print.objects().front()->is_step_done(posPerimeters));
+}
+
+// Slice all: a plate that has been sliced and exported keeps its whole sliced output - layers,
+// supports, fill, extrusion paths - for as long as the project lives, so a project with many
+// plates exhausts memory in proportion to the plate count no matter how little of that output is
+// still read. The output is derived data: the plate keeps reporting its statistics and its config,
+// and a later apply() rebuilds the objects from the model. This pins both
+// halves of that contract, including the status apply() reports for the rebuild: it must not be
+// mistaken for a change, or the caller throws the plate's still-current result away.
+TEST_CASE("A print that released its slicing state keeps its statistics and slices again from the model", "[Print][Memory]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "layer_height", 0.2 },
+        { "skirt_loops",  2 },
+    });
+    // So the statistics report a mass as well as a filament length, both of which the release has
+    // to leave untouched.
+    config.set_key_value("filament_density", new ConfigOptionFloats{ 1.24 });
+    Print print;
+    Model model;
+    init_print({ cube(20) }, print, model, config);
+
+    const auto export_gcode = [](Print &print) {
+        ScopedTemporaryFile temp(".gcode");
+        print.export_gcode(temp.string(), nullptr, nullptr);
+        std::ifstream in(temp.string());
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+
+    print.process();
+    const std::string first = export_gcode(print);
+    // The engine resolves the per-filament filament/nozzle maps while it slices and writes them
+    // back into the print config; the plate config the GUI applies afterwards carries them (see
+    // BackgroundSlicingProcess::process_fff). init_print also fills in what a test needs on top of
+    // the passed config, role comments among them. Taking the config back from the print is
+    // therefore what an unchanged plate actually hands to apply().
+    config = print.full_print_config();
+
+    // What the plate data, the statistics panel and the 3MF export still read once released.
+    const PrintStatistics before = print.print_statistics();
+    REQUIRE(before.total_used_filament > 0.);
+    REQUIRE(before.total_weight > 0.);
+    REQUIRE_FALSE(print.objects().empty());
+    // A 20 mm cube at 0.2 mm layers.
+    REQUIRE(print.objects().front()->layer_count() == 100);
+
+    print.release_slicing_state();
+
+    CHECK(print.objects().empty());
+    CHECK_THAT(print.print_statistics().total_used_filament, Catch::Matchers::WithinRel(before.total_used_filament));
+    CHECK_THAT(print.print_statistics().total_weight, Catch::Matchers::WithinRel(before.total_weight));
+    // The config the released print still reports. layer_height is an object setting, so it lives in
+    // the full config rather than in Print::config().
+    CHECK_THAT(print.full_print_config().opt_float("layer_height"), Catch::Matchers::WithinAbs(0.2, 1e-9));
+
+    // Painted data is not part of the mesh, the volume config or the volumes' matrices; the only
+    // thing that carries it is the volume's FacetsAnnotation, and apply() invalidates a step for
+    // each of the four sets. Paint one facet the way the painting gizmos do: the states differ per
+    // set, the timestamp is what the comparison sees.
+    const auto paint_facet = [](ModelVolume &volume, FacetsAnnotation &annotation, EnforcerBlockerType state) {
+        TriangleSelector selector(volume.mesh());
+        selector.set_facet(0, state);
+        REQUIRE(annotation.set(selector));
+    };
+
+    SECTION("an unchanged print rebuilds without reporting a change to slice for") {
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) == 0);
+        CHECK_FALSE(print.objects().empty());
+        // The rebuild is the release coming back, so the print is as exported as a plate loaded
+        // from its own 3MF: the export step is done, which is what the preview, the send path and
+        // the export paths read.
+        CHECK(print.finished());
+
+        // What the plate's own Slice button does to it afterwards.
+        print.process();
+        const std::string second = export_gcode(print);
+        CHECK_THAT(print.print_statistics().total_used_filament, Catch::Matchers::WithinRel(before.total_used_filament));
+        CHECK_THAT(max_z(second), Catch::Matchers::WithinAbs(max_z(first), 1e-6));
+        CHECK(layers_with_role(second, "skirt").size() == layers_with_role(first, "skirt").size());
+    }
+
+    SECTION("a config change while released is still reported as invalidated") {
+        DynamicPrintConfig changed = config;
+        changed.set_deserialize_strict({ { "layer_height", 1.0 } });
+        const Print::ApplyStatus status = print.apply(model, changed);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("an object config change while released is still reported as invalidated") {
+        // A per-object setting does not touch the print config, and the released print has no
+        // PrintObject left for apply() to diff it against: the plate's result no longer describes
+        // this object, so the change must still reach the caller.
+        model.objects.front()->config.set_key_value("enable_support", new ConfigOptionBool(true));
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("moving an object while released is still reported as invalidated") {
+        // The moved instance is only visible in the PrintObjects step 4 builds, and a released
+        // print has none: keeping the plate's result would point the preview and the export at
+        // G-code for the old position.
+        ModelInstance &instance = *model.objects.front()->instances.front();
+        instance.set_offset(instance.get_offset() + Vec3d(10., 0., 0.));
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("painted filament data changed while released is reported as invalidated") {
+        // Per-facet filament decides which extruder prints which triangle: keeping the plate's
+        // G-code would print the old colours.
+        ModelVolume &volume = *model.objects.front()->volumes.front();
+        paint_facet(volume, volume.mmu_segmentation_facets, EnforcerBlockerType::Extruder2);
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("fuzzy skin data changed while released is reported as invalidated") {
+        ModelVolume &volume = *model.objects.front()->volumes.front();
+        paint_facet(volume, volume.fuzzy_skin_facets, EnforcerBlockerType::Extruder1);
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("painted seam data changed while released is reported as invalidated") {
+        ModelVolume &volume = *model.objects.front()->volumes.front();
+        paint_facet(volume, volume.seam_facets, EnforcerBlockerType::ENFORCER);
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("an object that joins the plate while released is reported as invalidated") {
+        // The comparison apply() makes at the top can only look at the objects the release
+        // recorded, so an object that prints on this plate but was not part of the released slice
+        // is only visible in the rebuild. Its G-code is not in the plate's file.
+        ModelObject *added = model.add_object();
+        added->add_volume(make_cube(10., 10., 10.));
+        added->add_instance();
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+
+    SECTION("a change to an object outside this print is not reported as invalidated") {
+        // apply() is handed the model of the whole project. An object that does not print on this
+        // plate - another plate's instance is outside this plate's bed, which is what excludes it
+        // from this print - is no reason to throw this plate's G-code away.
+        ModelObject *other = model.add_object();
+        other->add_volume(make_cube(10., 10., 10.));
+        other->add_instance()->printable = false;
+        const Print::ApplyStatus status = print.apply(model, config);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) == 0);
+        CHECK(print.finished());
+    }
+}
+
+// The plate a GUI user clicks back to is applied with the preset bundle's config, not with the
+// config this print normalized while slicing: normalize_fdm_2() clears enable_prime_tower and
+// independent_support_layer_height for the filaments the plate actually uses, and apply() writes
+// that result into the print's config. A released print has no PrintObject left to derive the
+// used filaments from, so the apply() that rebuilds it has to reproduce the normalization from
+// what the release recorded. Otherwise it diffs the config it normalized while slicing against
+// the un-normalized preset config, reports a change to slice for, and the GUI throws away a
+// finished plate's result - its preview, its statistics and its export flag.
+TEST_CASE("A released print reproduces the config normalization it sliced with", "[Print][Memory]")
+{
+    // The plate hands apply() the preset config. Of everything the engine rewrote while slicing,
+    // only the values normalize_fdm_2() derives differ from what the presets still say, so
+    // restoring those two on top of the print's own config is what that preset config looks like.
+    const auto preset_config = [](const Print &print) {
+        DynamicPrintConfig preset = print.full_print_config();
+        preset.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
+        preset.set_key_value("independent_support_layer_height", new ConfigOptionBool(true));
+        return preset;
+    };
+
+    SECTION("a plate that prints one filament") {
+        // One used filament: normalize_fdm_2() clears the prime tower.
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            { "layer_height", 0.2 },
+            { "enable_prime_tower", true },
+            { "independent_support_layer_height", true },
+        });
+        Print print;
+        Model model;
+        init_print({ cube(20) }, print, model, config);
+        print.process();
+        // The normalization really ran, so the released apply() has something to reproduce.
+        REQUIRE_FALSE(print.config().enable_prime_tower);
+
+        DynamicPrintConfig preset = preset_config(print);
+        REQUIRE(print.release_slicing_state());
+        const Print::ApplyStatus status = print.apply(model, preset);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) == 0);
+        CHECK(print.finished());
+        CHECK_FALSE(print.config().enable_prime_tower);
+    }
+
+    SECTION("a plate that keeps its tower for two filaments") {
+        // Two used filaments: the tower stays and normalize_fdm_2() clears the independent support
+        // layer height instead.
+        DynamicPrintConfig config = multifilament_config(2, {
+            { "layer_height", 0.2 },
+            { "enable_prime_tower", true },
+            { "independent_support_layer_height", true },
+            // The tower goes in the corner of the 200x200 test bed the two arranged cubes leave
+            // free, as in the other prime-tower tests here; the default y is outside that bed.
+            { "printable_area", "0x0,200x0,200x200,0x200" },
+            { "prime_tower_width", 35 },
+            { "wipe_tower_x", 120 },
+            { "wipe_tower_y", 120 },
+            { "skirt_loops", 0 },
+            { "brim_type", "no_brim" },
+        });
+        Print print;
+        Model model;
+        // The second object prints with the second filament, so both count as used.
+        const std::vector<std::vector<ConfigBase::SetDeserializeItem>> per_object = {
+            {}, { { "extruder", "2" } } };
+        init_print({ cube(20), cube(20) }, print, model, config, &per_object);
+        print.process();
+        REQUIRE(print.config().enable_prime_tower);
+        REQUIRE_FALSE(print.config().independent_support_layer_height);
+
+        DynamicPrintConfig preset = preset_config(print);
+        REQUIRE(print.release_slicing_state());
+        const Print::ApplyStatus status = print.apply(model, preset);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) == 0);
+        CHECK(print.finished());
+        CHECK_FALSE(print.config().independent_support_layer_height);
+    }
+
+    SECTION("a layer height change is still reported as invalidated") {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            { "layer_height", 0.2 },
+            { "enable_prime_tower", true },
+        });
+        Print print;
+        Model model;
+        init_print({ cube(20) }, print, model, config);
+        print.process();
+        REQUIRE_FALSE(print.config().enable_prime_tower);
+
+        // The normalization still runs on this apply; it must not excuse a real config change.
+        DynamicPrintConfig changed = preset_config(print);
+        changed.set_deserialize_strict({ { "layer_height", 0.3 } });
+        REQUIRE(print.release_slicing_state());
+        const Print::ApplyStatus status = print.apply(model, changed);
+        CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) != 0);
+        CHECK_FALSE(print.finished());
+    }
+}
+
+// A project opened from a sliced 3MF has, per plate, only the G-code file: no moves and no cached
+// statistics document. Summing that document out of the file parses the plate's whole G-code -
+// 100+ MB on a full bed - on the caller's thread, so the result has to keep it. Otherwise every
+// export of the project parses every plate again, and a second export parses it all a second time.
+TEST_CASE("Statistics summed from a plate's G-code file are cached on its result", "[Print][Memory]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({ { "layer_height", 0.2 } });
+    Print print;
+    Model model;
+    init_print({ cube(20) }, print, model, config);
+    print.process();
+
+    ScopedTemporaryFile temp(".gcode");
+    GCodeProcessorResult exported;
+    print.export_gcode(temp.string(), &exported, nullptr);
+    REQUIRE_FALSE(exported.statistics_json.empty());
+
+    // What PartPlate::load_gcode_from_file() leaves behind: the file this plate exported, and
+    // nothing summed out of it yet.
+    GCodeProcessorResult loaded;
+    loaded.filename = temp.string();
+    loaded.mark_export_completed();
+    REQUIRE(loaded.moves.empty());
+    REQUIRE(loaded.statistics_json.empty());
+
+    const std::string statistics = print.gcode_statistics_from_file(loaded);
+    CHECK_FALSE(statistics.empty());
+    // Keeping it is the whole point: the file is the expensive part.
+    CHECK(loaded.statistics_json == statistics);
+
+    // Served from the cache from here on. The file is gone, so a second parse would come back
+    // empty or throw.
+    boost::system::error_code ec;
+    REQUIRE(boost::filesystem::remove(temp.string(), ec));
+    REQUIRE_FALSE(ec);
+    CHECK(print.gcode_statistics_from_file(loaded) == statistics);
+}
+
+// A project saved with statistics carries one document per plate, and the plate loaded from it has
+// that document but neither moves nor, in general, a reason to touch its G-code file. Serving the
+// document is the whole point: the file is what the export would otherwise sum it from, at 100+ MB
+// of G-code per plate on the UI thread.
+TEST_CASE("Statistics that came from the project are served without reading its G-code", "[Print][Memory]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({ { "layer_height", 0.2 } });
+    Print print;
+    Model model;
+    init_print({ cube(20) }, print, model, config);
+    print.process();
+
+    ScopedTemporaryFile temp(".gcode");
+    GCodeProcessorResult exported;
+    print.export_gcode(temp.string(), &exported, nullptr);
+    REQUIRE(statistics_json_has_data(exported.statistics_json));
+
+    // What PartPlateList::load_from_3mf_structure() leaves behind for a plate of a project saved
+    // with statistics: the document the archive held, and no moves.
+    GCodeProcessorResult from_project;
+    from_project.statistics_json = exported.statistics_json;
+    REQUIRE(from_project.moves.empty());
+
+    // The file the document describes is gone, so a sum out of it would come back empty.
+    boost::system::error_code ec;
+    REQUIRE(boost::filesystem::remove(temp.string(), ec));
+    REQUIRE_FALSE(ec);
+
+    CHECK(print.gcode_statistics_from_file(from_project) == exported.statistics_json);
+    CHECK(gcode_statistics_json(from_project) == exported.statistics_json);
+    CHECK(has_gcode_statistics(from_project));
+    // Served, not overwritten by a sum of nothing.
+    CHECK(from_project.statistics_json == exported.statistics_json);
+}
+
+// A G-code file with no move in it parses to a document with no layers and all-zero totals. That is
+// not the statistics of a plate: an export that took it for one would write it while reporting
+// success, which is exactly what the command line's --export-statistics has to refuse.
+TEST_CASE("A G-code file without a move has no statistics to sum", "[Print][Memory]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({ { "layer_height", 0.2 } });
+    Print print;
+    Model model;
+    init_print({ cube(20) }, print, model, config);
+    print.process();
+
+    // Comments only: a file the processor reads, and that never moves.
+    ScopedTemporaryFile temp(".gcode");
+    save_string_file(temp.string(), "; a plate whose G-code never moved\n");
+    GCodeProcessorResult loaded;
+    loaded.filename = temp.string();
+    loaded.mark_export_completed();
+
+    CHECK(print.gcode_statistics_from_file(loaded).empty());
+    // Not cached as if it were a document either: the next caller has to get the same answer.
+    CHECK(loaded.statistics_json.empty());
+    CHECK_FALSE(has_gcode_statistics(loaded));
 }
