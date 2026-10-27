@@ -9385,8 +9385,9 @@ void Tab::sync_excluder()
     auto extruders      = printer_preset.config.option<ConfigOptionEnumsGeneric>("extruder_type");
     // Motion ability options hold a (normal, silent) pair per variant, so switch_excluder indexes that page with stride 2.
     const int stride = m_active_page->title().StartsWith("Motion ability") ? 2 : 1;
+    const auto variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type];
     auto get_index_for_extruder =
-            [this, &extruders, stride, variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type]](int extruder_id, NozzleVolumeType nozzle_type) {
+            [this, &extruders, stride, &variant_keys](int extruder_id, NozzleVolumeType nozzle_type) {
         return m_config->get_index_for_extruder(extruder_id + 1, variant_keys.first,
             ExtruderType(extruders->values[extruder_id]), nozzle_type, variant_keys.second, stride);
     };
@@ -9424,6 +9425,18 @@ void Tab::sync_excluder()
         if (dirty) {
             auto key = opt.substr(0, n - 1);
             auto option = dynamic_cast<ConfigOptionVectorBase*>(m_config->option(key));
+            if (option == nullptr)
+                continue;
+            // deep_diff() numbers every vector option by array index, but only an option laid out one column
+            // per nozzle variant holds nozzle slots. For a single-value option (small_support_perimeter_speed)
+            // or a per-plate one (wipe_tower_x) the index is a plain array slot, and copying a nozzle slot into
+            // it would grow it past the length config_origin keeps, which the dialog then reads out of bounds.
+            if (!is_variant_column_option(*m_config, key, variant_keys.second, stride))
+                continue;
+            // Defensive only: the check above already guarantees dest_index + stride fits, since the array is
+            // exactly one column per variant. Kept so a future layout change cannot turn this into a grow.
+            if (dest_index + int(stride) > int(option->size()))
+                continue;
             auto option2 = dynamic_cast<ConfigOptionVectorBase*>(option->clone());
             for (int s = 0; s < stride; ++s)
                 option2->set_at(option, dest_index + s, from_index + s);

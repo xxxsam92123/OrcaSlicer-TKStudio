@@ -1,4 +1,5 @@
 #include "ParameterUtils.hpp"
+#include "Config.hpp"
 #include "PrintConfig.hpp"
 #include <cassert>
 #include <vector>
@@ -78,6 +79,28 @@ int get_index_for_extruder_parameter(const DynamicPrintConfig &config, const std
     }
 
     return variant_index;
+}
+
+bool is_variant_column_option(const DynamicPrintConfig &config, const std::string &opt_key,
+                              const std::string &variant_name, unsigned int stride)
+{
+    if (stride == 0)
+        return false;
+    const auto *option = dynamic_cast<const ConfigOptionVectorBase *>(config.option(opt_key));
+    if (option == nullptr)
+        return false;
+    const auto *variants = dynamic_cast<const ConfigOptionStrings *>(config.option(variant_name));
+    if (variants == nullptr || variants->values.empty())
+        return false;
+    return option->size() == variants->values.size() * stride;
+}
+
+bool variant_column_value(const ConfigOptionVectorBase &opt, int idx, std::string &out)
+{
+    if (idx < 0 || idx >= int(opt.size()))
+        return false;
+    out = opt.vserialize()[idx];
+    return true;
 }
 
 }; // namespace Slic3r
