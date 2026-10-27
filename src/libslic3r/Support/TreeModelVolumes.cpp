@@ -533,17 +533,22 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                 max_layers_above = 0;
                 max_layers_below = 0;
                 for (LayerIndex layer_idx = 0; layer_idx < LayerIndex(outlines.size()); ++ layer_idx) {
-                    const double z = grid.z(layer_idx);
+                    // The material of a layer that carries an exact top contact ends below the layer top,
+                    // so the clearance has to be measured from where that material ends - otherwise the
+                    // overhang the contact is meant to stop below would count as being inside the
+                    // clearance and remove the contact tips again.
+                    const double z = grid.contact_top_z(layer_idx);
                     // A layer above counts while the object inside it is still less than the clearance
-                    // away. The object's own bottom is used, not the tiled one: lowering a contact layer
-                    // pulls the tiled bottom of the layer above down with it, which would drag the
-                    // overhang layer into the clearance range and leave no room for the contact tips.
+                    // away. The object's own bottom is used rather than the layer bottom: a layer whose
+                    // slice reaches an overhang starts at the face, which sits above the layer bottom,
+                    // and measuring against the layer bottom would drag the overhang layer into the
+                    // clearance range and leave no room for the contact tips.
                     while (layer_idx + num_layers_above[layer_idx] + 1 < LayerIndex(outlines.size()) &&
                            grid.obj_bottom_z(layer_idx + num_layers_above[layer_idx] + 1) < z + top_distance - EPSILON)
                         ++ num_layers_above[layer_idx];
                     // A layer below counts while its top is still less than the clearance away.
                     while (layer_idx - num_layers_below[layer_idx] - 1 >= 0 &&
-                           grid.z(layer_idx - num_layers_below[layer_idx] - 1) > z - bottom_distance - EPSILON)
+                           grid.contact_top_z(layer_idx - num_layers_below[layer_idx] - 1) > z - bottom_distance - EPSILON)
                         ++ num_layers_below[layer_idx];
                     max_layers_above = std::max(max_layers_above, num_layers_above[layer_idx]);
                     max_layers_below = std::max(max_layers_below, num_layers_below[layer_idx]);
