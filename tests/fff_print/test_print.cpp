@@ -2785,3 +2785,97 @@ TEST_CASE("A G-code file without a move has no statistics to sum", "[Print][Memo
     CHECK(loaded.statistics_json.empty());
     CHECK_FALSE(has_gcode_statistics(loaded));
 }
+
+// A plate that comes back after its slicing state was released reaches the background process with
+// its export step done: apply() restores that step because the rebuild was the release coming back,
+// not a change (PrintApply.cpp, "released_rebuilt_same_objects"). The preview payload is empty by
+// then, so Plater::select_plate() reslices, and BackgroundSlicingProcess::process_fff() re-reads the
+// plate's G-code file into the result. That is only a restore while the file is still there: the
+// released plate's file is a temp file, and a temp cleanup, an unmounted volume or another
+// instance's cleanup can remove it between the release and the click. Reading it then used to kill
+// the process - boost::nowide::fopen() returns nullptr for a file that is not there, and fread() on
+// that null stream reports an invalid parameter, which __fastfail()s the process (0xc0000409 in
+// ucrtbase, FAST_FAIL_INVALID_ARG) instead of returning an error.
+TEST_CASE("A released plate is re-read from its G-code file only while that file is readable", "[Print][Memory]")
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({ { "layer_height", 0.2 } });
+    Print print;
+    Model model;
+    init_print({ cube(20) }, print, model, config);
+    print.process();
+
+    // What the plate has when its export is over: the file it wrote, and a result that names it as
+    // the file this result describes (GCode::do_export() sets both).
+    ScopedTemporaryFile temp(".gcode");
+    GCodeProcessorResult result;
+    print.export_gcode(temp.string(), &result, nullptr);
+    REQUIRE(result.preview_payload_restorable());
+    REQUIRE(print.finished());
+    REQUIRE(print.can_process_previous_gcode_file(&result));
+
+    // The batch moves on and releases this plate's slicing state; the print has no G-code any more.
+    config = print.full_print_config();
+    REQUIRE(print.release_slicing_state());
+    CHECK_FALSE(print.finished());
+    CHECK_FALSE(print.can_process_previous_gcode_file(&result));
+
+    // The user selects the plate again: the rebuild is the release coming back, so the export step
+    // is restored and the print reports itself as exported although its objects were just rebuilt.
+    const Print::ApplyStatus status = print.apply(model, config);
+    CHECK((status & PrintBase::APPLY_STATUS_INVALIDATED) == 0);
+    REQUIRE(print.finished());
+    // With the file still on disk, re-reading it is the restore this branch exists for.
+    CHECK(print.can_process_previous_gcode_file(&result));
+
+    // The temp file is gone. finished() still says exported, and that claim is what has to be
+    // checked against the file: the caller must slice again instead of reading what is not there.
+    boost::system::error_code ec;
+    REQUIRE(boost::filesystem::remove(temp.string(), ec));
+    REQUIRE_FALSE(ec);
+    CHECK_FALSE(result.preview_payload_restorable());
+    CHECK_FALSE(print.can_process_previous_gcode_file(&result));
+
+    // And reading it anyway is an error the caller reports, not a process kill: no empty result is
+    // handed back marked as this print's export.
+    CHECK_THROWS_AS(print.export_gcode_from_previous_file(temp.string(), &result, nullptr), Slic3r::RuntimeError);
+}
+
+// The crash site itself. Any caller that hands GCodeReader a file it cannot open - the re-read
+// above, a plate's statistics, the G-code viewer's reload, a project load - gets a failed read,
+// never an invalid-parameter fast-fail from the CRT.
+TEST_CASE("A G-code file that cannot be opened is a read failure, not a process kill", "[GCodeProcessor][Memory]")
+{
+    // A name that is not on disk, under this process's own temp area so it cannot collide with a
+    // real file on the machine.
+    ScopedTemporaryFile probe(".gcode");
+    const std::string missing = probe.string();
+    REQUIRE_FALSE(boost::filesystem::exists(missing));
+
+    GCodeReader reader;
+    std::vector<size_t> line_ends;
+    CHECK_FALSE(reader.parse_file_raw(missing, [](GCodeReader&, const char*, const char*) {}));
+    CHECK_FALSE(reader.parse_file(missing, [](GCodeReader&, const GCodeReader::GCodeLine&) {}, line_ends));
+    CHECK(line_ends.empty());
+
+    // What Print::export_gcode_from_previous_file() and Print::reload_gcode_moves() call. It carries
+    // the failure in its return value only: process_file() seeds the result with a dummy first move
+    // (initialize_result_moves()), so the result of a file that could not be read is one move long,
+    // exactly like the result of a file that could. Callers that need the moves check that value.
+    GCodeProcessor processor;
+    CHECK_FALSE(processor.process_file(missing));
+    CHECK(processor.result().moves.size() == 1);
+    CHECK(processor.result().lines_ends.empty());
+
+    // The same call on a file that is there succeeds and reads its moves: the false above is the
+    // read failing, not the check being vacuous.
+    ScopedTemporaryFile readable(".gcode");
+    {
+        std::ofstream os(readable.string());
+        os << "G1 X10 Y10 Z0.2 F3000\nG1 X20 Y10 E1 F1200\n";
+    }
+    GCodeProcessor processed;
+    processed.apply_config(FullPrintConfig{});
+    CHECK(processed.process_file(readable.string()));
+    CHECK(processed.result().moves.size() > 1);
+}

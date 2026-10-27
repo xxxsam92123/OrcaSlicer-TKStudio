@@ -18367,15 +18367,26 @@ void Plater::load_gcode(const wxString& filename)
     // process gcode
     GCodeProcessor processor;
     processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
+    bool read = false;
     try
     {
         GCodeProcessor::s_IsBBLPrinter = wxGetApp().preset_bundle->is_bbl_vendor();
-        processor.process_file(filename.ToUTF8().data());
+        read = processor.process_file(filename.ToUTF8().data());
     }
     catch (const std::exception& ex)
     {
         unload_file_settings();
         show_error(this, ex.what());
+        return;
+    }
+    if (! read)
+    {
+        // process_file() reports a file it could not open or read as false instead of throwing. Its
+        // result then holds nothing but the dummy first move, which is not this file's preview:
+        // taking it would present an empty plate as the G-code that was just loaded, and mark the
+        // result as one this file exported.
+        unload_file_settings();
+        show_error(this, Slic3r::format(_u8L("Failed to process the G-code file %1%."), filename.ToUTF8().data()), false);
         return;
     }
     *current_result = std::move(processor.extract_result());

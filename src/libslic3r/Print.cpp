@@ -27,6 +27,7 @@
 #include "TriangleSelector.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
 #include <exception>
+#include <stdexcept>
 #include <ostream>
 #include "ExPolygon.hpp"
 #include "Layer.hpp"
@@ -5897,6 +5898,12 @@ void Print::set_gcode_file_invalidated()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ <<  boost::format(": done");
 }
 
+// Whether the G-code file `result` names may be re-read instead of slicing. See the declaration.
+bool Print::can_process_previous_gcode_file(const GCodeProcessorResult* result) const
+{
+    return this->finished() && result != nullptr && result->preview_payload_restorable();
+}
+
 //BBS: add gcode file preload logic
 void Print::export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
@@ -5922,7 +5929,14 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
             processor.initialize_from_context(result->nozzle_group_result);
         processor.configure_exclusion_volume_path_check(this->config());
         //processor.enable_producers(true);
-        processor.process_file(file);
+        // GCodeProcessor::process_file() reports a file it could not open or read as false, and
+        // leaves the result with nothing but its dummy first move. That is not this print's G-code:
+        // taking it would make the plate present an empty preview as its own finished slice, and the
+        // caller marks the result as restored right after this returns. The move list cannot tell -
+        // the dummy move keeps it one move long either way - so ask the parse itself. Throw instead:
+        // the catch below turns it into the error the caller reports.
+        if (! processor.process_file(file))
+            throw std::runtime_error("the G-code file could not be read");
 
         // filament seq is loaded from file, processor result will override the value
         auto filament_seq_loaded = result->filament_change_sequence;
@@ -5973,7 +5987,11 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
     if (result->nozzle_group_result)
         processor.initialize_from_context(result->nozzle_group_result);
     try {
-        processor.process_file(result->filename);
+        // process_file() reports a file it could not open or read as false instead of throwing, and
+        // leaves the result with its dummy first move only. Treat that like the parse failure it is,
+        // so the handler below runs for both: a dummy move is not this plate's payload.
+        if (! processor.process_file(result->filename))
+            throw std::runtime_error("the G-code file could not be read");
     } catch (const std::exception& ex) {
         // The edited file is what gets printed, so failing to preview it must not fail the slice.
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": cannot re-read the G-code file " << result->filename << ": " << ex.what();

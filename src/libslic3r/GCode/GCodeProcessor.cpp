@@ -4003,7 +4003,7 @@ DynamicConfig GCodeProcessor::export_config_for_render() const
 
 // Load a G-code into a stand-alone G-code viewer.
 // throws CanceledException through print->throw_if_canceled() (sent by the caller as callback).
-void GCodeProcessor::process_file(const std::string& filename, std::function<void()> cancel_callback)
+bool GCodeProcessor::process_file(const std::string& filename, std::function<void()> cancel_callback)
 {
     CNumericLocalesSetter locales_setter;
 
@@ -4065,9 +4065,13 @@ void GCodeProcessor::process_file(const std::string& filename, std::function<voi
     m_result.id = ++s_result_id;
     initialize_result_moves();
     size_t parse_line_callback_cntr = 10000;
-    m_parser.parse_file(filename, [this, cancel_callback, &parse_line_callback_cntr](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
+    // GCodeReader reports a file it cannot open, or one whose read fails, as false - and it does so
+    // without calling the callback, so the dummy move seeded above is all this result gets. That
+    // failure is kept and handed back: the move list cannot carry it, because the dummy move makes
+    // every result at least one move long whether the file was readable or not.
+    const bool read_ok = m_parser.parse_file(filename, [this, cancel_callback, &parse_line_callback_cntr](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
         if (-- parse_line_callback_cntr == 0) {
-            // Don't call the cancel_callback() too often, do it every at every 10000'th line.
+            // Don't call the cancel_callback() too often, do it at every 10000'th line.
             parse_line_callback_cntr = 10000;
             if (cancel_callback)
                 cancel_callback();
@@ -4075,8 +4079,14 @@ void GCodeProcessor::process_file(const std::string& filename, std::function<voi
         this->process_gcode_line(line, true);
     }, m_result.lines_ends);
 
+    // Nothing was read, so there is nothing to finalize either: no times to sum and no statistics
+    // to document. The steps below would only put a slice's numbers on a file that has no slice.
+    if (! read_ok)
+        return false;
+
     // Don't post-process the G-code to update time stamps.
     this->finalize(false);
+    return true;
 }
 
 void GCodeProcessor::initialize(const std::string& filename)

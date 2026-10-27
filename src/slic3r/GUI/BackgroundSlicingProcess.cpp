@@ -224,7 +224,14 @@ void BackgroundSlicingProcess::process_fff()
     PresetBundle& preset_bundle   = *GUI::wxGetApp().preset_bundle;
     m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
     // BBS: add the logic to process from an existed gcode file
-    if (m_print->finished()) {
+    // The export step being done is not enough: for a plate whose slicing state was released, apply()
+    // restores that step as "the rebuild was the release coming back" (PrintApply.cpp), which is only
+    // true while the plate's G-code file is still there to be read. When it is not - the file is a
+    // temp file, and a temp cleanup, an unmounted volume or another instance's cleanup can take it
+    // away between the release and this click - re-reading it is not a restore, and the plate has to
+    // be sliced for real instead. Ask both halves here (Print::can_process_previous_gcode_file) so
+    // that no path below can reach the re-read with nothing to read.
+    if (m_fff_print->can_process_previous_gcode_file(m_gcode_result)) {
         m_stage = "export_from_previous_file";
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file") % __LINE__;
         m_fff_print->set_status(80, _utf8(L("Processing G-code from previous file\u2026" /* \u2026 -> ... */)));
@@ -255,6 +262,18 @@ void BackgroundSlicingProcess::process_fff()
                                            m_temp_output_path;
         }
     } else {
+        if (m_print->finished()) {
+            // The export step was done, but the file it claims is not readable, so this round is not
+            // a re-read of anything. The step is not invalidated here: the print's cancel callback is
+            // what PrintBase::invalidate_step() fires, and on this thread that callback is
+            // BackgroundSlicingProcess::stop_internal() - the worker cannot cancel itself. What keeps
+            // the stale claim harmless is the result below: reset() drops the moves and the
+            // export-completed mark, so nothing downstream can take this result for a restorable
+            // export until the new export_gcode() marks it done again.
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+                                    << boost::format(" %1%: the previous gcode file of this plate is not readable (result %2%, file %3%), slicing again") % __LINE__
+                                           % m_gcode_result % (m_gcode_result != nullptr ? m_gcode_result->filename : std::string());
+        }
         // BBS: reset the gcode before reload_print in slicing_completed event processing
         // FIX the gcode rename failed issue
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__

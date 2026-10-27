@@ -1332,6 +1332,15 @@ public:
     void set_gcode_file_ready();
     void set_gcode_file_invalidated();
     void export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // Whether `result`'s G-code file may be re-read instead of slicing: this print's export step is
+    // done, and the file that result names is still the one this plate exported and still readable
+    // (GCodeProcessorResult::preview_payload_restorable()). The two halves have to be asked
+    // together, because only the pair means "the file holds this print's G-code": the export step
+    // alone is what apply() restores for a released print whose objects it just rebuilt
+    // (PrintApply.cpp), and that claim outlives the file it rests on - a released plate's file is a
+    // temp file, and a temp cleanup, an unmounted drive or another instance's cleanup can take it
+    // away between the release and the plate being selected again.
+    bool can_process_previous_gcode_file(const GCodeProcessorResult* result) const;
     // Re-reads the moves and line offsets of `result` from its G-code file after the file was rewritten in
     // place (post-processing scripts or plugins), so the preview and its G-code window follow the file on
     // disk. Everything else in `result` was computed while slicing and is kept. If the file cannot be
