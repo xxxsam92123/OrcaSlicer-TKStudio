@@ -3640,9 +3640,11 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 #else
         std::vector<Polygons>        overhangs = generate_overhangs(config, *print.get_object(processing.second.front()), throw_on_cancel);
 #endif
-        // Map every overhang to the support layer carrying its top contact, lowering that layer so the
-        // support ends exactly support_top_z_distance below the overhang. `config` refers to the copy
-        // owned by grouped_meshes, so the lowered Zs are visible to every later stage.
+        // Map every overhang to the support layer that carries its top contact, ending exactly
+        // support_top_z_distance below the overhang. The layer keeps the object's Z and height and only
+        // its material stops at the contact Z, so the printed layer heights stay the profile's.
+        // `config` refers to the copy owned by grouped_meshes, so the recorded contacts are visible to
+        // every later stage.
         std::vector<LayerIndex> overhang_top_layer(overhangs.size(), -1);
         {
             TreeSupportLayerGrid &grid   = processing.first.layer_grid;
