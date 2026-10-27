@@ -42,26 +42,22 @@ namespace TreeSupport3D
 {
 using LayerIndex = int;
 
-// A support layer thinner than this is never emitted: the contact layer falls back to the layer
-// below instead, which only makes the gap larger than requested (the safe direction). Mirrors the
-// slicer's own floor for object layers (MIN_LAYER_HEIGHT in Slicing.cpp).
-static constexpr double MIN_SUPPORT_LAYER_HEIGHT = 0.01;
-
 /*!
  * \brief Z of every support layer, one entry per layer index.
  *
  * The organic generator used to derive every layer Z from a single layer height
  * (SlicingParameters::layer_height), which is only correct while the object is sliced with a
  * uniform layer height and the top / bottom gap is a multiple of it. Both assumptions break with
- * custom (variable) layer heights and with a gap the user did not round to the layer height. The
- * real object layers are the authority here, and one support layer per object layer keeps the layer
+ * custom (variable) layer heights and with a gap the user did not round to the layer height.
+ * The real object layers are the authority here, and one support layer per object layer keeps the layer
  * index space (and with it TreeModelVolumes' outline lookup at index num_raft_layers + object layer)
  * exactly as it was.
  *
- * A layer may additionally have its support material end below its top: the top contact layer of an
- * overhang stops exactly `support_top_z_distance` below the overhang, so the amount of material of
- * that layer is smaller than its height while the layer itself still prints at the object's Z and
- * height. The layer Zs and heights therefore stay exactly the object's.
+ * Every entry is a plain copy of an object layer: its Z and its height are never rewritten here. The
+ * top contact of an overhang is *placed* on one of these layers, it does not bend the stack to its own
+ * Z - so `SupportGeneratorLayer::height`, `SupportLayer::height` and the printed layer height stay the
+ * object's, and `support_top_z_distance` is honoured as a lower bound on the air gap rather than as a
+ * layer height. See place_top_contact() for why the gap can come out wider.
  */
 struct TreeSupportLayerGrid
 {
@@ -84,16 +80,11 @@ struct TreeSupportLayerGrid
         // an overhang; collision clearances are measured against that rather than against the layer
         // bottom.
         double     obj_bottom_z { 0. };
-        // print_z - bottom_z, the object layer's height.
+        // print_z - bottom_z, the object layer's height. Support layers print this height; the top
+        // contact of an overhang never writes a gap remainder into it.
         double     height   { 0. };
         // Object layer this support layer belongs to, -1 for the raft layers below the object.
         LayerIndex obj_layer_idx { -1 };
-        // Z where this layer's support material ends when the layer carries an exact top contact, and
-        // whether that override is set. The printed layer keeps its own Z and height; only the amount
-        // of material stops short of the layer top, which is what leaves the requested air gap under
-        // an overhang. A layer without an override prints up to its own top.
-        double     contact_top_z { 0. };
-        bool       has_contact_top { false };
     };
 
     std::vector<Entry> entries;
@@ -239,61 +230,32 @@ struct TreeSupportLayerGrid
         return std::max<LayerIndex>(0, LayerIndex(it - entries.begin()) - 1);
     }
 
-    // Z where this layer's support material ends: its top, or the recorded contact Z of a layer that
-    // carries an exact top contact.
-    double contact_top_z(LayerIndex layer_idx) const
-    {
-        if (layer_idx < 0 || layer_idx >= LayerIndex(entries.size()))
-            return z(layer_idx);
-        const Entry &entry = entries[layer_idx];
-        return entry.has_contact_top ? entry.contact_top_z : entry.print_z;
-    }
-
-    // Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`,
-    // placed so the support ends exactly `top_z_distance` below it.
+    // Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`.
     //
-    // The contact is *not* placed by moving the layer: the layer stack is the object's, and lowering a
-    // layer's top rewrote the printed Z and height of the layer itself and of its neighbour, which the
-    // G-code then reported as layer heights nobody configured (0.14 / 0.23 for a 0.2 mm profile), and
-    // which squeezed an object layer's 0.2 mm of material into the leftover space of a 0.1 mm step.
-    // Instead the layer keeps its Z and height and only records where its material has to stop, so the
-    // printed layer height is the profile's and the gap is exact (see contact_top_z() and
-    // layer_initialize()).
+    // `support_top_z_distance` is a distance in millimetres, but a support layer cannot end between two
+    // object layers without either moving the layer to the gap Z (which rewrote the printed Z of the
+    // support stack and of the object layer above it, and put 0.1 / 0.14 / 0.23 into the layer height
+    // legend) or handing the gap remainder to the layer as its height (which reached Flow and printed a
+    // full layer's worth of material into the remainder). Neither is acceptable, and a 2D polygon per
+    // layer cannot express "this layer's material stops half way up" either: the nozzle prints a layer
+    // at its print_z, so the material's top is the layer top. The safe semantics is therefore the one
+    // the layer synchronised generators already use (SupportMaterial.cpp, sync_gap_with_object_layer()):
+    // the contact takes the *highest layer whose top is at or below* `overhang_bottom_z -
+    // top_z_distance`. The air gap is then at least the requested distance and less than the requested
+    // distance plus one layer height - it is quantised upwards, never downwards, so the support can
+    // never fuse to the object, and every layer keeps the object's own Z and height.
     //
     // Layer 0 is the build plate face and has no support below it, and a raft layer has no object above
-    // it to gain distance from, so the contact never lands in either of them. Returns -1 when no layer
-    // is left to carry it.
+    // it to gain distance from, so the contact never lands in either of them; a contact that would have
+    // to be drawn there is refused instead of being pulled up (which would shrink the gap). Returns -1
+    // when no layer is left to carry it.
     LayerIndex place_top_contact(const double overhang_bottom_z, const double top_z_distance)
     {
         const LayerIndex lowest = std::max<LayerIndex>(1, LayerIndex(raft_layers));
         if (entries.size() < size_t(lowest) + 1)
             return -1;
-        const double     z_gap     = overhang_bottom_z - top_z_distance;
-        const LayerIndex layer_idx = std::clamp(idx_ceil(z_gap), lowest, LayerIndex(entries.size()) - 1);
-        // A layer whose own slice already contains the overhang face is the object layer above the gap,
-        // not a layer the support can reach into: its outline covers the whole overhang area, so no
-        // contact tip fits there. Such a layer cannot carry the contact - moving it would be exactly the
-        // rewrite this keeps out - so the contact goes to the layer below, which widens the gap by less
-        // than one layer height (the safe direction).
-        if (overhang_bottom_z < entries[layer_idx].print_z - EPSILON &&
-            overhang_bottom_z > entries[layer_idx].bottom_z + EPSILON)
-            return layer_idx > LayerIndex(raft_layers) ? layer_idx - 1 : -1;
-        // The contact ends inside this layer, so the layer's material stops `z_gap - bottom_z` short of
-        // its top. Too little material to print means the contact belongs to the layer below instead,
-        // which only widens the gap - never closes it.
-        if (z_gap - entries[layer_idx].bottom_z < MIN_SUPPORT_LAYER_HEIGHT)
-            return layer_idx > LayerIndex(raft_layers) ? layer_idx - 1 : -1;
-        Entry &entry = entries[layer_idx];
-        // A contact at or above the layer's own top needs no override: the layer already ends there.
-        if (z_gap >= entry.print_z - EPSILON)
-            return layer_idx;
-        // Several overhangs can share a layer; the lowest requested contact wins, so no overhang gets
-        // closer to the support than it asked for.
-        if (! entry.has_contact_top || z_gap < entry.contact_top_z) {
-            entry.contact_top_z     = z_gap;
-            entry.has_contact_top   = true;
-        }
-        return layer_idx;
+        const LayerIndex layer_idx = idx_floor(std::max(0., overhang_bottom_z - top_z_distance));
+        return layer_idx >= lowest ? layer_idx : -1;
     }
 };
 
@@ -349,8 +311,9 @@ struct TreeSupportMeshGroupSettings {
         // z_distance_top_layers below, so it must stay rounded to whole layers (review round 1, issue 2).
         this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
         this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
-        // Raw millimetres for the organic generator, which places its contact layers exactly this far
-        // below the overhang instead of a whole number of layers. Only the organic paths read these.
+        // Raw millimetres for the organic generator: it measures the air gap under an overhang from the
+        // overhang face itself instead of from a layer boundary, and takes the highest layer inside that
+        // gap (see TreeSupportLayerGrid::place_top_contact()). Only the organic paths read these.
         this->support_top_z_distance_mm    = config.support_top_z_distance.value;
         this->support_bottom_z_distance_mm = config.support_bottom_z_distance.value;
         this->support_roof_enable       = config.support_interface_top_layers.value > 0;
@@ -1137,13 +1100,11 @@ inline SupportGeneratorLayer& layer_initialize(
     // own print_z, which reached Flow::with_height() and threw FlowErrorNegativeFlow, so tree support
     // could not slice any belt model whose branches reached down that far.
     layer_new.bottom_z = config.layer_grid.bottom_z(LayerIndex(layer_idx));
-    // The printed Z and the layer height come from the object's layer stack and are never rewritten.
-    // The amount of material is what carries an exact top contact: on such a layer it stops at the
-    // contact Z instead of reaching the layer top, so the gap under the overhang is exactly
-    // `support_top_z_distance` while the layer still prints at the profile's Z and height.
-    const double top_z = config.layer_grid.empty() ? layer_new.print_z :
-        config.layer_grid.contact_top_z(LayerIndex(layer_idx));
-    layer_new.height = top_z - layer_new.bottom_z;
+    // The layer height is the object layer's own: the grid is the object's layer stack and no gap logic
+    // writes into it. `support_top_z_distance` moves the top *contact area* down onto an earlier layer
+    // (TreeSupportLayerGrid::place_top_contact()), it never becomes a layer height - a height fed from
+    // the gap remainder reaches Flow::with_height() and prints a whole layer's material into it.
+    layer_new.height = layer_new.print_z - layer_new.bottom_z;
     return layer_new;
 }
 
