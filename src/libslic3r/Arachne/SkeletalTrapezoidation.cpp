@@ -1810,10 +1810,11 @@ void SkeletalTrapezoidation::generateJunctions(ptr_vector_t<BeadingPropagation>&
                 break;
             }
             Point junction(a + (ab.cast<int64_t>() * int64_t(bead_R - start_R) / int64_t(end_R - start_R)).cast<coord_t>());
+            // `supported_area` is the lower layer flattened to a ring set, so a junction over one of its
+            // voids is inside the outer contour alone. Only the even-odd rule over the whole set tells a
+            // void from material; a ring-at-a-time test would call the void supported.
             if (supported_area != nullptr && overhang_spacing_reduction > 0 && junction_idx > 0 &&
-                !std::any_of(supported_area->begin(), supported_area->end(), [&junction](const Polygon &polygon) {
-                    return polygon.contains(junction);
-                })) {
+                !Slic3r::contains(*supported_area, junction, true)) {
                 bead_R = std::max(end_R, bead_R - coord_t(junction_idx) * overhang_spacing_reduction);
                 junction = a + (ab.cast<int64_t>() * int64_t(bead_R - start_R) / int64_t(end_R - start_R)).cast<coord_t>();
             }

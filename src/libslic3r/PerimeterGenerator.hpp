@@ -27,6 +27,11 @@ namespace Slic3r {
 coord_t overhang_wall_spacing(coord_t nominal_spacing, coord_t overhang_width,
                               coord_t layer_height, double overlap_percent);
 
+// True when the grown lower layer supports this point. That layer reaches the generator as a flat ring
+// set, so a void in it is only distinguishable by parity over the whole set: a ring-at-a-time test reads
+// a point over a void as material.
+bool point_is_supported(const Polygons &supported_area, const Point &point);
+
 struct FuzzySkinConfig
 {
     FuzzySkinType type;

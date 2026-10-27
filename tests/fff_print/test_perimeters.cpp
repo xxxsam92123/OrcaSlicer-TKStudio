@@ -1083,6 +1083,30 @@ TEST_CASE("Overhang wall overlap changes mixed-surface wall geometry", "[Overhan
 
 }
 
+TEST_CASE("A flattened lower layer keeps its voids out of the supported area", "[OverhangWallOverlap]")
+{
+    // overhang_wall_overlap asks, per wall sample, whether the layer below supports it, and it reads that
+    // layer flattened to a ring set. A void survives the flattening only as the parity of the outer contour
+    // and the hole ring, so a ring-at-a-time answer reports the void as material.
+    const coord_t mm = scaled<coord_t>(1.);
+    ExPolygon     plate;
+    plate.contour = Polygon({ Point(0, 0), Point(20 * mm, 0), Point(20 * mm, 20 * mm), Point(0, 20 * mm) });
+    plate.holes.emplace_back(
+        Polygon({ Point(5 * mm, 5 * mm), Point(15 * mm, 5 * mm), Point(15 * mm, 15 * mm), Point(5 * mm, 15 * mm) }));
+
+    // The generator grows the lower layer by half a nozzle before testing against it.
+    const Polygons flattened = offset(ExPolygons{ plate }, float(scale_(0.2)));
+    const Point    void_point(10 * mm, 10 * mm);
+    const Point    rim_point(1 * mm, 10 * mm);
+
+    REQUIRE(flattened.size() == 2);
+    CHECK(Slic3r::contains(flattened, void_point, true) == false);
+    CHECK(Slic3r::contains(flattened, rim_point, true) == true);
+    // ... which is exactly what the per-ring test the classic generator used to run gets wrong.
+    CHECK(std::any_of(flattened.begin(), flattened.end(),
+                      [&void_point](const Polygon &ring) { return ring.contains(void_point); }));
+}
+
 TEST_CASE("External bridge overlap changes only the bridge-to-overhang-wall seam", "[ExternalBridgeOverlap][Regression]")
 {
     struct Measurement {
