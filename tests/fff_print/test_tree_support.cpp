@@ -665,8 +665,8 @@ TEST_CASE("Organic support accepts a variable layer height profile", "[TreeSuppo
 // The Cura derived engines (tree_slim / strong / hybrid) derive their clearance layer counts from
 // settings.support_top_distance, which SlicingParameters rounds to whole layers unless support layers
 // are independent of the object's. The organic generator needs the raw millimetres. Both have to be
-// carried side by side: feeding the raw value to the quantised member shifted a tree_slim contact
-// layer by one layer in that configuration (review round 1, issue 2).
+// carried side by side: feeding the raw value to the quantised member shifts a tree_slim contact
+// layer by one layer in that configuration.
 TEST_CASE("The clearance is quantised for the layer synchronised engines and raw for the organic grid", "[TreeSupportOrganicGap]")
 {
     using namespace Slic3r::TreeSupport3D;
@@ -908,7 +908,7 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
 
         // A branch the generator had to drop is reported on stdout and leaves the geometry it returns
         // unchanged, so the assertions below would stay green while branches are missing. On a variable
-        // layer height the generator must not have to drop one (review round 3, issue 3).
+        // layer height the generator must not have to drop one.
         //
         // Every support diagnostic goes through tree_supports_show_error(), which prints
         // "Error: <message>, critical: <0|1>" - the same stream this capture reads. Counting the records
@@ -1027,7 +1027,7 @@ TEST_CASE("A tree_slim print keeps its own support layer heights", "[TreeSupport
 // layer 16.0 .. 16.4 sees the plate, and its face sits inside 15.6 .. 16.0. The face search therefore has
 // to reach into that layer; a window narrowed to the area's own slab finds nothing and falls back to the
 // layer bottom, which is not the face. A face further down belongs to a different overhang and must not
-// be taken (review round 3, issue 2).
+// be taken.
 TEST_CASE("The overhang face is searched in the slab of the layer below the area's layer", "[TreeSupportOrganicGap]")
 {
     using namespace Slic3r::TreeSupport3D;
@@ -1061,7 +1061,7 @@ TEST_CASE("The overhang face is searched in the slab of the layer below the area
                                    Point::new_scale(10., 10.), Point::new_scale(0., 10.) } } };
 
     // The contact of the area is placed from the face inside the layer below, not from the layer bottom.
-    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0., 0.2);
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0.2);
     REQUIRE(contact.face_z.has_value());
     // The mesh is a float mesh, so the face carries its vertex precision.
     CHECK_THAT(*contact.face_z, Catch::Matchers::WithinAbs(15.9, 1e-4));
@@ -1114,7 +1114,7 @@ TEST_CASE("A sloped overhang face below the search window still keeps the reques
 
     const std::vector<TreeSupportLayerGrid::Entry> before = grid.entries;
     constexpr double                               requested = 0.4;
-    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0., requested);
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, requested);
     REQUIRE(contact.contact_layer >= 1);
 
     // The contact is one of the grid's own layers, printed at that layer's height: no remainder of the
@@ -1298,7 +1298,7 @@ TEST_CASE("A higher face of the same overhang area does not lift the contact abo
 
     const std::vector<TreeSupportLayerGrid::Entry> before = grid.entries;
     constexpr double                               requested = 0.4;
-    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0., requested);
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, requested);
     REQUIRE(contact.face_z.has_value());
     INFO("reference " << *contact.face_z << " slope face over the area " << slope_face_over_area
                       << " contact " << grid.z(contact.contact_layer));
@@ -1426,6 +1426,228 @@ TEST_CASE("A shallow slope sharing its overhang area with a shelf keeps the requ
     CHECK(*lowest_face < 3.35 - 1e-6);
 }
 
+// A belt print slices its mesh in the frame `trafo_sliced()` describes - belt rotation and min-Z lift
+// included - and adds `belt_global_z_offset()` to `Layer::print_z` only afterwards (PrintObject::slice()).
+// The organic layer grid is built from those layers with that offset removed (TreeSupportMeshGroupSettings
+// ::build_layer_grid()), so the transformed mesh and the grid are in one and the same frame and the
+// overhang search must not convert between them. This runs the whole pipeline on a belt printer, where the
+// offset is not zero, and measures the gap under every point of the contact against the mesh.
+TEST_CASE("A belt print keeps the organic top gap it asked for", "[TreeSupportOrganicGap][belt]")
+{
+    const TriangleMesh mesh = two_tier_mesh();
+    constexpr double  gap   = 0.25;
+
+    auto slice_belt = [&mesh](Slic3r::Print &print, const bool with_support) {
+        Slic3r::Model        model;
+        Slic3r::ModelObject *object = model.add_object();
+        object->name = "two_tier.stl";
+        object->add_volume(mesh);
+        object->add_instance();
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            { "belt_printer",                 1 },
+            { "belt_slice_rotation",          "x" },
+            { "belt_slice_rotation_angle",    45 },
+            { "gcode_remap_x",                "rev_x" },
+            { "gcode_remap_y",                "pos_z" },
+            { "gcode_remap_z",                "pos_y" },
+            { "enable_support",               with_support ? 1 : 0 },
+            { "support_type",                 "tree(auto)" },
+            { "support_style",                "organic" },
+            { "support_threshold_angle",      30 },
+            { "support_top_z_distance",       gap },
+            { "support_interface_top_layers", 2 },
+            { "layer_height",                 0.2 },
+            { "initial_layer_print_height",   0.2 },
+            { "skirt_loops",                  0 },
+            { "z_hop",                        0 },
+            { "machine_start_gcode",          "T[initial_tool]\n" },
+            { "before_layer_change_gcode",    "G92 E0" },
+        });
+        print.apply(model, config);
+        const std::string validation = print.validate().string;
+        INFO("validate: " << validation);
+        REQUIRE(validation.empty());
+        ScopedStdoutCapture capture;
+        print.process();
+        return capture.finish();
+    };
+
+    Slic3r::Print     supported;
+    Slic3r::Print     unsupported;
+    const std::string diagnostics = slice_belt(supported, true);
+    slice_belt(unsupported, false);
+    CHECK(diagnostic_count(diagnostics) == 0);
+    CHECK(critical_diagnostic_count(diagnostics) == 0);
+
+    const PrintObject &po       = *supported.objects().front();
+    const PrintObject &po_plain = *unsupported.objects().front();
+    // The offset this regression is about: it must be there, and the frame the organic generator works in
+    // must not carry it a second time.
+    const double z_offset = po.belt_global_z_offset();
+    INFO("belt global z offset " << z_offset);
+    REQUIRE(std::abs(z_offset) > 0.1);
+
+    // The object's layer stack is the slicing result, whatever the gap asks for.
+    REQUIRE(po.layer_count() == po_plain.layer_count());
+    for (size_t i = 0; i < po.layer_count(); ++ i) {
+        const Layer &layer = *po.get_layer(i);
+        const Layer &plain = *po_plain.get_layer(i);
+        INFO("object layer " << i << " z " << layer.print_z << " h " << layer.height
+                             << " slice_z " << layer.slice_z);
+        CHECK_THAT(layer.print_z, Catch::Matchers::WithinAbs(plain.print_z, 1e-12));
+        CHECK_THAT(layer.height, Catch::Matchers::WithinAbs(plain.height, 1e-12));
+        CHECK_THAT(layer.slice_z, Catch::Matchers::WithinAbs(plain.slice_z, 1e-12));
+    }
+
+    // Every support layer sits on an object layer Z and prints that layer's height, and so does every
+    // extrusion path of it: no gap remainder became a layer height. This belt configuration emits base
+    // support paths only (no roof / interface layer is produced for it), so the path check covers
+    // erSupportMaterial here; the interface path heights are asserted by the non-belt cases above.
+    REQUIRE(! po.support_layers().empty());
+    const std::multiset<double> profile_heights = object_layer_heights(po);
+    size_t                      base_paths      = 0;
+    for (const SupportLayer *layer : po.support_layers()) {
+        const auto it = std::find_if(po.layers().begin(), po.layers().end(),
+            [&layer](const Layer *object_layer) { return std::abs(object_layer->print_z - layer->print_z) < 1e-9; });
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
+        CHECK(it != po.layers().end());
+        if (it == po.layers().end())
+            continue;
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
+        for (const SupportPathRole &path : support_path_roles(*layer)) {
+            INFO("support path role " << int(path.role) << " height " << path.height);
+            CHECK(profile_heights.find(path.height) != profile_heights.end());
+            ++base_paths;
+        }
+    }
+    REQUIRE(base_paths > 0);
+
+    // The top contact: the highest support layer that carries fill.
+    const SupportLayer *contact = nullptr;
+    for (const SupportLayer *layer : po.support_layers()) {
+        Points points;
+        layer->support_fills.collect_points(points);
+        if (! points.empty() && (contact == nullptr || layer->print_z > contact->print_z))
+            contact = layer;
+    }
+    REQUIRE(contact != nullptr);
+    INFO("contact print_z " << contact->print_z << " height " << contact->height);
+
+    // The mesh in the frame it was sliced in. Applying `trafo_sliced()` puts the vertices in the frame of
+    // `Layer::lslices`, and that frame carries the belt rotation but not the global offset the layers got
+    // afterwards, so a support point's XY is a point of this mesh and the contact's local Z is its
+    // print_z minus the offset.
+    TriangleMesh sliced_mesh = mesh;
+    sliced_mesh.transform(po.trafo_sliced());
+    const double contact_local_z = contact->print_z - z_offset;
+    INFO("contact local z " << contact_local_z);
+
+    Points points;
+    contact->support_fills.collect_points(points);
+    REQUIRE(! points.empty());
+    size_t                checked = 0;
+    std::optional<double> lowest_face;
+    for (const Point &p : points) {
+        const double                x    = unscaled(p.x());
+        const double                y    = unscaled(p.y());
+        const std::optional<double> face = face_above(sliced_mesh, x, y, contact_local_z + 1e-6);
+        if (! face)
+            continue;
+        ++ checked;
+        if (! lowest_face || *face < *lowest_face)
+            lowest_face = *face;
+        INFO("support point " << x << ", " << y << " at " << contact_local_z << " under " << *face
+                              << " gap " << *face - contact_local_z);
+        CHECK(*face - contact_local_z >= gap - 1e-9);
+    }
+    // The mapping has to have found the mesh under the contact, or the assertion above says nothing.
+    REQUIRE(checked > 10);
+    REQUIRE(lowest_face.has_value());
+    // The contact sits on a whole layer of the object, not on a Z of its own...
+    const auto contact_layer = std::find_if(po.layers().begin(), po.layers().end(),
+        [contact](const Layer *object_layer) { return std::abs(object_layer->print_z - contact->print_z) < 1e-9; });
+    REQUIRE(contact_layer != po.layers().end());
+    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs((*contact_layer)->height, 1e-12));
+    // ... and, measured against the lowest face above it, the gap is quantised upwards only: at least the
+    // requested distance, and not more than one layer plus the slope the face gains over one layer's worth
+    // of area (the belt rotation tilts every face, so a strip of one layer is not at a single Z).
+    INFO("lowest face above the contact " << *lowest_face << " gap " << *lowest_face - contact_local_z);
+    CHECK(*lowest_face - contact_local_z > gap - 0.2 - 0.5 - 1e-9);
+    CHECK(*lowest_face - contact_local_z < gap + 0.2 + 0.5 + 1e-9);
+
+    // The G-code is produced and carries the support: the print is not empty and its output is not
+    // dropped. Its layer-height legend is not compared on a belt - the belt axis is machine Z, so the
+    // legend carries machine-frame entries that are not layer heights - the heights are asserted above,
+    // on the object layers and on every support path.
+    const std::string gcode = Slic3r::Test::gcode(supported);
+    REQUIRE(! gcode.empty());
+    CHECK(gcode.find("; support") != std::string::npos);
+    CHECK(! Slic3r::Test::gcode(unsupported).empty());
+}
+
+// The grid and the mesh the organic generator searches are in one frame: the grid stores each object
+// layer's Z with `belt_global_z_offset()` removed (TreeSupportMeshGroupSettings::build_layer_grid()), and
+// `trafo_sliced()` - the frame the layers were sliced in - does not carry that offset either, it is added
+// to `Layer::print_z` only after slicing. This case is the one a frame slip breaks first: the face sits
+// exactly on the window bottom, as a uniform grid puts it, so a search window or a reference moved by the
+// belt offset (negative on a lifted belt mesh) lifts the contact onto the layer above the face, i.e. into
+// the object. The grid here is built the way the object layers are, so a reference that leaves the
+// window shows up as a contact above the face.
+TEST_CASE("A belt Z offset does not shift the overhang search frame", "[TreeSupportOrganicGap][belt]")
+{
+    using namespace Slic3r::TreeSupport3D;
+
+    // One down facing face at 15.6, over the area the layer's overhang covers.
+    const TriangleMesh mesh(std::vector<Vec3f>{ { 0.f, 0.f, 15.6f }, { 0.f, 2.f, 15.6f }, { 2.f, 2.f, 15.6f },
+                                                { 0.f, 0.f, 15.6f }, { 2.f, 2.f, 15.6f }, { 2.f, 0.f, 15.6f } },
+                            std::vector<Vec3i32>{ { 0, 1, 2 }, { 3, 4, 5 } });
+
+    // 0.4 mm layers: layer 40 tops out at 16.4 and starts at 16.0, so the face at 15.6 sits on the bottom
+    // of the window [15.6, 16.4] the layer searches.
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (int i = 0; i < 50; ++ i) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z      = bottom;
+        entry.obj_bottom_z  = bottom;
+        entry.print_z       = bottom + 0.4;
+        entry.height        = 0.4;
+        entry.obj_layer_idx = LayerIndex(i);
+        bottom              = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+    REQUIRE_THAT(grid.bottom_z(39), Catch::Matchers::WithinAbs(15.6, 1e-9));
+
+    OverhangFacetZIndex facets;
+    facets.build(mesh);
+    const Polygons area{ Polygon{ { Point::new_scale(0., 0.), Point::new_scale(2., 0.),
+                                   Point::new_scale(2., 2.), Point::new_scale(0., 2.) } } };
+
+    const std::vector<TreeSupportLayerGrid::Entry> before = grid.entries;
+    constexpr double                               requested = 0.1;
+    // No belt offset is handed to the placement: the grid already holds the frame the mesh was sliced in.
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, requested);
+    REQUIRE(contact.face_z.has_value());
+    REQUIRE(contact.contact_layer >= 1);
+    INFO("reference " << *contact.face_z << " contact " << grid.z(contact.contact_layer));
+    // The reference is the face itself, not the face moved by an offset.
+    CHECK_THAT(*contact.face_z, Catch::Matchers::WithinAbs(15.6, 1e-6));
+    // The contact stays under the face with the requested air: 15.6 - 0.1 asks for a top at or below
+    // 15.5, which is layer 38 at 15.2. A reference moved up by a belt offset of -0.5 could ask for 16.0
+    // and put the contact 0.4 above the face, inside the object.
+    CHECK_THAT(grid.z(contact.contact_layer), Catch::Matchers::WithinAbs(15.2, 1e-6));
+    CHECK(15.6 - grid.z(contact.contact_layer) >= requested - 1e-9);
+    // No layer height or object Z was rewritten to absorb anything.
+    REQUIRE(grid.entries.size() == before.size());
+    for (size_t i = 0; i < before.size(); ++ i) {
+        INFO("grid layer " << i);
+        CHECK_THAT(grid.entries[i].print_z, Catch::Matchers::WithinAbs(before[i].print_z, 1e-12));
+        CHECK_THAT(grid.entries[i].bottom_z, Catch::Matchers::WithinAbs(before[i].bottom_z, 1e-12));
+        CHECK_THAT(grid.entries[i].height, Catch::Matchers::WithinAbs(before[i].height, 1e-12));
+    }
+}
+
 // An overhang area with no down facing facet behind it - a support enforcer adds areas that no mesh face
 // backs - has no face to measure from. The fallback is the bottom of the window that was searched, which
 // keeps the gap a lower bound, and it must not move the layer's material start.
@@ -1456,7 +1678,7 @@ TEST_CASE("An overhang area with no face behind it falls back to the searched wi
                                    Point::new_scale(2., 2.), Point::new_scale(0., 2.) } } };
 
     constexpr double     requested = 0.4;
-    const OverhangContact contact  = place_overhang_contact(grid, 40, mesh, facets, area, 0., requested);
+    const OverhangContact contact  = place_overhang_contact(grid, 40, mesh, facets, area, requested);
     CHECK_FALSE(contact.face_z.has_value());
     // 15.6 - 0.4 asks for a top at or below 15.2, which is layer 37.
     CHECK(contact.contact_layer == 37);
