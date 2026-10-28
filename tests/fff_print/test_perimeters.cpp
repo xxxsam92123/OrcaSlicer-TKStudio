@@ -1766,3 +1766,51 @@ TEST_CASE("Changing the brim updates the wall order of the first layer", "[Perim
     REQUIRE(before != fresh);
     CHECK(after == fresh);
 }
+
+// Layers merge the slices of regions whose perimeter settings agree into one make_perimeters() call.
+// A ZAA role speed is per region, so two regions that differ only in one of them must stay apart --
+// otherwise both print at the initiating region's speed and the other region's value is dropped.
+TEST_CASE("Regions differing only in a ZAA role speed are not perimeter compatible", "[Perimeters]")
+{
+    struct RoleSpeed {
+        const char *name;
+        ConfigOptionFloatsNullable PrintRegionConfig::*field;
+    };
+    const RoleSpeed roles[] = {
+        { "zaa_outer_wall_speed",  &PrintRegionConfig::zaa_outer_wall_speed },
+        { "zaa_inner_wall_speed",  &PrintRegionConfig::zaa_inner_wall_speed },
+        { "zaa_top_surface_speed", &PrintRegionConfig::zaa_top_surface_speed },
+        { "zaa_ironing_speed",     &PrintRegionConfig::zaa_ironing_speed },
+    };
+
+    // is_perimeter_compatible() resolves the speed vectors through the print's extruder mapping.
+    Print print;
+    Model model;
+    init_print({ cube(20) }, print, model);
+
+    const auto compatible = [&print](const PrintRegionConfig &a, const PrintRegionConfig &b) {
+        const PrintRegion region_a(a);
+        const PrintRegion region_b(b);
+        return Layer::is_perimeter_compatible(print, region_a, region_b);
+    };
+
+    // Identical region configs are compatible, so a difference below can only come from the role speed.
+    const PrintRegionConfig base = PrintRegionConfig::defaults();
+    REQUIRE(compatible(base, base));
+
+    for (const RoleSpeed &role : roles) {
+        DYNAMIC_SECTION(role.name)
+        {
+            PrintRegionConfig contoured = base;
+            (contoured.*role.field).values = { 11. };
+
+            CHECK_FALSE(compatible(base, contoured));
+            CHECK_FALSE(compatible(contoured, base));
+
+            // The same value on both sides must still merge, or the check above would pass for the
+            // wrong reason.
+            PrintRegionConfig same = contoured;
+            CHECK(compatible(same, contoured));
+        }
+    }
+}

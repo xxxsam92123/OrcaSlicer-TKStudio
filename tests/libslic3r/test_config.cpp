@@ -1906,3 +1906,81 @@ TEST_CASE("Every listed filament override is nullable", "[Config]")
             CHECK(def.nullable);
     }
 }
+
+// The four ZAA role speeds are print-region options. 0 means "print this role at its ordinary
+// speed", which is what a profile written before these options existed has to fall back to, and a
+// value the user set has to survive the config being saved and loaded again.
+TEST_CASE("ZAA role speeds default to zero and survive a config round trip", "[Config][ZAA]")
+{
+    const std::vector<std::string> keys   = { "zaa_outer_wall_speed", "zaa_inner_wall_speed",
+                                              "zaa_top_surface_speed", "zaa_ironing_speed" };
+    const std::vector<double>      speeds = { 11., 12., 13., 14. };
+
+    SECTION("the registered default is 0 for every role")
+    {
+        const DynamicPrintConfig print_defaults  = DynamicPrintConfig::full_print_config();
+        const PrintRegionConfig  region_defaults = PrintRegionConfig::defaults();
+        for (const std::string &key : keys) {
+            INFO(key);
+            const ConfigOptionFloatsNullable *option = print_defaults.option<ConfigOptionFloatsNullable>(key);
+            REQUIRE(option != nullptr);
+            REQUIRE(option->values.size() == 1);
+            CHECK(option->values.front() == 0.);
+            CHECK(region_defaults.opt_serialize(key) == "0");
+        }
+    }
+
+    SECTION("values set on a region survive saving and loading the config")
+    {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        for (size_t i = 0; i < keys.size(); ++ i)
+            config.set_deserialize_strict(keys[i], std::to_string(speeds[i]));
+
+        // The JSON preset path: save_to_json() writes the document a user preset is, load() reads it back.
+        ScopedTemporaryFile json(".json");
+        config.save_to_json(json.string(), "zaa_role_speeds", "User", "1.0.0.0");
+        DynamicPrintConfig from_json = DynamicPrintConfig::full_print_config();
+        CHECK(from_json.load(json.string(), ForwardCompatibilitySubstitutionRule::Disable).empty());
+        for (const std::string &key : keys) {
+            INFO(key);
+            REQUIRE(from_json.has(key));
+            CHECK(from_json.opt_serialize(key) == config.opt_serialize(key));
+        }
+
+        // ... and the flat "key = value" text form ConfigBase::save() writes.
+        ScopedTemporaryFile ini(".ini");
+        config.save(ini.string());
+        DynamicPrintConfig from_ini;
+        CHECK(from_ini.load_from_ini(ini.string(), ForwardCompatibilitySubstitutionRule::Disable).empty());
+        for (const std::string &key : keys) {
+            INFO(key);
+            REQUIRE(from_ini.has(key));
+            CHECK(from_ini.opt_serialize(key) == config.opt_serialize(key));
+        }
+    }
+
+    SECTION("an older config without the keys keeps the 0 default")
+    {
+        // A profile saved before these options existed is applied on top of the defaults: PresetBundle
+        // seeds the print preset that way and PrintApply applies a region diff the same way.
+        DynamicPrintConfig       full          = DynamicPrintConfig::full_print_config();
+        const ConfigSubstitutions substitutions = full.load_from_ini_string("outer_wall_speed = 42\n", ForwardCompatibilitySubstitutionRule::Disable);
+        CHECK(substitutions.empty());
+        CHECK(full.opt_serialize("outer_wall_speed") == "42");
+        for (const std::string &key : keys) {
+            INFO(key);
+            CHECK(full.opt_serialize(key) == "0");
+        }
+
+        // ... and Print::apply() lands the same keys in a PrintRegionConfig with apply(ignore_nonexistent).
+        DynamicPrintConfig old_region;
+        old_region.load_from_ini_string("outer_wall_speed = 42\n", ForwardCompatibilitySubstitutionRule::Disable);
+        PrintRegionConfig region = PrintRegionConfig::defaults();
+        region.apply(old_region, /*ignore_nonexistent=*/true);
+        CHECK(region.outer_wall_speed.get_at(0) == 42.);
+        for (const std::string &key : keys) {
+            INFO(key);
+            CHECK(region.opt_serialize(key) == "0");
+        }
+    }
+}
