@@ -1655,6 +1655,11 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool, zaa_dont_alternate_fill_direction))
     ((ConfigOptionFloat, zaa_min_z))
     ((ConfigOptionFloat, zaa_minimize_perimeter_height))
+    // Per-role speeds for the Z contoured paths only. 0 keeps the role's normal speed.
+    ((ConfigOptionFloatsNullable, zaa_outer_wall_speed))
+    ((ConfigOptionFloatsNullable, zaa_inner_wall_speed))
+    ((ConfigOptionFloatsNullable, zaa_top_surface_speed))
+    ((ConfigOptionFloatsNullable, zaa_ironing_speed))
     )
 
 PRINT_CONFIG_CLASS_DEFINE(
