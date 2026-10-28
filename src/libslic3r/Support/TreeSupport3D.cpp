@@ -382,13 +382,12 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 // can only widen the gap, never close it.
 //
 // The search runs once per overhang area, so the facet Z ranges are collected once per mesh instead of
-// being recomputed - together with a full walk over the triangles - for every area (review round 4,
-// issue 3). A facet is a candidate as soon as its Z range overlaps the window at all, so a sloped or
-// large triangle whose lowest vertex sits below the window is still found: the part of it inside the
-// window is at or above the window bottom, and that bottom is what it contributes. Indexing the facets
-// by their lowest vertex alone - what this did up to review round 5 - dropped exactly such a facet, and
-// an area that also holds a higher downward facet then measured the gap from the higher one: 0.23 mm of
-// air under the slope where 0.4 was asked for.
+// being recomputed - together with a full walk over the triangles - for every area. A facet is a candidate
+// as soon as its Z range overlaps the window at all, so a sloped or large triangle whose lowest vertex
+// sits below the window is still found: the part of it inside the window is at or above the window bottom,
+// and that bottom is what it contributes. Indexing the facets by their lowest vertex alone would drop
+// exactly such a facet, and an area that also holds a higher downward facet would then measure the gap
+// from the higher one: 0.23 mm of air under the slope where 0.4 was asked for.
 void OverhangFacetZIndex::build(const TriangleMesh &mesh)
 {
     const indexed_triangle_set &its        = mesh.its;
@@ -422,7 +421,12 @@ void OverhangFacetZIndex::build(const TriangleMesh &mesh)
 }
 
 // Facets whose Z range [z_min, z_max] overlaps the closed window [z_lo, z_hi], in mesh order: the tie
-// breaking between facets that sit within EPSILON of each other has to stay the one a full scan used.
+// breaking between facets that sit within `z_roundoff` of each other has to stay the one a full scan used.
+//
+// The window edges carry `TreeSupportLayerGrid::z_roundoff`, not the geometric EPSILON: the window is
+// closed, so a face lying exactly on a layer boundary is a candidate, and the round-off of a sum of layer
+// heights is all that tolerance may cover. A facet within 1e-4 mm of the window would otherwise be
+// treated as if it were inside it.
 //
 // The facets are ordered by z_min, so the window covers a prefix of that order and the walk starts at
 // its end. A subtree whose highest z_max stays below the window holds no candidate and is skipped whole,
@@ -434,7 +438,8 @@ void OverhangFacetZIndex::build(const TriangleMesh &mesh)
     if (facet_z.by_z.empty())
         return facets;
     // Facets that start above the window sit at the end of the sorted order and are cut off here.
-    const auto   last = std::upper_bound(facet_z.by_z.begin(), facet_z.by_z.end(), z_hi + EPSILON,
+    const auto   last = std::upper_bound(facet_z.by_z.begin(), facet_z.by_z.end(),
+                                         z_hi + TreeSupportLayerGrid::z_roundoff,
                                          [&facet_z](double z, size_t facet) { return z < facet_z.z_min[facet]; });
     const size_t num_starting_below = size_t(last - facet_z.by_z.begin());
     if (num_starting_below == 0)
@@ -448,7 +453,8 @@ void OverhangFacetZIndex::build(const TriangleMesh &mesh)
         pending.pop_back();
         // Padding leaves of the tree carry no facet, and a node whose facets all end below the window
         // holds none either.
-        if (current.lo >= num_starting_below || facet_z.node_z_max[current.node] < z_lo - EPSILON)
+        if (current.lo >= num_starting_below ||
+            facet_z.node_z_max[current.node] < z_lo - TreeSupportLayerGrid::z_roundoff)
             continue;
         if (current.hi - current.lo == 1) {
             facets.emplace_back(facet_z.by_z[current.lo]);
@@ -476,7 +482,11 @@ void OverhangFacetZIndex::build(const TriangleMesh &mesh)
         // is the lowest Z it contributes. That is at or below the face it really holds there, so a gap
         // measured from it can come out wider than requested but never narrower.
         const double reference = std::max(facet_z.z_min[facet], z_lo);
-        if (face_z && reference > *face_z - EPSILON)
+        // Strictly lower wins, so the retained Z is the minimum over the candidates and can never sit
+        // above it: a candidate within the geometric EPSILON above the minimum used to be skipped, which
+        // left the reference up to 1e-4 mm - a distance that can cross a layer boundary - too high. Ties
+        // keep the first facet in mesh order, which is the rule the full scan this replaced used.
+        if (face_z && reference >= *face_z)
             continue;
         const stl_triangle_vertex_indices &triangle = its.indices[facet];
         const Vec3f &a = its.vertices[triangle[0]];
@@ -497,26 +507,31 @@ void OverhangFacetZIndex::build(const TriangleMesh &mesh)
 }
 
 OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIndex layer_idx, const TriangleMesh &mesh,
-                                        const OverhangFacetZIndex &facet_z, const Polygons &area, const double z_offset,
+                                        const OverhangFacetZIndex &facet_z, const Polygons &area,
                                         const double top_z_distance)
 {
     // The window is [bottom_z(layer_idx - 1), z(layer_idx)] of the grid, which on a uniform grid is two
     // layer heights tall: a layer's slices are taken at its own mid-plane, so material that first appears
     // in layer `layer_idx` starts below that mid-plane, i.e. inside the layer below or inside this one,
     // and a face exactly on either boundary counts - that is the case a uniform grid hits. A face further
-    // down is a different overhang and would drop the contact by a whole layer for no reason. The window
-    // is passed in the frame the mesh was sliced in, hence the belt Z offset; the grid keeps the object's
-    // local Zs and only this call converts between the two.
+    // down is a different overhang and would drop the contact by a whole layer for no reason.
+    //
+    // No frame conversion happens here. `mesh` is passed already transformed by `trafo_sliced()`, the
+    // frame the layers were sliced in, and `grid` holds exactly those Zs: build_layer_grid() copies each
+    // object layer's print_z minus `belt_global_z_offset()`, which PrintObject::slice() adds to
+    // `Layer::print_z` only after the slicing. The mesh and the grid therefore share one frame, and the
+    // belt offset belongs to the layer stack only - feeding it into this search moves the window off the
+    // face (upwards for the negative offset a lifted belt mesh has) and can place the contact above it.
     const std::optional<double> face_z = overhang_face_z(mesh, facet_z, area,
-        grid.bottom_z(layer_idx - 1) + z_offset, grid.z(layer_idx) + z_offset);
-    // Z the air gap is measured from, in the grid's frame. Without a facet at all - a support enforcer
+        grid.bottom_z(layer_idx - 1), grid.z(layer_idx));
+    // Z the air gap is measured from, in that same frame. Without a facet at all - a support enforcer
     // adds areas with no down facing facet behind them - it is the bottom of the window that was just
     // searched rather than this layer's bottom: the overhang area is the material of this layer's slice
     // that the layer below does not support, so the face over it lies above the mid-plane slice of the
     // layer below and that bottom is a lower bound of it. A contact placed under it therefore keeps
     // `actual gap >= top_z_distance` either way, while measuring from this layer's bottom put the contact
     // up to half a layer too close to a face that sits below it.
-    const double reference_z = face_z ? *face_z - z_offset : grid.bottom_z(layer_idx - 1);
+    const double reference_z = face_z ? *face_z : grid.bottom_z(layer_idx - 1);
     // Highest whole layer that keeps at least `top_z_distance` of air under that reference; see
     // TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft.
     const LayerIndex contact_layer = grid.place_top_contact(reference_z, top_z_distance);
@@ -524,7 +539,7 @@ OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIn
     // which sits below it on a variable layer height. `set_obj_bottom_z()` only moves the material start
     // up, so the lower bound of a facet that reaches into the window from below leaves it where it was.
     if (face_z)
-        grid.set_obj_bottom_z(layer_idx, *face_z - z_offset);
+        grid.set_obj_bottom_z(layer_idx, *face_z);
     return { contact_layer, face_z };
 }
 
@@ -3725,10 +3740,10 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             TreeSupportLayerGrid &grid   = processing.first.layer_grid;
             // Raw millimetres: the lowest Z a contact may reach under the overhang.
             const double          top_z  = processing.first.settings.support_top_z_distance_mm;
-            // The mesh in the frame the layers were sliced in, so the overhang face Z can be measured
-            // against the grid Zs: the face itself is not in the layer stack (see overhang_face_z).
-            // The grid works in the object's local frame with the belt Z offset removed.
-            const double     z_offset = print_object.belt_global_z_offset();
+            // The mesh in the frame the layers were sliced in, which is the frame the grid holds: the
+            // overhang face itself is not a layer boundary (see overhang_face_z), and neither the mesh nor
+            // the grid carries the belt global Z offset - build_layer_grid() removes it from the object
+            // layers, PrintObject::slice() adds it to `Layer::print_z` only after slicing.
             TriangleMesh     mesh;
             OverhangFacetZIndex facet_index;
             if (std::any_of(overhangs.begin(), overhangs.end(), [](const Polygons &overhang) { return ! overhang.empty(); })) {
@@ -3741,7 +3756,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
                 if (! overhangs[overhang_idx].empty())
                     overhang_top_layer[overhang_idx] =
                         place_overhang_contact(grid, LayerIndex(overhang_idx), mesh, facet_index,
-                            overhangs[overhang_idx], z_offset, top_z).contact_layer;
+                            overhangs[overhang_idx], top_z).contact_layer;
         }
 
         // Generator for model collision, avoidance and internal guide volumes.

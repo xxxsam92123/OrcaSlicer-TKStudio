@@ -336,7 +336,7 @@ struct TreeSupportMeshGroupSettings {
         this->support_xy_distance_overhang = std::min(this->support_xy_distance, scaled<coord_t>(0.5 * external_perimeter_width));
         // Quantised clearance, as SlicingParameters computed it for the layer synchronised generators.
         // The Cura derived engines (tree_slim / strong / hybrid) read it through
-        // z_distance_top_layers below, so it must stay rounded to whole layers (review round 1, issue 2).
+        // z_distance_top_layers below, so it must stay rounded to whole layers.
         this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
         this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
         // Raw millimetres for the organic generator: it measures the air gap under an overhang from the
@@ -469,8 +469,7 @@ struct TreeSupportMeshGroupSettings {
     // Distance from the print to the bottom of the support.
     coord_t                         support_bottom_distance                 { scaled<coord_t>(0.1) };
     // Raw (unquantised) clearances in millimetres. The organic generator places its contact layers
-    // from these; the quantised members above stay for the layer synchronised engines (review round 1,
-    // issue 2).
+    // from these; the quantised members above stay for the layer synchronised engines.
     double                          support_top_z_distance_mm               { 0.1 };
     double                          support_bottom_z_distance_mm            { 0.1 };
     //FIXME likely not needed, optimization for clipping of interface layers
@@ -1049,7 +1048,7 @@ public:
         // elephant foot. The foot itself grows by `bp_radius_increase_at()`, i.e. by the real thickness
         // of each layer, so on a variable layer height the recommendation has to accumulate the same
         // increments - multiplying them by the count would ask for a radius the branches below never
-        // reach, and the branch spacing derived from it would be wrong (review round 4, issue 1).
+        // reach, and the branch spacing derived from it would be wrong.
         // A grid whose object layers are all nominal carries no thickness information beyond the scalar,
         // so it takes the scalar expression verbatim and that grid stays bit-identical (contract §5.1).
         // An empty grid carries no thickness information either - `h()` returns zero for it - so it has

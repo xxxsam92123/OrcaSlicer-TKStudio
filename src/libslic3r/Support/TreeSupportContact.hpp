@@ -52,8 +52,8 @@ struct OverhangFacetZIndex
  * The result is a lower bound of the face under `area`: a facet is considered when its Z range
  * overlaps the window at all, and a facet that starts below the window contributes the window bottom
  * (its face inside the window is at or above it), so measuring the gap from the result can widen the
- * gap but never close it. The mesh is in the frame it was sliced in and the window is in that same
- * frame, see place_overhang_contact() for the belt Z offset.
+ * gap but never close it. The mesh is in the frame it was sliced in, `trafo_sliced()`, and the window is
+ * in that same frame - the caller takes both from the layer grid, see place_overhang_contact().
  */
 [[nodiscard]] std::optional<double> overhang_face_z(const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
                                                     const Polygons &area, double z_lo, double z_hi);
@@ -63,11 +63,11 @@ struct OverhangFacetZIndex
  *
  * A layer's slices are taken at its mid-plane, so the material that first appears in layer `layer_idx`
  * starts below that layer, in the slab of the layers underneath: `[bottom_z(layer_idx - 1), z(layer_idx)]`
- * - closed, and with the EPSILON of overhang_face_z() - is the window the face is searched in, and it is
- * two layers tall on a uniform grid. The contact then goes on the highest whole layer whose top keeps
- * at least `top_z_distance` of air under that face, so the gap is quantised upwards and never narrower
- * than requested, and no layer height is written: the grid, the object layers, `SupportLayer::height`
- * and the extrusion heights stay the object's own.
+ * - closed, and with the round-off tolerance of overhang_face_z() - is the window the face is searched in,
+ * and it is two layers tall on a uniform grid. The contact then goes on the highest whole layer whose top
+ * keeps at least `top_z_distance` of air under that face, so the gap is quantised upwards and never
+ * narrower than requested, and no layer height is written: the grid, the object layers,
+ * `SupportLayer::height` and the extrusion heights stay the object's own.
  *
  * When no facet overlaps the window at all, the gap is measured from the bottom of that same window
  * instead. The face over an overhang area lies above the mid-plane slice of the layer below it - the
@@ -76,20 +76,24 @@ struct OverhangFacetZIndex
  *
  * Also raises the object material start of `layer_idx` to the face, so the clearance of the contact
  * layer below is measured against the face rather than against a layer bottom that sits below it.
+ *
+ * `mesh` and `grid` are in one frame and no conversion happens between them: `mesh` is transformed by
+ * `trafo_sliced()`, the frame the layers were sliced in, and `grid` holds those same Zs - its
+ * `build_layer_grid()` copies each object layer's print_z minus the belt global Z offset, which is added
+ * to `Layer::print_z` only after slicing.
  */
 struct OverhangContact
 {
     LayerIndex            contact_layer { -1 };  // -1 when no whole layer is left to carry it
-    // The Z the air gap of this area is measured from, in the mesh frame: the mesh as transformed by
-    // `trafo_sliced()`, which carries `belt_global_z_offset()`, while the grid holds the object's local
-    // Zs. A grid Z is therefore `*face_z - z_offset`, and that is the only way this Z is used - it never
-    // becomes a layer Z, a layer height or an extrusion height.
+    // The Z the air gap of this area is measured from, in the frame of the layer grid: the mesh as
+    // transformed by `trafo_sliced()`, which is also the grid's frame. It never becomes a layer Z, a layer
+    // height or an extrusion height; the only Z derived from it is the contact layer index.
     std::optional<double> face_z;
 };
 
 [[nodiscard]] OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, LayerIndex layer_idx,
                                                     const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
-                                                    const Polygons &area, double z_offset, double top_z_distance);
+                                                    const Polygons &area, double top_z_distance);
 
 } // namespace TreeSupport3D
 
