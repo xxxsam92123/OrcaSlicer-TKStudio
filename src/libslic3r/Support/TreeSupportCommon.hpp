@@ -129,8 +129,8 @@ struct TreeSupportLayerGrid
     // Move the Z where the object's material inside `layer_idx` really starts. A layer whose slice
     // reaches an overhang starts above the face when the face falls inside the layer below, and the
     // clearance of the contact layer below has to be measured against the face, not against the
-    // layer's bottom: with the exact gap the contact top sits exactly `top_z_distance` under the face,
-    // so that layer is not within the clearance and must not be treated as an obstacle there.
+    // layer's bottom: the contact top sits at least `top_z_distance` under the face, so that layer is
+    // not within the clearance and must not be treated as an obstacle there.
     // Moving it is only ever upwards - the layer's slices do start at its bottom everywhere else.
     void set_obj_bottom_z(LayerIndex layer_idx, const double obj_bottom_z_req)
     {
@@ -139,8 +139,8 @@ struct TreeSupportLayerGrid
         entries[layer_idx].obj_bottom_z = std::max(entries[layer_idx].obj_bottom_z, obj_bottom_z_req);
     }
 
-    // Z where the object inside this layer really starts. Stays put when the support stack above is
-    // pulled down by a lowered contact layer.
+    // Z where the object inside this layer really starts. Only the overhang face ever raises it; the
+    // support stack above cannot move it, as the top contact is one of the existing layers.
     double obj_bottom_z(LayerIndex layer_idx) const
     {
         if (entries.empty())
@@ -155,6 +155,23 @@ struct TreeSupportLayerGrid
     // Vertical distance between the tops of two layers. The layers tile the Z axis, so this is the
     // sum of the layer heights in between.
     double z_span(LayerIndex from, LayerIndex to) const { return z(to) - z(from); }
+
+    // True when the object layers of the grid all have the nominal `layer_height` thickness, so that the
+    // grid carries no thickness information the nominal formulas lack.
+    //
+    // Two kinds of layer are left out of the test on purpose, because neither says how the object stacks
+    // over its height: the raft layers below it (a raft layer is thicker so it can be peeled off, and a
+    // branch does not grow along it) and the object's first layer (printed thicker for bed adhesion, a
+    // first layer setting rather than a variable layer height). Leaving them out is what keeps every
+    // print that uses a raft or a thicker first layer on the historical scalar layer counts (contract
+    // §4.4), while a genuinely variable layer height still re-derives them from the grid.
+    [[nodiscard]] bool object_layers_are_nominal(const coord_t layer_height) const
+    {
+        for (size_t idx = raft_layers + 1; idx < entries.size(); ++ idx)
+            if (scaled_rounded(entries[idx].height) != layer_height)
+                return false;
+        return true;
+    }
 
     // How many layers a Z distance spans. Walking the grid keeps these counts meaningful with
     // variable layer heights; the three roundings reproduce the historical formulas exactly on a
@@ -214,7 +231,7 @@ struct TreeSupportLayerGrid
         return layers;
     }
 
-    // Lowest layer whose top reaches z, i.e. the layer that would have to be lowered to end at z.
+    // Lowest layer whose top reaches z.
     LayerIndex idx_ceil(double z_req) const
     {
         const auto it = std::lower_bound(entries.begin(), entries.end(), z_req - EPSILON,
@@ -616,8 +633,11 @@ public:
     
         layer_start_bp_radius = (bp_radius - branch_radius) / bp_radius_increase_per_layer;
 
-        // The layer Zs of this group. Copied so that a contact layer may be lowered to an exact Z gap
-        // without touching the settings the volumes are built from.
+        // The layer Zs of this group: the object's own layers, one entry each, copied so the grid the
+        // generator places its contacts on is the one this settings object counts layers in. Nothing in
+        // that grid is ever rewritten - the top contact of an overhang is *placed* on the highest whole
+        // layer that keeps at least `support_top_z_distance` of air under the face, so the gap is
+        // quantised upwards and every layer keeps its object height.
         layer_grid = mesh_group_settings.layer_grid;
         raft_layers.clear();
         for (size_t i = 0; i < layer_grid.raft_layers; ++ i)
@@ -625,16 +645,22 @@ public:
         has_top_gap    = mesh_group_settings.support_top_z_distance_mm > EPSILON;
         has_bottom_gap = mesh_group_settings.support_bottom_z_distance_mm > EPSILON;
 
-        // Derive the layer counts from the grid, so a variable layer height does not silently change how
-        // many layers a millimetre covers (contract §4.1). On a uniform grid every count resolves to the
-        // value the initialisation list derived from the nominal layer height.
-        if (! layer_grid.empty()) {
+        // Layer counts are "how many layers does a millimetre cover", which a variable layer height
+        // answers differently per layer than the nominal `layer_height` the initialisation list used
+        // (contract §4.1). They are therefore re-derived from the grid, but only when the object's own
+        // layers actually vary: a print whose object layers are all the nominal height keeps the scalar
+        // values bit for bit, whatever its raft or first layer looks like - the raft is not part of the
+        // object the branch grows along, and letting its 0.3 mm layers shorten the counts would change
+        // existing support for no gain (contract §4.4).
+        if (! layer_grid.empty() && ! layer_grid.object_layers_are_nominal(layer_height)) {
+            const LayerIndex first_object_layer = LayerIndex(layer_grid.raft_layers);
             support_bottom_layers = mesh_group_settings.support_bottom_enable ?
-                layer_grid.layers_rounding(unscale<double>(mesh_group_settings.support_bottom_height)) : 0;
+                layer_grid.layers_rounding(unscale<double>(mesh_group_settings.support_bottom_height), first_object_layer) : 0;
             tip_layers = std::max<size_t>(size_t(1),
                 std::max<size_t>(size_t((branch_radius - min_radius) / std::max<coord_t>(support_line_width / 3, 1)),
-                                 layer_grid.layers_fitting(unscale<double>(branch_radius))));
-            min_dtt_to_model = layer_grid.layers_covering(unscale<double>(mesh_group_settings.support_tree_min_height_to_model));
+                                 layer_grid.layers_fitting(unscale<double>(branch_radius), first_object_layer)));
+            min_dtt_to_model = layer_grid.layers_covering(unscale<double>(mesh_group_settings.support_tree_min_height_to_model),
+                                                          first_object_layer);
             increase_radius_until_layer = increase_radius_until_radius <= branch_radius ?
                 size_t(tip_layers * (increase_radius_until_radius / branch_radius)) :
                 layers_for_branch_radius_growth(double(increase_radius_until_radius - branch_radius));
@@ -910,7 +936,8 @@ public:
     {
         double accumulated = 0.;
         size_t layers      = 0;
-        for (size_t idx = 0; idx < layer_grid.size(); ++ idx) {
+        // The branch grows along the object, so the raft layers below it do not contribute.
+        for (size_t idx = layer_grid.raft_layers; idx < layer_grid.size(); ++ idx) {
             const double growth = branch_radius_increase_at(LayerIndex(idx));
             if (growth <= EPSILON || accumulated + growth > radius_delta + EPSILON)
                 break;
@@ -925,7 +952,7 @@ public:
     {
         double accumulated = 0.;
         size_t layers      = 0;
-        for (size_t idx = 0; idx < layer_grid.size(); ++ idx) {
+        for (size_t idx = layer_grid.raft_layers; idx < layer_grid.size(); ++ idx) {
             const double growth = bp_radius_increase_at(LayerIndex(idx));
             if (growth <= EPSILON || accumulated + growth > radius_delta + EPSILON)
                 break;
@@ -1000,9 +1027,9 @@ public:
         // of each layer, so on a variable layer height the recommendation has to accumulate the same
         // increments - multiplying them by the count would ask for a radius the branches below never
         // reach, and the branch spacing derived from it would be wrong (review round 4, issue 1).
-        // A range of nominal layers carries no thickness information beyond the scalar, so it takes the
-        // scalar expression verbatim and a uniform grid stays bit-identical (contract §5.1).
-        bool all_nominal = ! layer_grid.empty();
+        // A grid whose object layers are all nominal carries no thickness information beyond the scalar,
+        // so it takes the scalar expression verbatim and that grid stays bit-identical (contract §5.1).
+        bool all_nominal = layer_grid.empty() || layer_grid.object_layers_are_nominal(layer_height);
         for (LayerIndex idx = layer_idx + 1; all_nominal && idx <= layer_start_bp_radius; ++ idx)
             all_nominal = nominal_thickness(idx);
         if (! all_nominal) {
@@ -1057,8 +1084,10 @@ inline void tree_supports_show_error(std::string_view message, bool critical)
 #endif // TREE_SUPPORT_SHOW_ERRORS_WIN32
 }
 
-// Print Z of a support layer. Comes from the layer grid, which holds the real object layer Zs, so
-// a varying layer height and a contact layer lowered to an exact Z gap both resolve correctly.
+// Print Z of a support layer. Comes from the layer grid, which holds the real object layer Zs, so a
+// varying layer height resolves to the object's own Zs. The top contact of an overhang is one of those
+// whole layers - the highest one that keeps the requested air gap - and is never moved onto the gap Z
+// itself, so no support layer has a Z of its own.
 inline double layer_z(const TreeSupportSettings &config, const size_t layer_idx)
 {
     return config.layer_grid.z(LayerIndex(layer_idx));
