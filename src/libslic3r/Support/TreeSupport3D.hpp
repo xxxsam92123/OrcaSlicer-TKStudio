@@ -357,6 +357,11 @@ struct OverhangFacetZIndex
  * highest whole layer whose top stays `top_z_distance` below the face, i.e. the gap is quantised upwards
  * and never narrower than requested.
  *
+ * When no face is found, the gap is measured from the bottom of that same slab instead of from this
+ * layer's bottom. That Z is a lower bound of the object's material inside the area - the material starts
+ * above the mid-plane slice of the layer below - so the gap stays a lower bound as well, and a facet that
+ * only reaches into the slab from below needs no case of its own.
+ *
  * Also raises the object material start of `layer_idx` to the face, so the clearance of the contact
  * layer below is measured against the face rather than against a layer bottom that sits below it.
  */

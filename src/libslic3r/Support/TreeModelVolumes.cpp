@@ -111,7 +111,9 @@ TreeModelVolumes::TreeModelVolumes(
     {
         m_anti_overhang = print_object.slice_support_blockers();
         TreeSupportMeshGroupSettings mesh_settings(print_object);
-        // Take the grid the generator lowered the contact layers on, not the plain object layer grid.
+        // Take the grid the generator built its support layers on - one entry per object layer, raft
+        // layers first - so the collision volumes resolve the same Zs. No layer was moved onto a gap Z
+        // and none carries a gap remainder as its height.
         if (layer_grid != nullptr && ! layer_grid->empty())
             mesh_settings.layer_grid = *layer_grid;
         const TreeSupportSettings config{ mesh_settings, print_object.slicing_parameters() };
@@ -820,13 +822,13 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
                 int         move_steps = std::max(1, round_up_divide<int>(layer_move, move_step));
                 assert(move_steps > 0);
                 float last_move_step = layer_move - (move_steps - 1) * move_step;
-                if (last_move_step < scaled<float>(0.05)) {
-                    assert(move_steps > 1);
-                    if (move_steps > 1) {
-                        // Avoid taking a very short last step, stretch the other steps a bit instead.
-                        move_step = layer_move / (-- move_steps);
-                        last_move_step = move_step;
-                    }
+                // A layer whose movement limit is below the minimum step moves in that one step, so the
+                // `move_steps > 1` guard is a real case with the per-layer limit - not an invariant the
+                // way it was for the nominal scalar.
+                if (move_steps > 1 && last_move_step < scaled<float>(0.05)) {
+                    // Avoid taking a very short last step, stretch the other steps a bit instead.
+                    move_step = layer_move / (-- move_steps);
+                    last_move_step = move_step;
                 }
                 // For mildly steep branch angles only one step will be taken.
                 for (int istep = 0; istep < move_steps; ++ istep)
