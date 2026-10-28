@@ -7,6 +7,7 @@
 #include "PrintBase.hpp"
 #include <utility>
 #include <string>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "libslic3r.h"

@@ -18,6 +18,7 @@
 #include <map>
 #include <math.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Slic3r {

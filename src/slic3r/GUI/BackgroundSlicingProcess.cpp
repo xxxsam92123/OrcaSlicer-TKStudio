@@ -3,6 +3,7 @@
 #include "GUI.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
+#include <atomic>
 
 #include <cstddef>
 #include <exception>
