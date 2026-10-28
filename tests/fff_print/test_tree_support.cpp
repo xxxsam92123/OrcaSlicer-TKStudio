@@ -14,7 +14,11 @@
 #include "libslic3r/TriangleMesh.hpp"
 
 #include "test_helpers.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Polygon.hpp"
 #include "libslic3r/Support/TreeSupport3D.hpp"
 #include "libslic3r/Support/TreeSupportContact.hpp"
 #include "libslic3r/Model.hpp"
@@ -22,11 +26,16 @@
 #include "libslic3r/Support/TreeSupportCommon.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <math.h>
+#include <optional>
 #include <set>
 #include <string>
-#include <vector>
+#include <string_view>
 #include <sstream>
+#include <vector>
 #ifdef _WIN32
     #include <io.h>
 #else
