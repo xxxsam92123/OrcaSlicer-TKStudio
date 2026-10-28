@@ -452,8 +452,9 @@ private:
      * and using the nominal value for the propagation would let the region claim a reachability the
      * branch cannot follow: on 0.1 mm layers the region grows by the nominal 0.2 mm worth of movement
      * while the branch may only move half of it, so a branch following the region's edge ends up
-     * completely inside it and is dropped as a lost branch. Empty when the group carries no grid (or a
-     * single layer height), in which case the scalars above are used for every layer.
+     * completely inside it and is dropped as a lost branch. Filled whenever the group carries a layer
+     * grid - a uniform grid stores the nominal value for every layer, so its propagation is unchanged -
+     * and empty without one, where the scalars above are used for every layer.
      */
     std::vector<coord_t> m_max_move_per_layer;
     std::vector<coord_t> m_max_move_slow_per_layer;

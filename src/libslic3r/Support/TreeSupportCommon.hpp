@@ -1029,8 +1029,10 @@ public:
         // reach, and the branch spacing derived from it would be wrong (review round 4, issue 1).
         // A grid whose object layers are all nominal carries no thickness information beyond the scalar,
         // so it takes the scalar expression verbatim and that grid stays bit-identical (contract §5.1).
+        // An empty grid carries no thickness information either - `h()` returns zero for it - so it has
+        // to take the scalar expression as well.
         bool all_nominal = layer_grid.empty() || layer_grid.object_layers_are_nominal(layer_height);
-        for (LayerIndex idx = layer_idx + 1; all_nominal && idx <= layer_start_bp_radius; ++ idx)
+        for (LayerIndex idx = layer_idx + 1; ! layer_grid.empty() && all_nominal && idx <= layer_start_bp_radius; ++ idx)
             all_nominal = nominal_thickness(idx);
         if (! all_nominal) {
             double radius = branch_radius;

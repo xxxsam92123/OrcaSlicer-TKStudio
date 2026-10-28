@@ -382,7 +382,11 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 //
 // The search runs once per overhang area, so the facet Z minima are collected once per mesh instead of
 // being recomputed - together with a full walk over the triangles - for every area (review round 4,
-// issue 3). Only the facets whose lowest vertex lies inside the window are visited at all.
+// issue 3). Only the facets whose lowest vertex lies inside the window are visited at all. A facet that
+// spans the window from below - a large or steeply sloped triangle whose lowest vertex sits under it -
+// is therefore not returned; place_overhang_contact() covers it by measuring from the bottom of the
+// window in that case, which is a lower bound of such a facet's face inside the window and never above
+// it. So a facet is never dropped in a way that could put the contact too close to the object.
 void OverhangFacetZIndex::build(const TriangleMesh &mesh)
 {
     const indexed_triangle_set &its = mesh.its;
@@ -457,10 +461,20 @@ OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIn
     // bottom that is not the face.
     const std::optional<double> face_z = overhang_face_z(mesh, facet_z, area,
         grid.bottom_z(layer_idx - 1) + z_offset, grid.z(layer_idx) + z_offset);
-    // Highest whole layer that keeps at least `top_z_distance` of air under the face; see
+    // Z the air gap is measured from. Without a face it is the bottom of the slab that was just searched
+    // rather than this layer's bottom: the object's material inside the area starts above the slice plane
+    // of the layer below (a layer's slices are taken at its mid-plane, see compute_slice_z()), so its
+    // lowest possible Z is this one. A contact placed under it therefore keeps
+    // `actual gap >= top_z_distance` whether or not a facet was found, while measuring from this layer's
+    // bottom put the contact up to half a layer too close to a face that sits below it.
+    //
+    // A facet that only reaches into the window from below needs no case of its own: its face inside the
+    // slab is at or above the slab bottom, i.e. at or above this same reference, so dropping it from the
+    // search cannot make the gap narrower than what this reference already guarantees.
+    const double reference_z = face_z ? *face_z - z_offset : grid.bottom_z(layer_idx - 1);
+    // Highest whole layer that keeps at least `top_z_distance` of air under that reference; see
     // TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft.
-    const LayerIndex contact_layer =
-        grid.place_top_contact(face_z ? *face_z - z_offset : grid.bottom_z(layer_idx), top_z_distance);
+    const LayerIndex contact_layer = grid.place_top_contact(reference_z, top_z_distance);
     // The contact layer's clearance is measured against the face, not against this layer's bottom,
     // which sits below it on a variable layer height.
     if (face_z)
@@ -3653,9 +3667,10 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         }
 
         // Generator for model collision, avoidance and internal guide volumes.
-        // The avoidance caches take the nominal movement limits: they quantise growth in steps of
-        // xy_min_distance, so a per-layer limit would only change how many steps a cache is built with,
-        // not the geometry (contract §4.1 keeps the nominal value for such non-geometric uses).
+        // The two movement limits passed here are the nominal ones, for the layers the grid does not
+        // cover; the avoidance caches derive the per-layer limit from the same grid this generator
+        // settles its support layers on (see TreeModelVolumes::m_max_move_per_layer), so the region they
+        // propagate and the step a branch may take per layer stay the same number.
         TreeModelVolumes volumes{ print_object, build_volume, config.maximum_move_distance, config.maximum_move_distance_slow, processing.second.front(),
             &processing.first.layer_grid,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS

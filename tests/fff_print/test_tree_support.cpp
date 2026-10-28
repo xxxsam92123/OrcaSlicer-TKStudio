@@ -188,6 +188,13 @@ size_t occurrences(const std::string &text, const std::string &needle)
     return count;
 }
 
+// Support diagnostics are printed by tree_supports_show_error() as "Error: <message>, critical: <0|1>".
+// Counting the records rather than a list of messages catches a critical one the test does not know the
+// wording of; every critical diagnostic of the generator goes through that one function.
+size_t diagnostic_count(const std::string &text) { return occurrences(text, "Error: "); }
+
+size_t critical_diagnostic_count(const std::string &text) { return occurrences(text, ", critical: 1"); }
+
 // The grid entry whose top is `print_z`, or null when that Z is not a layer of the grid.
 const Slic3r::TreeSupport3D::TreeSupportLayerGrid::Entry *grid_entry_at(
     const Slic3r::TreeSupport3D::TreeSupportLayerGrid &grid, double print_z)
@@ -660,14 +667,24 @@ std::multiset<double> gcode_layer_heights(const std::string &gcode)
 // Heights of the extrusion paths a support layer prints. This is the number Flow is built from
 // (`ExtrusionPath::height`), so a gap remainder that leaked into a layer height shows up here as well -
 // asserting on `SupportLayer::height` alone would not prove what the extrusions actually lay down.
-std::multiset<double> support_path_heights(const SupportLayer &layer)
+//
+// The role comes along because the base of the support is printed as erSupportMaterial and the interface
+// and roof stack as erSupportMaterialInterface with a flow of its own: a test that only looked at one of
+// the two would not see a remainder that leaked into the other.
+struct SupportPathRole
 {
-    std::multiset<double> heights;
+    ExtrusionRole role;
+    double        height;
+};
+
+std::vector<SupportPathRole> support_path_roles(const SupportLayer &layer)
+{
+    std::vector<SupportPathRole> paths;
     const ExtrusionEntityCollection flat = layer.support_fills.flatten();
     for (const ExtrusionEntity *entity : flat.entities)
         if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity))
-            heights.insert(std::round(double(path->height) * 1000.) / 1000.);
-    return heights;
+            paths.push_back({ path->role(), std::round(double(path->height) * 1000.) / 1000. });
+    return paths;
 }
 
 // Every height the object's layer stack has, rounded to a micron: a support path may only be as thick as
@@ -730,16 +747,23 @@ TEST_CASE("An organic top gap keeps every support layer on the object's own laye
     // own height. Not one of them may be the gap remainder.
     REQUIRE(! po.support_layers().empty());
     const std::multiset<double> profile_heights = object_layer_heights(po);
+    size_t                      base_paths      = 0;
+    size_t                      interface_paths = 0;
     for (const SupportLayer *layer : po.support_layers()) {
         INFO("support layer print_z " << layer->print_z << " height " << layer->height);
         CHECK_THAT(layer->print_z, Catch::Matchers::WithinAbs(std::round(layer->print_z / 0.2) * 0.2, 1e-9));
         CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(0.2, 1e-12));
-        // Flow / path height: what the extrusions of this layer are actually built with.
-        for (const double height : support_path_heights(*layer)) {
-            INFO("support path height " << height);
-            CHECK(profile_heights.find(height) != profile_heights.end());
+        // Flow / path height: what the extrusions of this layer are actually built with, base and
+        // interface stack alike.
+        for (const SupportPathRole &path : support_path_roles(*layer)) {
+            INFO("support path role " << int(path.role) << " height " << path.height);
+            CHECK(profile_heights.find(path.height) != profile_heights.end());
+            (path.role == erSupportMaterialInterface ? interface_paths : base_paths) += 1;
         }
     }
+    // The interface stack has a flow of its own, so both kinds have to have been looked at.
+    REQUIRE(base_paths > 0);
+    REQUIRE(interface_paths > 0);
 
     // The top contact is the highest support layer, and its top is that layer's own print_z. The air gap
     // under the overhang at 16.0 is therefore never narrower than requested and at most one layer wider;
@@ -759,6 +783,19 @@ TEST_CASE("An organic top gap keeps every support layer on the object's own laye
     REQUIRE(! heights.empty());
     REQUIRE(! heights_plain.empty());
     CHECK(heights == heights_plain);
+}
+
+// The zero the tests below assert is only meaningful if the capture reads the stream the generator
+// writes and the counters match its format, so both are checked against the function that emits the
+// record instead of against a string this test made up.
+TEST_CASE("The support diagnostic count sees what the generator prints", "[TreeSupport]")
+{
+    ScopedStdoutCapture capture;
+    TreeSupport3D::tree_supports_show_error(std::string_view("Uninitialized support element. A branch may be missing.\n"), true);
+    TreeSupport3D::tree_supports_show_error(std::string_view("Not precalculated Collision requested."), false);
+    const std::string text = capture.finish();
+    CHECK(diagnostic_count(text) == 2);
+    CHECK(critical_diagnostic_count(text) == 1);
 }
 
 // The same property on variable layer height profiles: 0.2 mm up to z = 15 and 0.4 mm above it, with the
@@ -812,6 +849,13 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
         // A branch the generator had to drop is reported on stdout and leaves the geometry it returns
         // unchanged, so the assertions below would stay green while branches are missing. On a variable
         // layer height the generator must not have to drop one (review round 3, issue 3).
+        //
+        // Every support diagnostic goes through tree_supports_show_error(), which prints
+        // "Error: <message>, critical: <0|1>" - the same stream this capture reads. Counting the records
+        // covers every critical diagnostic of the path, including the ones this test cannot name.
+        CHECK(diagnostic_count(diagnostics) == 0);
+        CHECK(critical_diagnostic_count(diagnostics) == 0);
+        // Named as well, so a failure points at the branch that was lost rather than only at a count.
         CHECK(occurrences(diagnostics, "Uninitialized support element") == 0);
         CHECK(occurrences(diagnostics, "Potentially lost branch") == 0);
 
@@ -835,6 +879,8 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
         // Every support layer sits on one of those Zs and prints *that* layer's height - the 0.4 mm
         // section is printed as 0.4, never as the 0.14 a gap remainder would leave of it.
         const std::multiset<double> profile_heights = object_layer_heights(po);
+        size_t                      base_paths      = 0;
+        size_t                      interface_paths = 0;
         double contact_print_z = 0.;
         for (const SupportLayer *layer : po.support_layers()) {
             INFO("support layer print_z " << layer->print_z << " height " << layer->height);
@@ -844,12 +890,16 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
             if (it == object_layers.end())
                 continue;
             CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
-            for (const double height : support_path_heights(*layer)) {
-                INFO("support path height " << height);
-                CHECK(profile_heights.find(height) != profile_heights.end());
+            // Base and interface / roof paths both take their height from the layer, so both are checked.
+            for (const SupportPathRole &path : support_path_roles(*layer)) {
+                INFO("support path role " << int(path.role) << " height " << path.height);
+                CHECK(profile_heights.find(path.height) != profile_heights.end());
+                (path.role == erSupportMaterialInterface ? interface_paths : base_paths) += 1;
             }
             contact_print_z = std::max(contact_print_z, layer->print_z);
         }
+        REQUIRE(base_paths > 0);
+        REQUIRE(interface_paths > 0);
 
         // The gap is at least as wide as requested, and less than one layer wider. On a variable layer
         // height a whole layer is what it is at that Z, so one 0.4 mm layer is the bound here.
@@ -963,6 +1013,72 @@ TEST_CASE("The overhang face is searched in the slab of the layer below the area
     CHECK_THAT(*overhang_face_z(mesh, facets, area, grid.bottom_z(38), grid.z(39)), Catch::Matchers::WithinAbs(15.9, 1e-4));
     // ... while a window that starts at the area's own layer bottom does not see the real face at all.
     CHECK_FALSE(overhang_face_z(mesh, facets, area, grid.bottom_z(40), grid.z(40)).has_value());
+}
+
+// A sloped face can cross the whole search slab while its lowest vertex lies below it. Indexing the
+// facets by their lowest vertex alone dropped such a facet, and the placement then measured the gap from
+// the top of the layer below the area's - a Z the face is not on - which closed the gap to 0.32 mm
+// against a requested 0.4. The reference has to be bounded by the slab that was searched instead: for a
+// facet that only reaches into the slab from below, the bottom of this slab is the lowest Z the face can
+// have, so a contact placed against it can only widen the gap.
+TEST_CASE("A sloped overhang face below the search window still keeps the requested gap", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+
+    // One down facing triangle: 16.2 at the origin, 15.0 at y = 10 and 16.0 at x = 10. Its lowest vertex
+    // is below the slab the area's layer searches, the facet itself reaches up into it.
+    TriangleMesh mesh(std::vector<Vec3f>{ Vec3f(0.f, 0.f, 16.2f), Vec3f(0.f, 10.f, 15.0f), Vec3f(10.f, 0.f, 16.f) },
+                      std::vector<Vec3i32>{ Vec3i32(0, 1, 2) });
+
+    // 0.4 mm layers: layer 40 tops out at 16.4, so the face of its area is searched in (15.6, 16.4].
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (int i = 0; i < 50; ++ i) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z      = bottom;
+        entry.obj_bottom_z  = bottom;
+        entry.print_z       = bottom + 0.4;
+        entry.height        = 0.4;
+        entry.obj_layer_idx = LayerIndex(i);
+        bottom              = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+    const double window_lo = grid.bottom_z(39);
+    REQUIRE_THAT(window_lo, Catch::Matchers::WithinAbs(15.6, 1e-9));
+    // The premise of the case: the facet's lowest vertex is outside the window it spans.
+    REQUIRE(15.0 < window_lo);
+
+    OverhangFacetZIndex facets;
+    facets.build(mesh);
+    const Polygons area{ Polygon{ { Point::new_scale(0., 0.), Point::new_scale(2., 0.),
+                                   Point::new_scale(2., 2.), Point::new_scale(0., 2.) } } };
+
+    const std::vector<TreeSupportLayerGrid::Entry> before = grid.entries;
+    constexpr double                               requested = 0.4;
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0., requested);
+    REQUIRE(contact.contact_layer >= 1);
+
+    // The contact is one of the grid's own layers, printed at that layer's height: no remainder of the
+    // gap became a Z or a layer height.
+    const TreeSupportLayerGrid::Entry *entry = grid_entry_at(grid, grid.z(contact.contact_layer));
+    REQUIRE(entry != nullptr);
+    CHECK_THAT(entry->height, Catch::Matchers::WithinAbs(0.4, 1e-12));
+    CHECK_THAT(grid.z(contact.contact_layer) - grid.bottom_z(contact.contact_layer),
+               Catch::Matchers::WithinAbs(0.4, 1e-12));
+    REQUIRE(grid.entries.size() == before.size());
+    for (size_t i = 0; i < before.size(); ++ i) {
+        INFO("grid layer " << i);
+        CHECK_THAT(grid.entries[i].print_z, Catch::Matchers::WithinAbs(before[i].print_z, 1e-12));
+        CHECK_THAT(grid.entries[i].bottom_z, Catch::Matchers::WithinAbs(before[i].bottom_z, 1e-12));
+        CHECK_THAT(grid.entries[i].height, Catch::Matchers::WithinAbs(before[i].height, 1e-12));
+    }
+
+    // The lowest point of the face inside the area is the far corner (2, 2): the triangle drops 0.12 per
+    // millimetre in y and 0.02 in x. The air gap under it may come out wider than requested, never
+    // narrower - 0.32 mm is what measuring from the layer top above the face produced.
+    const double face_z = 16.2 - 0.02 * 2. - 0.12 * 2.;
+    INFO("contact print_z " << grid.z(contact.contact_layer) << " lowest face " << face_z);
+    CHECK(face_z - grid.z(contact.contact_layer) >= requested - 1e-9);
 }
 
 // A raft is not part of the layered object: its layers are thicker (0.3 on a 0.2 mm profile) and it is
