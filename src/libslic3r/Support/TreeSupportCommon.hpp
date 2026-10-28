@@ -90,6 +90,15 @@ struct TreeSupportLayerGrid
     std::vector<Entry> entries;
     size_t             raft_layers { 0 };
 
+    // Tolerance of the Z comparison that places a top contact, millimetres.
+    //
+    // It only has to absorb the round-off of the doubles involved: the layer Zs are sums of layer heights
+    // and the reference is a face Z minus the gap. 1e-9 mm is far above that round-off and five orders of
+    // magnitude below the 1e-4 mm geometric EPSILON the rest of the file uses, which is a length the
+    // printer cannot express anyway (3 decimals, 1e-3 mm). Applying the geometric EPSILON here instead let
+    // a contact end up 1e-4 mm closer to the object than the requested gap.
+    static constexpr double z_roundoff = 1e-9;
+
     bool   empty() const { return entries.empty(); }
     size_t size()  const { return entries.size(); }
 
@@ -239,10 +248,12 @@ struct TreeSupportLayerGrid
         return LayerIndex(it - entries.begin());
     }
 
-    // Highest layer whose top does not exceed z.
-    LayerIndex idx_floor(double z_req) const
+    // Highest layer whose top does not exceed z, allowing for `tolerance` above it. The tolerance only
+    // has to absorb the round-off of the Zs themselves; the contact placement passes z_roundoff, while the
+    // layer lookups elsewhere keep the geometric EPSILON.
+    LayerIndex idx_floor(const double z_req, const double tolerance = EPSILON) const
     {
-        const auto it = std::upper_bound(entries.begin(), entries.end(), z_req + EPSILON,
+        const auto it = std::upper_bound(entries.begin(), entries.end(), z_req + tolerance,
             [](double z, const Entry &entry) { return z < entry.print_z; });
         return std::max<LayerIndex>(0, LayerIndex(it - entries.begin()) - 1);
     }
@@ -271,7 +282,7 @@ struct TreeSupportLayerGrid
         const LayerIndex lowest = std::max<LayerIndex>(1, LayerIndex(raft_layers));
         if (entries.size() < size_t(lowest) + 1)
             return -1;
-        const LayerIndex layer_idx = idx_floor(std::max(0., overhang_bottom_z - top_z_distance));
+        const LayerIndex layer_idx = idx_floor(std::max(0., overhang_bottom_z - top_z_distance), z_roundoff);
         return layer_idx >= lowest ? layer_idx : -1;
     }
 };
@@ -901,8 +912,20 @@ public:
     // How far an influence area may move outward from `layer_idx` down to the layer below it.
     // A layer as thick as the nominal layer height returns the legacy scalar verbatim, so a uniform
     // layer grid stays bit-identical to the scalar implementation this replaced (contract §5.1).
+    //
+    // The raft layers and the object's first layer count as nominal whatever their thickness, the same
+    // two kinds object_layers_are_nominal() leaves out of the counts: a raft layer is thicker so it can
+    // be peeled off and the first layer is thicker for adhesion, so neither says how the object stacks.
+    // Those counts therefore stay the historical scalars on such a print (contract §4.4), and the per
+    // layer growth has to stay the scalar as well - deriving it from a 0.3 mm raft layer would move a
+    // branch away from the scalar baseline while the counts it was sized with still assume nominal
+    // layers.
     [[nodiscard]] bool nominal_thickness(const LayerIndex layer_idx) const
-    { return TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx)) == layer_height; }
+    {
+        if (layer_idx <= LayerIndex(layer_grid.raft_layers))
+            return true;
+        return TreeSupportLayerGrid::scaled_rounded(layer_grid.h(layer_idx)) == layer_height;
+    }
 
     [[nodiscard]] coord_t maximum_move_distance_at(const LayerIndex layer_idx) const
     {

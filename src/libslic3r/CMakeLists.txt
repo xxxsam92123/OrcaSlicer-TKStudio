@@ -504,6 +504,7 @@ set(lisbslic3r_sources
     Support/TreeSupport3D.cpp
     Support/TreeSupport3D.hpp
     Support/TreeSupportCommon.hpp
+    Support/TreeSupportContact.hpp
     Support/TreeSupport.cpp
     Support/TreeSupport.hpp
     SurfaceCollection.cpp

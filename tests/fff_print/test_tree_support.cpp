@@ -16,6 +16,7 @@
 #include "test_helpers.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Support/TreeSupport3D.hpp"
+#include "libslic3r/Support/TreeSupportContact.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
@@ -220,6 +221,59 @@ void check_counts_unchanged(const Slic3r::TreeSupport3D::TreeSupportSettings &co
     CHECK(config.increase_radius_until_layer == reference.increase_radius_until_layer);
     INFO("layer_start_bp_radius " << config.layer_start_bp_radius << " vs " << reference.layer_start_bp_radius);
     CHECK(config.layer_start_bp_radius == reference.layer_start_bp_radius);
+}
+
+// A prism with a sloped underside that runs into a horizontal shelf, extruded along Y. Its cross section
+// in XZ is (0, 2.0) -> (13.5, 3.35) -> (25, 3.35) -> (25, 4.0) -> (0, 4.0), so one overhang area holds two
+// downward faces: the slope, whose lowest vertex at 2.0 lies below the window a layer searches, and the
+// shelf at 3.35, whose own lowest vertex lies inside that window. The slope rises 0.1 mm per mm, i.e. 5.7
+// degrees, which is below the 30 degree support threshold - a steeper face than that leaves no overhang
+// area behind the threshold offset at all.
+TriangleMesh sloped_shelf_mesh()
+{
+    const float y0 = 0.f, y1 = 10.f;
+    const std::vector<Vec3f> vertices {
+        { 0.f, y0, 2.000f }, { 13.5f, y0, 3.35f }, { 25.f, y0, 3.35f }, { 25.f, y0, 4.f }, { 0.f, y0, 4.f },
+        { 0.f, y1, 2.000f }, { 13.5f, y1, 3.35f }, { 25.f, y1, 3.35f }, { 25.f, y1, 4.f }, { 0.f, y1, 4.f },
+    };
+    // Outward facing throughout: the caps close the ends, the walls run along the cross section.
+    const std::vector<Vec3i32> indices {
+        { 1, 3, 2 }, { 1, 4, 3 }, { 1, 0, 4 },   // the y = 0 cap
+        { 6, 7, 8 }, { 6, 8, 9 }, { 6, 9, 5 },   // the y = 10 cap
+        { 0, 5, 6 }, { 0, 6, 1 },                // the sloped underside
+        { 1, 6, 7 }, { 1, 7, 2 },                // the shelf
+        { 2, 7, 8 }, { 2, 8, 3 },                // the wall at x = 25
+        { 3, 8, 9 }, { 3, 9, 4 },                // the top
+        { 4, 9, 5 }, { 4, 5, 0 },                // the wall at x = 0
+    };
+    return TriangleMesh(vertices, indices);
+}
+
+// Lowest Z at which the mesh has material above `z` at (x, y), i.e. the surface an air gap under a support
+// point at that Z has to be measured against. Nothing when the point is outside the object's projection.
+std::optional<double> face_above(const TriangleMesh &mesh, const double x, const double y, const double z)
+{
+    auto cross = [](double ax, double ay, double bx, double by) { return ax * by - ay * bx; };
+    std::optional<double> face;
+    for (const Vec3i32 &triangle : mesh.its.indices) {
+        const Vec3f &a = mesh.its.vertices[triangle[0]];
+        const Vec3f &b = mesh.its.vertices[triangle[1]];
+        const Vec3f &c = mesh.its.vertices[triangle[2]];
+        const double det = cross(double(b.x()) - a.x(), double(b.y()) - a.y(),
+                                 double(c.x()) - a.x(), double(c.y()) - a.y());
+        if (std::abs(det) < 1e-12)
+            continue;
+        // Barycentrics of (x, y) in the XY projection of the facet; Z is affine over it.
+        const double wa = cross(double(b.x()) - x, double(b.y()) - y, double(c.x()) - x, double(c.y()) - y) / det;
+        const double wb = cross(double(c.x()) - x, double(c.y()) - y, double(a.x()) - x, double(a.y()) - y) / det;
+        const double wc = 1. - wa - wb;
+        if (wa < -1e-9 || wb < -1e-9 || wc < -1e-9)
+            continue;
+        const double facet_z = wa * double(a.z()) + wb * double(b.z()) + wc * double(c.z());
+        if (facet_z > z && (! face || facet_z < *face))
+            face = facet_z;
+    }
+    return face;
 }
 
 } // namespace
@@ -788,6 +842,12 @@ TEST_CASE("An organic top gap keeps every support layer on the object's own laye
 // The zero the tests below assert is only meaningful if the capture reads the stream the generator
 // writes and the counters match its format, so both are checked against the function that emits the
 // record instead of against a string this test made up.
+//
+// What the count covers is exactly this one function: every support diagnostic goes through
+// tree_supports_show_error(), which prints "Error: <message>, critical: <0|1>" to stdout. Diagnostics the
+// generator writes through BOOST_LOG_TRIVIAL instead - the "detect_overhangs takes more than 30 secs"
+// warning and the informational progress lines - are not part of the count and are not asserted on, so a
+// zero here says nothing about them.
 TEST_CASE("The support diagnostic count sees what the generator prints", "[TreeSupport]")
 {
     ScopedStdoutCapture capture;
@@ -1015,12 +1075,11 @@ TEST_CASE("The overhang face is searched in the slab of the layer below the area
     CHECK_FALSE(overhang_face_z(mesh, facets, area, grid.bottom_z(40), grid.z(40)).has_value());
 }
 
-// A sloped face can cross the whole search slab while its lowest vertex lies below it. Indexing the
-// facets by their lowest vertex alone dropped such a facet, and the placement then measured the gap from
-// the top of the layer below the area's - a Z the face is not on - which closed the gap to 0.32 mm
-// against a requested 0.4. The reference has to be bounded by the slab that was searched instead: for a
-// facet that only reaches into the slab from below, the bottom of this slab is the lowest Z the face can
-// have, so a contact placed against it can only widen the gap.
+// A sloped face can cross the whole search window while its lowest vertex lies below it. Such a facet is
+// a candidate - its Z range overlaps the window - and what it contributes is the window bottom, the lowest
+// Z its face inside the window can have: measuring the gap from the top of the layer below the area's
+// instead closed it to 0.32 mm against a requested 0.4. The case that a *higher* face of the same area
+// could stand in for the slope is the next test's.
 TEST_CASE("A sloped overhang face below the search window still keeps the requested gap", "[TreeSupportOrganicGap]")
 {
     using namespace Slic3r::TreeSupport3D;
@@ -1188,5 +1247,353 @@ TEST_CASE("A thicker first layer keeps the organic layer counts", "[TreeSupportO
                 object_layer = candidate;
         REQUIRE(object_layer != nullptr);
         CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
+    }
+}
+
+// One overhang area can hold two downward faces at different heights: a slope whose lowest vertex sits
+// below the window the layer searches, and a higher face of the very same area whose vertex sits inside
+// it. Indexing the facets by their lowest vertex alone dropped the slope and kept the higher face, so the
+// contact was placed from a face that is not the lowest one over the area - 0.23 mm of air under the
+// slope where 0.4 was asked for. The candidates are now the facets whose Z range *overlaps* the window,
+// so the lower face wins.
+TEST_CASE("A higher face of the same overhang area does not lift the contact above the slope crossing the window",
+          "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+
+    // The slope reaches from 15.0 at y = 10 up to 16.2 at the origin, and over the area (0, 0) .. (2, 2)
+    // its face drops to 16.2 - 0.02 * 2 - 0.12 * 2 = 15.92. The two triangles at 16.1 are a down facing
+    // shelf over the same XY, well above the relevant part of the slope.
+    const TriangleMesh mesh(
+        std::vector<Vec3f>{ { 0.f, 0.f, 16.2f }, { 0.f, 10.f, 15.0f }, { 10.f, 0.f, 16.f },
+                            { 0.f, 0.f, 16.1f }, { 0.f, 2.f, 16.1f }, { 2.f, 2.f, 16.1f },
+                            { 0.f, 0.f, 16.1f }, { 2.f, 2.f, 16.1f }, { 2.f, 0.f, 16.1f } },
+        std::vector<Vec3i32>{ { 0, 1, 2 }, { 3, 4, 5 }, { 6, 7, 8 } });
+
+    // 0.4 mm layers: layer 40 tops out at 16.4 and starts at 16.0, so the window it searches is
+    // [15.6, 16.4] and the slope's own lowest vertex at 15.0 lies below it.
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (int i = 0; i < 50; ++ i) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z      = bottom;
+        entry.obj_bottom_z  = bottom;
+        entry.print_z       = bottom + 0.4;
+        entry.height        = 0.4;
+        entry.obj_layer_idx = LayerIndex(i);
+        bottom              = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+    const double window_lo = grid.bottom_z(39);
+    REQUIRE_THAT(window_lo, Catch::Matchers::WithinAbs(15.6, 1e-9));
+    // The premise of the case: the slope's lowest vertex is outside the window, the shelf's is inside it.
+    REQUIRE(15.0 < window_lo);
+    REQUIRE(16.1 > window_lo);
+
+    OverhangFacetZIndex facets;
+    facets.build(mesh);
+    const Polygons area{ Polygon{ { Point::new_scale(0., 0.), Point::new_scale(2., 0.),
+                                   Point::new_scale(2., 2.), Point::new_scale(0., 2.) } } };
+    const double   slope_face_over_area = 16.2 - 0.02 * 2. - 0.12 * 2.;
+
+    const std::vector<TreeSupportLayerGrid::Entry> before = grid.entries;
+    constexpr double                               requested = 0.4;
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0., requested);
+    REQUIRE(contact.face_z.has_value());
+    INFO("reference " << *contact.face_z << " slope face over the area " << slope_face_over_area
+                      << " contact " << grid.z(contact.contact_layer));
+
+    // The reference is no higher than the face the slope holds over the area, and it is not the shelf's
+    // 16.1: taking that one is what puts the contact a layer too high.
+    CHECK(*contact.face_z <= slope_face_over_area + 1e-6);
+    CHECK(*contact.face_z < 16.1 - 1e-6);
+    // The contact is one of the grid's own layers, at that layer's height.
+    REQUIRE(contact.contact_layer >= 1);
+    REQUIRE(grid_entry_at(grid, grid.z(contact.contact_layer)) != nullptr);
+    CHECK_THAT(grid.z(contact.contact_layer) - grid.bottom_z(contact.contact_layer),
+               Catch::Matchers::WithinAbs(0.4, 1e-12));
+    // The air gap under the slope is at least the requested distance - the candidate rule this replaced
+    // put the contact at 15.6 and left 0.32 mm under it.
+    CHECK(slope_face_over_area - grid.z(contact.contact_layer) >= requested - 1e-9);
+    // No gap remainder became a Z or a layer height anywhere in the grid.
+    REQUIRE(grid.entries.size() == before.size());
+    for (size_t i = 0; i < before.size(); ++ i) {
+        INFO("grid layer " << i);
+        CHECK_THAT(grid.entries[i].print_z, Catch::Matchers::WithinAbs(before[i].print_z, 1e-12));
+        CHECK_THAT(grid.entries[i].bottom_z, Catch::Matchers::WithinAbs(before[i].bottom_z, 1e-12));
+        CHECK_THAT(grid.entries[i].height, Catch::Matchers::WithinAbs(before[i].height, 1e-12));
+    }
+}
+
+// The same property on a real model and through the real pipeline: a prism whose underside is a shallow
+// slope (5.7 degrees below horizontal) that runs into a horizontal shelf 0.35 mm above where the slope
+// leaves the layer below. With 0.4 mm layers the overhang area of one layer covers both faces - the
+// slope's portion and the whole shelf - so the contact must be placed from the slope, not from the shelf.
+//
+// The numbers are derived from the settings, not measured: the layer below is expanded by
+// layer_height / tan(31 deg) = 0.666 before the slices are differenced, so the area of the layer whose
+// slice is at 3.4 starts at x = 10 + 0.666, where the slope (z = 2 + 0.1 * x) is at 3.067; the shelf is at
+// 3.35. A 0.4 mm gap under the slope asks for a top at or below 2.667, i.e. layer top 2.4, while measuring
+// from the shelf asks for 2.95, i.e. layer top 2.8 - which leaves 0.267 mm under the slope.
+TEST_CASE("A shallow slope sharing its overhang area with a shelf keeps the requested top gap", "[TreeSupportOrganicGap]")
+{
+    const TriangleMesh mesh = sloped_shelf_mesh();
+    constexpr double   gap  = 0.4;
+
+    Slic3r::Model         model;
+    Slic3r::ModelObject  *object = model.add_object();
+    object->name = "sloped_shelf.stl";
+    object->add_volume(mesh);
+    // No instance offset: the Zs this test asserts are the mesh's own.
+    object->add_instance();
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "enable_support",               1 },
+        { "support_type",                 "tree(auto)" },
+        { "support_style",                "organic" },
+        { "support_threshold_angle",      30 },
+        { "support_top_z_distance",       gap },
+        { "support_interface_top_layers", 2 },
+        { "layer_height",                 0.4 },
+        { "initial_layer_print_height",   0.4 },
+        // A 0.4 mm layer has to be thinner than every extrusion width, as validate() points out, so the
+        // print runs a 0.6 mm nozzle instead of the default one.
+        { "nozzle_diameter",              "0.6" },
+        // Relative extruder addressing needs a reset at each layer, as validate() points out.
+        { "before_layer_change_gcode",    "G92 E0" },
+    });
+    Slic3r::Print print;
+    print.apply(model, config);
+    const std::string validation = print.validate().string;
+    INFO("validate: " << validation);
+    REQUIRE(validation.empty());
+    print.process();
+
+    const PrintObject &po = *print.objects().front();
+    // The top contact of the highest overhang is the highest support layer that carries fill.
+    const SupportLayer *contact = nullptr;
+    for (const SupportLayer *layer : po.support_layers()) {
+        Points points;
+        layer->support_fills.collect_points(points);
+        if (! points.empty() && (contact == nullptr || layer->print_z > contact->print_z))
+            contact = layer;
+    }
+    REQUIRE(contact != nullptr);
+    INFO("contact print_z " << contact->print_z << " height " << contact->height);
+
+    // The contact is one of the object's own layers, never a Z of its own and never a gap remainder.
+    CHECK_THAT(contact->print_z - 0.4,
+               Catch::Matchers::WithinAbs(std::round((contact->print_z - 0.4) / 0.4) * 0.4, 1e-9));
+    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(0.4, 1e-9));
+
+    // The reference the contact was placed from: the slope at the lower edge of the area, derived above.
+    const double area_edge_x        = 10. + 0.4 / std::tan(M_PI * 31. / 180.);
+    const double slope_face_at_edge = 2. + 0.1 * area_edge_x;
+    INFO("slope face at the area edge " << slope_face_at_edge);
+    CHECK(contact->print_z <= slope_face_at_edge - gap + 1e-6);
+
+    // ... and the same statement per support point, measured against the mesh itself: no point of the
+    // contact may be closer to the surface above it than the requested gap. The slices live in the print
+    // frame, which is the mesh frame moved onto the bed, so the shift between the two is taken from the
+    // slices of a layer that spans the whole footprint instead of being assumed.
+    const BoundingBox  slices_bb  = get_extents(po.get_layer(8)->lslices);
+    const BoundingBoxf3 mesh_bb   = mesh.bounding_box();
+    const double       shift_x    = unscaled(slices_bb.min.x()) - double(mesh_bb.min.x());
+    const double       shift_y    = unscaled(slices_bb.min.y()) - double(mesh_bb.min.y());
+    INFO("print frame shift " << shift_x << ", " << shift_y);
+    Points points;
+    contact->support_fills.collect_points(points);
+    REQUIRE(! points.empty());
+    size_t                checked = 0;
+    std::optional<double> lowest_face;
+    for (const Point &p : points) {
+        const double                x    = unscaled(p.x()) - shift_x;
+        const double                y    = unscaled(p.y()) - shift_y;
+        const std::optional<double> face = face_above(mesh, x, y, contact->print_z + 1e-6);
+        if (! face)
+            continue;
+        ++ checked;
+        if (! lowest_face || *face < *lowest_face)
+            lowest_face = *face;
+        INFO("support point " << x << ", " << y << " at " << contact->print_z << " under " << *face);
+        CHECK(*face - contact->print_z >= gap - 1e-9);
+    }
+    // The loop has to have looked at points under the slope, not only under the shelf, or the assertion
+    // above says nothing about this case.
+    REQUIRE(checked > 10);
+    REQUIRE(lowest_face.has_value());
+    INFO("lowest face above the contact " << *lowest_face);
+    CHECK(*lowest_face < 3.35 - 1e-6);
+}
+
+// An overhang area with no down facing facet behind it - a support enforcer adds areas that no mesh face
+// backs - has no face to measure from. The fallback is the bottom of the window that was searched, which
+// keeps the gap a lower bound, and it must not move the layer's material start.
+TEST_CASE("An overhang area with no face behind it falls back to the searched window's bottom", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (int i = 0; i < 50; ++ i) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z      = bottom;
+        entry.obj_bottom_z  = bottom;
+        entry.print_z       = bottom + 0.4;
+        entry.height        = 0.4;
+        entry.obj_layer_idx = LayerIndex(i);
+        bottom              = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+
+    // One up facing facet over the area: no down facing face anywhere, so the search finds nothing even
+    // though the facet's Z range overlaps the window.
+    const TriangleMesh  mesh(std::vector<Vec3f>{ { 0.f, 0.f, 16.2f }, { 10.f, 0.f, 16.2f }, { 0.f, 10.f, 16.2f } },
+                             std::vector<Vec3i32>{ { 0, 1, 2 } });
+    OverhangFacetZIndex facets;
+    facets.build(mesh);
+    const Polygons area{ Polygon{ { Point::new_scale(0., 0.), Point::new_scale(2., 0.),
+                                   Point::new_scale(2., 2.), Point::new_scale(0., 2.) } } };
+
+    constexpr double     requested = 0.4;
+    const OverhangContact contact  = place_overhang_contact(grid, 40, mesh, facets, area, 0., requested);
+    CHECK_FALSE(contact.face_z.has_value());
+    // 15.6 - 0.4 asks for a top at or below 15.2, which is layer 37.
+    CHECK(contact.contact_layer == 37);
+    CHECK_THAT(grid.z(contact.contact_layer), Catch::Matchers::WithinAbs(15.2, 1e-9));
+    // The material over that area starts at the facet above it, so the gap stays a lower bound ...
+    const double material_start = 16.2;
+    CHECK(material_start - grid.z(contact.contact_layer) >= requested - 1e-9);
+    // ... and without a face the layer's material start is left at its bottom.
+    CHECK_THAT(grid.obj_bottom_z(40), Catch::Matchers::WithinAbs(16.0, 1e-12));
+    // No layer height was touched.
+    for (size_t i = 0; i < grid.entries.size(); ++ i) {
+        INFO("grid layer " << i);
+        CHECK_THAT(grid.entries[i].height, Catch::Matchers::WithinAbs(0.4, 1e-12));
+    }
+}
+
+// The contact is the highest layer whose top keeps the whole gap, so the tolerance of that comparison may
+// only cover the round-off of the Zs themselves. The geometric EPSILON used to be applied there, which let
+// a contact sit 1e-4 mm too high; the other half of the test is that a layer top that *is* the requested Z
+// up to round-off is still taken, so the tolerance cannot be dropped either.
+TEST_CASE("The top contact comparison only tolerates round-off, never a shorter gap", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+
+    auto grid_with_heights = [](const std::vector<double> &heights) {
+        TreeSupportLayerGrid grid;
+        double               bottom = 0.;
+        for (const double height : heights) {
+            TreeSupportLayerGrid::Entry entry;
+            entry.bottom_z     = bottom;
+            entry.obj_bottom_z = bottom;
+            entry.print_z      = bottom + height;
+            entry.height       = height;
+            bottom             = entry.print_z;
+            grid.entries.emplace_back(entry);
+        }
+        return grid;
+    };
+
+    SECTION("A layer top that is the requested Z up to round-off is taken") {
+        // A top one ULP above the requested Z is that Z: refusing it would drop the contact a whole layer
+        // for no reason, and the double round-off of a sum of layer heights is that order of magnitude.
+        std::vector<double> tops { 0.2, 0.4, 0.6, std::nextafter(0.8, 1.0), 1.0 };
+        TreeSupportLayerGrid grid;
+        double               bottom = 0.;
+        for (const double top : tops) {
+            TreeSupportLayerGrid::Entry entry;
+            entry.bottom_z     = bottom;
+            entry.obj_bottom_z = bottom;
+            entry.print_z      = top;
+            entry.height       = top - bottom;
+            bottom             = top;
+            grid.entries.emplace_back(entry);
+        }
+        REQUIRE(grid.z(3) > 0.8);
+        REQUIRE(grid.z(3) - 0.8 < 1e-12);
+        CHECK(grid.place_top_contact(1.0, 0.2) == 3);
+        CHECK(1.0 - grid.z(3) >= 0.2 - 1e-9);
+    }
+
+    SECTION("A layer top that is a ten-thousandth too high is refused") {
+        // Tops 0.2, 0.4, 0.6, 0.80005, 1.0. A face at 1.0 with a 0.2 gap asks for a top at or below 0.8:
+        // taking 0.80005 would leave 0.19995 mm of air, which is what the geometric EPSILON allowed.
+        TreeSupportLayerGrid grid = grid_with_heights({ 0.2, 0.2, 0.2, 0.20005, 0.19995 });
+        REQUIRE_THAT(grid.z(3), Catch::Matchers::WithinAbs(0.80005, 1e-9));
+        CHECK(grid.place_top_contact(1.0, 0.2) == 2);
+        CHECK(1.0 - grid.z(2) >= 0.2 - 1e-9);
+        // A face one ten-thousandth higher does land on it, and then the gap is exactly the requested one.
+        CHECK(grid.place_top_contact(1.00005, 0.2) == 3);
+        CHECK_THAT(1.00005 - grid.z(3), Catch::Matchers::WithinAbs(0.2, 1e-9));
+    }
+}
+
+// A raft layer is thicker so it can be peeled off and a thicker first layer is a first layer setting;
+// neither says how the object stacks, which is why the layer *counts* stay the historical scalars on such
+// a print. The per-layer growth has to stay the scalar with them: deriving it from the raft's 0.3 mm or the
+// first layer's 0.32 mm would move the branches while the counts that sized them still assume nominal
+// layers.
+TEST_CASE("A raft and a thicker first layer keep the per-layer growth at its nominal value", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    const TriangleMesh mesh = two_tier_mesh();
+
+    const bool   with_raft   = GENERATE(false, true);
+    const double first_layer = GENERATE(0.2, 0.32);
+    INFO("raft " << with_raft << ", first layer height " << first_layer);
+
+    auto slice = [&mesh](Slic3r::Print &print, int raft_layers, double first_layer_height) {
+        slice_with_tree_support(mesh, print, "organic", 30, 0, raft_layers, {
+            { "initial_layer_print_height",   first_layer_height },
+            { "support_top_z_distance",       0.2 },
+            { "support_interface_top_layers", 2 },
+        });
+    };
+
+    Slic3r::Print print;
+    Slic3r::Print uniform;
+    slice(print, with_raft ? 2 : 0, first_layer);
+    slice(uniform, 0, 0.2);
+
+    const PrintObject &po = *print.objects().front();
+    TreeSupportMeshGroupSettings ms(po);
+    TreeSupportMeshGroupSettings ms_uniform(*uniform.objects().front());
+    TreeSupportSettings          config(ms, po.slicing_parameters());
+    TreeSupportSettings          config_uniform(ms_uniform, uniform.objects().front()->slicing_parameters());
+
+    if (with_raft)
+        REQUIRE(config.layer_grid.raft_layers > 0);
+    else
+        REQUIRE(config.layer_grid.raft_layers == 0);
+    // The case is really exercised: the grid holds layers thicker than the nominal 0.2 mm - the raft's own
+    // layers and/or the first object layer.
+    size_t thicker = 0;
+    for (const TreeSupportLayerGrid::Entry &entry : config.layer_grid.entries)
+        if (entry.height > 0.2 + 1e-9)
+            ++ thicker;
+    if (with_raft || first_layer > 0.2)
+        // Everything but the plain 0.2 mm profile has a layer thicker than nominal ...
+        REQUIRE(thicker > 0);
+    else
+        // ... and the plain one has none, which is the baseline the other cases are compared against.
+        REQUIRE(thicker == 0);
+    if (! with_raft && first_layer > 0.2)
+        // No raft: the only thicker layer is the object's first one.
+        CHECK(thicker == 1);
+    // ... and the counts are the historical scalars anyway.
+    check_counts_unchanged(config, config_uniform);
+
+    // Every layer therefore reports the nominal growth, the raft layers and the first one included.
+    for (size_t i = 0; i < config.layer_grid.size(); ++ i) {
+        const LayerIndex layer_idx = LayerIndex(i);
+        INFO("layer " << i << " height " << config.layer_grid.h(layer_idx));
+        CHECK(config.maximum_move_distance_at(layer_idx) == config.maximum_move_distance);
+        CHECK(config.maximum_move_distance_slow_at(layer_idx) == config.maximum_move_distance_slow);
+        CHECK_THAT(config.branch_radius_increase_at(layer_idx),
+                   Catch::Matchers::WithinAbs(config.branch_radius_increase_per_layer, 1e-6));
+        CHECK_THAT(config.bp_radius_increase_at(layer_idx),
+                   Catch::Matchers::WithinAbs(config.bp_radius_increase_per_layer, 1e-6));
     }
 }
