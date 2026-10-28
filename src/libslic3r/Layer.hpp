@@ -158,6 +158,11 @@ public:
     coordf_t            print_z;       // Z used for printing in unscaled coordinates
     coordf_t            height;        // layer height in unscaled coordinates
     coordf_t            bottom_z() const { return this->print_z - this->height; }
+    // True if Z anti-aliasing (ZAA) slices this layer at zaa_min_z above its bottom instead of at
+    // its mid height, i.e. this is one of the layers ZAA resamples (see compute_slice_z()). Raft
+    // and support layers are never such a layer, and neither is the first object layer, which ZAA
+    // keeps sampling at its mid height.
+    bool                zaa_sampling_layer() const { return m_zaa_sampling_layer; }
 
     //Extrusions estimated to be seriously malformed, estimated during "Estimating curled extrusions" step. These lines should be avoided during fast travels.
     CurledLines         curled_lines;
@@ -217,6 +222,10 @@ public:
     // Phony version of make_fills() without parameters for Perl integration only.
     void                    make_fills() { this->make_fills(nullptr); }
     void                    make_fills(const FillAdaptive::RegionOctrees* fill_octrees, FillLightning::Generator* lightning_generator = nullptr);
+    // Whether the infill of region `region_config` shall keep one direction on this layer instead
+    // of alternating with the layer id. The region's zaa_dont_alternate_fill_direction only applies
+    // to the layers ZAA resamples: on every other layer the infill alternates as before.
+    bool                    suppress_infill_alternation(const PrintRegionConfig &region_config) const;
     Polylines               generate_sparse_infill_polylines_for_anchoring(const FillAdaptive::RegionOctrees *fill_octrees,
                                                                            FillLightning::Generator* lightning_generator) const;
     void 					make_ironing();
@@ -283,10 +292,10 @@ protected:
     friend std::vector<Layer*> new_layers(PrintObject*, const std::vector<coordf_t>&);
     friend std::string fix_slicing_errors(PrintObject* object, LayerPtrs&, const std::function<void()>&, int &);
 
-    Layer(size_t id, PrintObject *object, coordf_t height, coordf_t print_z, coordf_t slice_z) :
+    Layer(size_t id, PrintObject *object, coordf_t height, coordf_t print_z, coordf_t slice_z, bool zaa_sampling_layer = false) :
         upper_layer(nullptr), lower_layer(nullptr), slicing_errors(false),
         slice_z(slice_z), print_z(print_z), height(height),
-        m_id(id), m_object(object) {}
+        m_id(id), m_object(object), m_zaa_sampling_layer(zaa_sampling_layer) {}
     virtual ~Layer();
 
 //BBS: method to simplify support path
@@ -300,6 +309,8 @@ private:
     size_t              m_id;
     PrintObject        *m_object;
     LayerRegionPtrs     m_regions;
+    // See zaa_sampling_layer().
+    bool                m_zaa_sampling_layer;
 };
 
 enum SupportInnerType {
