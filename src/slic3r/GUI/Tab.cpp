@@ -7852,9 +7852,16 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
         if (m_type == presets->type()) // save changes for the current preset from this tab
         {
             // revert unselected options to the old values
+            DynamicPrintConfig config_before_revert = presets->get_edited_preset().config;
             presets->get_edited_preset().config.apply_only(presets->get_selected_preset().config, unselected_options);
             //BBS: add project embedded preset relate logic
-            save_preset(name, false, save_to_project);
+            // A cancelled save (no name, unresolved-plugin warning, temperature check) must leave the
+            // edited preset and the pending switch untouched. UnsavedChangesDialog::save already ran
+            // the plugin warning for the selected presets, so do not ask again.
+            if (!save_preset(name, false, save_to_project, false, "", true)) {
+                presets->get_edited_preset().config = std::move(config_before_revert);
+                return false;
+            }
             //save_preset(name);
         }
         else
@@ -8331,11 +8338,19 @@ void Tab::transfer_options(const std::string &name_from, const std::string &name
 // Wizard calls save_preset with a name "My Settings", otherwise no name is provided and this method
 // opens a Slic3r::GUI::SavePresetDialog dialog.
 //BBS: add project embedded preset relate logic
-void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_project, bool from_input, std::string input_name )
+bool Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_project, bool from_input, std::string input_name, bool plugin_warning_confirmed )
 {
     // ORCA: Validate before opening any save-name UI for filament presets.
     if (!validate_filament_temperature_pairs())
-        return;
+        return false;
+
+    // A plugin-backed setting whose plugin is unavailable here loses its "name;uuid;capability"
+    // reference when the preset is written. Ask before any save-name UI: accepting that dialog can
+    // already delete an overwritten preset, so a Cancel here must happen before it. A caller that
+    // came through UnsavedChangesDialog (which already warned for the selected presets) skips it.
+    if (!plugin_warning_confirmed &&
+        !confirm_save_with_unresolved_plugins(parent(), m_presets->get_edited_preset().config, SaveSubject::Preset))
+        return false;
 
     // since buttons(and choices too) don't get focus on Mac, we set focus manually
     // to the treectrl so that the EVT_* events are fired for the input field having
@@ -8356,7 +8371,7 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
         SavePresetDialog dlg(m_parent, m_type, m_mode, detach ? _u8L("Detached") : "");
         if (!m_just_edit) {
             if (dlg.ShowModal() != wxID_OK)
-                return;
+                return false;
         }
         name = dlg.get_name();
         //BBS: add project embedded preset relate logic
@@ -8385,6 +8400,7 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
         if (nullptr != _curr_printer && compatible_printers && compatible_printers->values.empty())
             compatible_printers->values.push_back(_curr_printer->name);
     }
+
     // Save the preset into Slic3r::data_dir / presets / section_name / preset_name.json
     m_presets->save_current_preset(name, detach, save_to_project, nullptr);
 
@@ -8393,7 +8409,7 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     //Preset* preset = &m_presets.preset(it - m_presets.begin(), true);
     if (!new_preset) {
         BOOST_LOG_TRIVIAL(info) << "create new preset failed";
-        return;
+        return false;
     }
 
     // set sync_info for sync service
@@ -8470,6 +8486,8 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     DiffPresetDialog* diff_dialog = DiffPresetDialog::if_built();
     if (diff_dialog != nullptr && diff_dialog->IsShown())
         diff_dialog->update_presets(m_type);
+
+    return true;
 }
 
 // Called for a currently selected preset.
