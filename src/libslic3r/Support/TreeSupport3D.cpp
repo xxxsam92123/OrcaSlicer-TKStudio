@@ -47,7 +47,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -384,49 +383,44 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 // The search runs once per overhang area, so the facet Z minima are collected once per mesh instead of
 // being recomputed - together with a full walk over the triangles - for every area (review round 4,
 // issue 3). Only the facets whose lowest vertex lies inside the window are visited at all.
-struct OverhangFacetZIndex
+void OverhangFacetZIndex::build(const TriangleMesh &mesh)
 {
-    std::vector<double> z_min; // lowest vertex Z of each facet, in mesh order
-    std::vector<size_t> by_z;  // facet indices, ascending z_min, ties in mesh order
-
-    void build(const indexed_triangle_set &its)
-    {
-        z_min.clear();
-        z_min.reserve(its.indices.size());
-        for (const stl_triangle_vertex_indices &triangle : its.indices) {
-            const Vec3f &a = its.vertices[triangle[0]];
-            const Vec3f &b = its.vertices[triangle[1]];
-            const Vec3f &c = its.vertices[triangle[2]];
-            z_min.emplace_back(std::min({ double(a.z()), double(b.z()), double(c.z()) }));
-        }
-        by_z.resize(z_min.size());
-        for (size_t i = 0; i < by_z.size(); ++ i)
-            by_z[i] = i;
-        std::stable_sort(by_z.begin(), by_z.end(), [this](size_t l, size_t r) { return z_min[l] < z_min[r]; });
+    const indexed_triangle_set &its = mesh.its;
+    z_min.clear();
+    z_min.reserve(its.indices.size());
+    for (const stl_triangle_vertex_indices &triangle : its.indices) {
+        const Vec3f &a = its.vertices[triangle[0]];
+        const Vec3f &b = its.vertices[triangle[1]];
+        const Vec3f &c = its.vertices[triangle[2]];
+        z_min.emplace_back(std::min({ double(a.z()), double(b.z()), double(c.z()) }));
     }
+    by_z.resize(z_min.size());
+    for (size_t i = 0; i < by_z.size(); ++ i)
+        by_z[i] = i;
+    std::stable_sort(by_z.begin(), by_z.end(), [this](size_t l, size_t r) { return z_min[l] < z_min[r]; });
+}
 
-    // Facets whose lowest vertex lies in [z_lo, z_hi], in mesh order: the tie breaking between facets
-    // that sit within EPSILON of each other has to stay the one the full scan used.
-    [[nodiscard]] std::vector<size_t> window(const double z_lo, const double z_hi) const
-    {
-        const auto first = std::lower_bound(by_z.begin(), by_z.end(), z_lo - EPSILON,
-            [this](size_t facet, double z) { return z_min[facet] < z; });
-        const auto last = std::upper_bound(by_z.begin(), by_z.end(), z_hi + EPSILON,
-            [this](double z, size_t facet) { return z < z_min[facet]; });
-        std::vector<size_t> facets(first, last);
-        std::sort(facets.begin(), facets.end());
-        return facets;
-    }
-};
+// Facets whose lowest vertex lies in [z_lo, z_hi], in mesh order: the tie breaking between facets
+// that sit within EPSILON of each other has to stay the one the full scan used.
+[[nodiscard]] static std::vector<size_t> facet_window(const OverhangFacetZIndex &facet_z, const double z_lo, const double z_hi)
+{
+    const auto first = std::lower_bound(facet_z.by_z.begin(), facet_z.by_z.end(), z_lo - EPSILON,
+        [&facet_z](size_t facet, double z) { return facet_z.z_min[facet] < z; });
+    const auto last = std::upper_bound(facet_z.by_z.begin(), facet_z.by_z.end(), z_hi + EPSILON,
+        [&facet_z](double z, size_t facet) { return z < facet_z.z_min[facet]; });
+    std::vector<size_t> facets(first, last);
+    std::sort(facets.begin(), facets.end());
+    return facets;
+}
 
-[[nodiscard]] static std::optional<double> overhang_face_z(const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
-                                                           const Polygons &area, const double z_lo, const double z_hi)
+[[nodiscard]] std::optional<double> overhang_face_z(const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
+                                                    const Polygons &area, const double z_lo, const double z_hi)
 {
     if (area.empty() || facet_z.z_min.empty())
         return std::nullopt;
     std::optional<double> face_z;
     const indexed_triangle_set &its = mesh.its;
-    for (const size_t facet : facet_z.window(z_lo, z_hi)) {
+    for (const size_t facet : facet_window(facet_z, z_lo, z_hi)) {
         const stl_triangle_vertex_indices &triangle = its.indices[facet];
         const double                      z_min     = facet_z.z_min[facet];
         if (face_z && z_min > *face_z - EPSILON)
@@ -448,18 +442,38 @@ struct OverhangFacetZIndex
     return face_z;
 }
 
+OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIndex layer_idx, const TriangleMesh &mesh,
+                                        const OverhangFacetZIndex &facet_z, const Polygons &area, const double z_offset,
+                                        const double top_z_distance)
+{
+    // A layer's slices are taken at its own mid-plane, so material that first appears in layer
+    // `layer_idx` starts somewhere between the bottom of the layer below and that mid-plane: the face
+    // behind the area lies in the slab of the layer *below*. The window therefore starts at that layer's
+    // bottom and ends at this layer's top, and a face exactly on either boundary counts - closing it is
+    // what makes the uniform grid hit the face of a plate that starts exactly on a layer boundary. A face
+    // further down is a different overhang and would drop the contact by a whole layer for no reason,
+    // while narrowing the window to the area's own slab loses the face completely once a layer is thick
+    // enough to hold both the face and the material above it - the gap is then measured from a layer
+    // bottom that is not the face.
+    const std::optional<double> face_z = overhang_face_z(mesh, facet_z, area,
+        grid.bottom_z(layer_idx - 1) + z_offset, grid.z(layer_idx) + z_offset);
+    // Highest whole layer that keeps at least `top_z_distance` of air under the face; see
+    // TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft.
+    const LayerIndex contact_layer =
+        grid.place_top_contact(face_z ? *face_z - z_offset : grid.bottom_z(layer_idx), top_z_distance);
+    // The contact layer's clearance is measured against the face, not against this layer's bottom,
+    // which sits below it on a variable layer height.
+    if (face_z)
+        grid.set_obj_bottom_z(layer_idx, *face_z - z_offset);
+    return { contact_layer, face_z };
+}
+
 /*!
  * \brief Precalculates all avoidances, that could be required.
  *
  * \param storage[in] Background storage to access meshes.
  * \param currently_processing_meshes[in] Indexes of all meshes that are processed in this iteration
  */
-// Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`: see
-// TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft layers.
-[[nodiscard]] static LayerIndex place_top_contact(TreeSupportLayerGrid &grid, const double overhang_bottom_z, const double top_z_distance)
-{
-    return grid.place_top_contact(overhang_bottom_z, top_z_distance);
-}
 
 [[nodiscard]] static LayerIndex precalculate(const std::vector<LayerIndex> &overhang_top_layer, const PrintObject &print_object, TreeModelVolumes &volumes, std::function<void()> throw_on_cancel)
 {
@@ -1801,7 +1815,9 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
             while (current_ceil_radius < target_radius && validWithRadius(volumes.getRadiusNextCeil(current_ceil_radius + 1, settings.use_min_distance)))
                 current_ceil_radius = volumes.getRadiusNextCeil(current_ceil_radius + 1, settings.use_min_distance);
             size_t resulting_eff_dtt = current_elem.effective_radius_height;
-            const LayerIndex tip_layer = current_elem.layer_idx - LayerIndex(current_elem.distance_to_top);
+            // The tip sits `distance_to_top` layers above the element: the radius a larger effective
+            // distance asks for is integrated between this layer and that tip.
+            const LayerIndex tip_layer = current_elem.layer_idx + LayerIndex(current_elem.distance_to_top);
             while (resulting_eff_dtt + 1 < current_elem.distance_to_top &&
                 config.getRadius_at(tip_layer, resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= current_ceil_radius &&
                 config.getRadius_at(tip_layer, resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= support_element_radius(config, current_elem))
@@ -1810,7 +1826,7 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
         }
         radius = support_element_collision_radius(config, current_elem);
 
-        const LayerIndex current_tip = current_elem.layer_idx - LayerIndex(current_elem.distance_to_top);
+        const LayerIndex current_tip = current_elem.layer_idx + LayerIndex(current_elem.distance_to_top);
         const coord_t foot_radius_increase = std::max(config.bp_radius_increase_at(current_elem.layer_idx) - config.branch_radius_increase_at(current_elem.layer_idx), 0.0);
         // Is nearly all of the time 1, but sometimes an increase of 1 could cause the radius to become bigger than recommendedMinRadius,
         // which could cause the radius to become bigger than precalculated.
@@ -1928,8 +1944,8 @@ static void increase_areas_one_layer(
             const coord_t            max_move       = config.maximum_move_distance_at(layer_idx);
             const coord_t            max_move_slow  = config.maximum_move_distance_slow_at(layer_idx);
             const double             bp_increase    = config.bp_radius_increase_at(layer_idx);
-            // Layer the branch tip of `elem` sits on: support layer index minus the layers it grew over.
-            const LayerIndex         elem_tip       = elem.layer_idx - LayerIndex(elem.distance_to_top);
+            // Layer the branch tip of `elem` sits on: `distance_to_top` layers above the element.
+            const LayerIndex         elem_tip       = elem.layer_idx + LayerIndex(elem.distance_to_top);
             const Polygons          &wall_restriction =
                 // Abstract representation of the model outline. If an influence area would move through it, it could teleport through a wall.
                 volumes.getWallRestriction(support_element_collision_radius(config, parent.state), layer_idx, parent.state.use_min_xy_dist);
@@ -1946,7 +1962,7 @@ static void increase_areas_one_layer(
             coord_t extra_speed = 5; // The extra speed is added to both movement distances. Also move 5 microns faster than allowed to avoid rounding errors, this may cause issues at VERY VERY small layer heights.
             coord_t extra_slow_speed = 0; // Only added to the slow movement distance.
             const coord_t ceiled_parent_radius = volumes.ceilRadius(support_element_collision_radius(config, parent.state), parent.state.use_min_xy_dist);
-            const LayerIndex parent_tip = parent.state.layer_idx - LayerIndex(parent.state.distance_to_top);
+            const LayerIndex parent_tip = parent.state.layer_idx + LayerIndex(parent.state.distance_to_top);
             coord_t projected_radius_increased = config.getRadius_at(parent_tip, parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases);
             coord_t projected_radius_delta = projected_radius_increased - support_element_collision_radius(config, parent.state);
 
@@ -3659,22 +3675,13 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
                 mesh = print_object.model_object()->raw_mesh();
                 mesh.transform(print_object.trafo_sliced());
                 // One pass over the facets for all the areas below, instead of one per area.
-                facet_index.build(mesh.its);
+                facet_index.build(mesh);
             }
             for (size_t overhang_idx = grid.raft_layers; overhang_idx < overhangs.size(); ++ overhang_idx)
-                if (! overhangs[overhang_idx].empty()) {
-                    const LayerIndex layer_idx = LayerIndex(overhang_idx);
-                    // The overhang shows up in this layer's slice; its face lies between the top of the
-                    // layer below and this layer's top.
-                    const std::optional<double> face_z = overhang_face_z(mesh, facet_index, overhangs[overhang_idx],
-                        grid.bottom_z(layer_idx - 1) + z_offset, grid.z(layer_idx) + z_offset);
-                    overhang_top_layer[overhang_idx] = place_top_contact(grid,
-                        face_z ? *face_z - z_offset : grid.bottom_z(layer_idx), top_z);
-                    // The contact layer's clearance is measured against the face, not against this
-                    // layer's bottom, which sits below it on a variable layer height.
-                    if (face_z)
-                        grid.set_obj_bottom_z(layer_idx, *face_z - z_offset);
-                }
+                if (! overhangs[overhang_idx].empty())
+                    overhang_top_layer[overhang_idx] =
+                        place_overhang_contact(grid, LayerIndex(overhang_idx), mesh, facet_index,
+                            overhangs[overhang_idx], z_offset, top_z).contact_layer;
         }
 
         // Generator for model collision, avoidance and internal guide volumes.

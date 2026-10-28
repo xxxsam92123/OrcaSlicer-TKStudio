@@ -15,15 +15,22 @@
 
 #include "test_helpers.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Support/TreeSupport3D.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <set>
 #include <string>
 #include <vector>
 #include <sstream>
+#ifdef _WIN32
+    #include <io.h>
+#else
+    #include <unistd.h>
+#endif
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -116,6 +123,96 @@ void sliced_twice_matches(const TriangleMesh &mesh, int build_plate_only, const 
     REQUIRE(first.size() > 1000); // without support the comparison below passes vacuously
     REQUIRE(second.size() == first.size());
     REQUIRE(first_difference(first, second) == first.size());
+}
+
+// The organic generator reports a branch it could not keep connected by printing to stdout, and the
+// geometry it returns is unchanged when that happens - so a test that only looks at Zs and heights stays
+// green while branches are missing. Redirect stdout for the duration of a call and assert on the text
+// afterwards instead of trusting the exit code.
+class ScopedStdoutCapture
+{
+public:
+    ScopedStdoutCapture() :
+        m_file(std::tmpfile())
+    {
+        if (m_file == nullptr)
+            FAIL("could not open a temporary file to capture the support diagnostics");
+        std::fflush(stdout);
+        m_saved = fd_dup(file_fd(stdout));
+        fd_dup2(file_fd(m_file), file_fd(stdout));
+    }
+    ~ScopedStdoutCapture() { finish(); }
+    ScopedStdoutCapture(const ScopedStdoutCapture &) = delete;
+    ScopedStdoutCapture &operator=(const ScopedStdoutCapture &) = delete;
+
+    // Ends the capture and returns everything printed to stdout in between.
+    std::string finish()
+    {
+        if (m_file == nullptr)
+            return {};
+        std::fflush(stdout);
+        fd_dup2(m_saved, file_fd(stdout));
+        fd_close(m_saved);
+        std::rewind(m_file);
+        std::string text;
+        char        buffer[4096];
+        for (size_t read; (read = std::fread(buffer, 1, sizeof(buffer), m_file)) > 0;)
+            text.append(buffer, read);
+        std::fclose(m_file);
+        m_file = nullptr;
+        return text;
+    }
+
+private:
+#ifdef _WIN32
+    static int  file_fd(std::FILE *file) { return _fileno(file); }
+    static int  fd_dup(int fd) { return _dup(fd); }
+    static int  fd_dup2(int from, int to) { return _dup2(from, to); }
+    static void fd_close(int fd) { _close(fd); }
+#else
+    static int  file_fd(std::FILE *file) { return fileno(file); }
+    static int  fd_dup(int fd) { return dup(fd); }
+    static int  fd_dup2(int from, int to) { return dup2(from, to); }
+    static void fd_close(int fd) { close(fd); }
+#endif
+
+    std::FILE *m_file  { nullptr };
+    int        m_saved { -1 };
+};
+
+size_t occurrences(const std::string &text, const std::string &needle)
+{
+    size_t count = 0;
+    for (size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + needle.size()))
+        ++ count;
+    return count;
+}
+
+// The grid entry whose top is `print_z`, or null when that Z is not a layer of the grid.
+const Slic3r::TreeSupport3D::TreeSupportLayerGrid::Entry *grid_entry_at(
+    const Slic3r::TreeSupport3D::TreeSupportLayerGrid &grid, double print_z)
+{
+    for (const Slic3r::TreeSupport3D::TreeSupportLayerGrid::Entry &entry : grid.entries)
+        if (std::abs(entry.print_z - print_z) < 1e-9)
+            return &entry;
+    return nullptr;
+}
+
+// The layer counts of two prints have to match: a raft or a thicker first layer is not a variable layer
+// height, so it may not move a single one of them.
+void check_counts_unchanged(const Slic3r::TreeSupport3D::TreeSupportSettings &config,
+                            const Slic3r::TreeSupport3D::TreeSupportSettings &reference)
+{
+    INFO("tip_layers " << config.tip_layers << " vs " << reference.tip_layers);
+    CHECK(config.tip_layers == reference.tip_layers);
+    INFO("support_bottom_layers " << config.support_bottom_layers << " vs " << reference.support_bottom_layers);
+    CHECK(config.support_bottom_layers == reference.support_bottom_layers);
+    INFO("min_dtt_to_model " << config.min_dtt_to_model << " vs " << reference.min_dtt_to_model);
+    CHECK(config.min_dtt_to_model == reference.min_dtt_to_model);
+    INFO("increase_radius_until_layer " << config.increase_radius_until_layer << " vs " << reference.increase_radius_until_layer);
+    CHECK(config.increase_radius_until_layer == reference.increase_radius_until_layer);
+    INFO("layer_start_bp_radius " << config.layer_start_bp_radius << " vs " << reference.layer_start_bp_radius);
+    CHECK(config.layer_start_bp_radius == reference.layer_start_bp_radius);
 }
 
 } // namespace
@@ -658,6 +755,9 @@ TEST_CASE("An organic top gap keeps every support layer on the object's own laye
     // or 0.23 sneaks into the legend through a support layer.
     const std::multiset<double> heights       = gcode_layer_heights(Slic3r::Test::gcode(supported));
     const std::multiset<double> heights_plain = gcode_layer_heights(Slic3r::Test::gcode(unsupported));
+    // Both sides parse the report; two empty sets would compare equal and prove nothing.
+    REQUIRE(! heights.empty());
+    REQUIRE(! heights_plain.empty());
     CHECK(heights == heights_plain);
 }
 
@@ -699,13 +799,21 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
             });
             print.apply(model, config);
             REQUIRE(print.validate().string.empty());
+            ScopedStdoutCapture capture;
             print.process();
+            return capture.finish();
         };
 
         Slic3r::Print supported;
         Slic3r::Print unsupported;
-        slice(supported, true);
+        const std::string diagnostics = slice(supported, true);
         slice(unsupported, false);
+
+        // A branch the generator had to drop is reported on stdout and leaves the geometry it returns
+        // unchanged, so the assertions below would stay green while branches are missing. On a variable
+        // layer height the generator must not have to drop one (review round 3, issue 3).
+        CHECK(occurrences(diagnostics, "Uninitialized support element") == 0);
+        CHECK(occurrences(diagnostics, "Potentially lost branch") == 0);
 
         const PrintObject &po       = *supported.objects().front();
         const PrintObject &po_plain = *unsupported.objects().front();
@@ -753,6 +861,9 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
         // no 0.14 / 0.23 to the legend.
         const std::multiset<double> heights       = gcode_layer_heights(Slic3r::Test::gcode(supported));
         const std::multiset<double> heights_plain = gcode_layer_heights(Slic3r::Test::gcode(unsupported));
+        // Both sides parse the report; two empty sets would compare equal and prove nothing.
+        REQUIRE(! heights.empty());
+        REQUIRE(! heights_plain.empty());
         CHECK(heights == heights_plain);
     }
 }
@@ -797,5 +908,169 @@ TEST_CASE("A tree_slim print keeps its own support layer heights", "[TreeSupport
         if (it == po.layers().end())
             continue;
         CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
+    }
+}
+
+
+// A layer's slices are taken at its mid-plane, so the overhang area of a layer is caused by a face that
+// lies in the slab of the layer *below* it: with 0.4 mm layers and a plate starting at 15.9, only the
+// layer 16.0 .. 16.4 sees the plate, and its face sits inside 15.6 .. 16.0. The face search therefore has
+// to reach into that layer; a window narrowed to the area's own slab finds nothing and falls back to the
+// layer bottom, which is not the face. A face further down belongs to a different overhang and must not
+// be taken (review round 3, issue 2).
+TEST_CASE("The overhang face is searched in the slab of the layer below the area's layer", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+
+    // Two shelves sharing one XY footprint: the plate whose underside at 15.9 is the face of the area,
+    // and a second shelf at 15.1, a whole layer further down, whose underside is a different overhang.
+    TriangleMesh mesh = make_cube(10.f, 10.f, 0.1f);
+    mesh.translate(0.f, 0.f, 15.1f);
+    TriangleMesh face_plate = make_cube(10.f, 10.f, 0.1f);
+    face_plate.translate(0.f, 0.f, 15.9f);
+    mesh.merge(face_plate);
+
+    // A 0.4 mm grid: layer 40 tops out at 16.4 and starts at 16.0, so the face at 15.9 lies in the slab
+    // (15.6, 16.0] of layer 39.
+    TreeSupportLayerGrid grid;
+    double               bottom = 0.;
+    for (int i = 0; i < 50; ++ i) {
+        TreeSupportLayerGrid::Entry entry;
+        entry.bottom_z      = bottom;
+        entry.obj_bottom_z  = bottom;
+        entry.print_z       = bottom + 0.4;
+        entry.height        = 0.4;
+        entry.obj_layer_idx = LayerIndex(i);
+        bottom              = entry.print_z;
+        grid.entries.emplace_back(entry);
+    }
+
+    OverhangFacetZIndex facets;
+    facets.build(mesh);
+    const Polygons area{ Polygon{ { Point::new_scale(0., 0.), Point::new_scale(10., 0.),
+                                   Point::new_scale(10., 10.), Point::new_scale(0., 10.) } } };
+
+    // The contact of the area is placed from the face inside the layer below, not from the layer bottom.
+    const OverhangContact contact = place_overhang_contact(grid, 40, mesh, facets, area, 0., 0.2);
+    REQUIRE(contact.face_z.has_value());
+    // The mesh is a float mesh, so the face carries its vertex precision.
+    CHECK_THAT(*contact.face_z, Catch::Matchers::WithinAbs(15.9, 1e-4));
+    // 15.9 - 0.2 asks for 15.7, which no layer top reaches, so the contact is layer 38 at 15.6.
+    CHECK(contact.contact_layer == 38);
+    CHECK_THAT(grid.z(contact.contact_layer), Catch::Matchers::WithinAbs(15.6, 1e-4));
+    CHECK_THAT(15.9 - grid.z(contact.contact_layer), Catch::Matchers::WithinAbs(0.3, 1e-4));
+    // The lower shelf sits below the window of the area, so it never becomes this area's face ...
+    CHECK_THAT(*overhang_face_z(mesh, facets, area, grid.bottom_z(38), grid.z(39)), Catch::Matchers::WithinAbs(15.9, 1e-4));
+    // ... while a window that starts at the area's own layer bottom does not see the real face at all.
+    CHECK_FALSE(overhang_face_z(mesh, facets, area, grid.bottom_z(40), grid.z(40)).has_value());
+}
+
+// A raft is not part of the layered object: its layers are thicker (0.3 on a 0.2 mm profile) and it is
+// not a stack the branch grows along, so letting them into the layer counts would shorten every count
+// and change the support of every existing raft print. The counts keep the fixed layer values, and the
+// support layers still sit on the grid the raft and the object layers form together.
+TEST_CASE("An organic raft keeps the layer counts of the object's own layers", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    const TriangleMesh mesh = two_tier_mesh();
+    auto               slice = [&mesh](Slic3r::Print &print, int raft_layers) {
+        slice_with_tree_support(mesh, print, "organic", 30, 0, raft_layers, {
+            { "support_top_z_distance",       0.2 },
+            { "support_interface_top_layers", 2 },
+        });
+    };
+
+    Slic3r::Print rafted;
+    Slic3r::Print plain;
+    slice(rafted, 2);
+    slice(plain, 0);
+
+    const PrintObject            &po            = *rafted.objects().front();
+    const PrintObject            &po_plain      = *plain.objects().front();
+    TreeSupportMeshGroupSettings  mesh_settings(po);
+    TreeSupportMeshGroupSettings  mesh_settings_plain(po_plain);
+    REQUIRE(mesh_settings.layer_grid.raft_layers > 0);
+    // The case is really exercised: a raft layer is thicker than the object's 0.2 mm layers, so a count
+    // that walked through it would come out shorter.
+    double thickest_raft_layer = 0.;
+    for (size_t i = 0; i < mesh_settings.layer_grid.raft_layers; ++ i)
+        thickest_raft_layer = std::max(thickest_raft_layer, mesh_settings.layer_grid.entries[i].height);
+    CHECK(thickest_raft_layer > 0.2 + 1e-9);
+
+    TreeSupportSettings config(mesh_settings, po.slicing_parameters());
+    TreeSupportSettings config_plain(mesh_settings_plain, po_plain.slicing_parameters());
+
+    // Machine readable control against the fixed layer height formulas the grid replaced.
+    CHECK(config.layer_start_bp_radius ==
+          LayerIndex((config.bp_radius - config.branch_radius) / config.bp_radius_increase_per_layer));
+    check_counts_unchanged(config, config_plain);
+
+    // Every support layer prints a layer of that grid, at that layer's own height - the raft layers
+    // included, and never a gap remainder.
+    REQUIRE(! po.support_layers().empty());
+    for (const SupportLayer *layer : po.support_layers()) {
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
+        const TreeSupportLayerGrid::Entry *entry = grid_entry_at(mesh_settings.layer_grid, layer->print_z);
+        REQUIRE(entry != nullptr);
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(entry->height, 1e-12));
+    }
+}
+
+// The first object layer is printed thicker for bed adhesion - a first layer setting, not a variable
+// layer height - so it must not move the layer counts either. The object keeps its own 0.32 / 0.2
+// layers, untouched by the support, and every support layer prints one of them.
+TEST_CASE("A thicker first layer keeps the organic layer counts", "[TreeSupportOrganicGap]")
+{
+    using namespace Slic3r::TreeSupport3D;
+    const TriangleMesh mesh = two_tier_mesh();
+    auto               slice = [&mesh](Slic3r::Print &print, double first_layer_height, int support) {
+        slice_with_tree_support(mesh, print, "organic", 30, 0, 0, {
+            { "enable_support",               support },
+            { "initial_layer_print_height",   first_layer_height },
+            { "support_top_z_distance",       0.2 },
+            { "support_interface_top_layers", 2 },
+        });
+    };
+
+    Slic3r::Print thick;
+    Slic3r::Print thick_plain;
+    Slic3r::Print uniform;
+    slice(thick, 0.32, 1);
+    slice(thick_plain, 0.32, 0);
+    slice(uniform, 0.2, 1);
+
+    const PrintObject            &po       = *thick.objects().front();
+    const PrintObject            &po_plain = *thick_plain.objects().front();
+    TreeSupportMeshGroupSettings  mesh_settings(po);
+    TreeSupportMeshGroupSettings  mesh_settings_uniform(*uniform.objects().front());
+
+    // The case is really exercised: the first layer is thicker than the regular ones.
+    REQUIRE(po.layer_count() > 1);
+    CHECK_THAT(po.get_layer(0)->height, Catch::Matchers::WithinAbs(0.32, 1e-9));
+    CHECK(po.get_layer(1)->height < 0.32 - 1e-9);
+
+    TreeSupportSettings config(mesh_settings, po.slicing_parameters());
+    TreeSupportSettings config_uniform(mesh_settings_uniform, uniform.objects().front()->slicing_parameters());
+    CHECK(config.layer_start_bp_radius ==
+          LayerIndex((config.bp_radius - config.branch_radius) / config.bp_radius_increase_per_layer));
+    check_counts_unchanged(config, config_uniform);
+
+    // The support does not touch the object's layer stack ...
+    REQUIRE(po.layer_count() == po_plain.layer_count());
+    for (size_t i = 0; i < po.layer_count(); ++ i) {
+        INFO("object layer " << i);
+        CHECK_THAT(po.get_layer(i)->print_z, Catch::Matchers::WithinAbs(po_plain.get_layer(i)->print_z, 1e-12));
+        CHECK_THAT(po.get_layer(i)->height, Catch::Matchers::WithinAbs(po_plain.get_layer(i)->height, 1e-12));
+    }
+    // ... and every support layer prints one of those layers, at that layer's height.
+    REQUIRE(! po.support_layers().empty());
+    for (const SupportLayer *layer : po.support_layers()) {
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
+        const Layer *object_layer = nullptr;
+        for (const Layer *candidate : po.layers())
+            if (std::abs(candidate->print_z - layer->print_z) < 1e-9)
+                object_layer = candidate;
+        REQUIRE(object_layer != nullptr);
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
     }
 }

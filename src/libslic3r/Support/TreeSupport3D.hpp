@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <utility>
 #include <deque>
+#include <optional>
 #include <vector>
 #include <functional>
 
@@ -51,6 +52,7 @@ namespace Slic3r
 // Forward declarations
 class Print;
 class PrintObject;
+class TriangleMesh;
 struct SlicingParameters;
 
 namespace TreeSupport3D
@@ -262,8 +264,11 @@ struct SupportElementState : public SupportElementStateBits
  */
 [[nodiscard]] inline coord_t support_element_radius(const TreeSupportSettings &settings, const SupportElementState &elem)
 { 
-    // Grown from the tip layer upwards, over the actual layer heights (contract §4.1/§4.4).
-    return settings.getRadius_at(elem.layer_idx - LayerIndex(elem.distance_to_top), getEffectiveDTT(settings, elem),
+    // The tip is `distance_to_top` layers *above* this element (propagate_down() decrements the layer
+    // index and increments the distance), so the Z the branch grew over is the span between this layer
+    // and that tip - not the span below the element, which is a different number of microns on a
+    // variable layer height (contract §4.1/§4.4).
+    return settings.getRadius_at(elem.layer_idx + LayerIndex(elem.distance_to_top), getEffectiveDTT(settings, elem),
                                  elem.elephant_foot_increases);
 }
 
@@ -274,7 +279,7 @@ struct SupportElementState : public SupportElementStateBits
  */
 [[nodiscard]] inline coord_t support_element_collision_radius(const TreeSupportSettings &settings, const SupportElementState &elem)
 {
-    return settings.getRadius_at(elem.layer_idx - LayerIndex(elem.distance_to_top), elem.effective_radius_height,
+    return settings.getRadius_at(elem.layer_idx + LayerIndex(elem.distance_to_top), elem.effective_radius_height,
                                  elem.elephant_foot_increases);
 }
 
@@ -319,6 +324,51 @@ using SupportElements = std::deque<SupportElement>;
 {
     return support_element_collision_radius(settings, elem.state);
 }
+
+/*!
+ * rief Down facing facets of a mesh, indexed by the lowest Z of their vertices.
+ *
+ * The top contact of an overhang is placed from the overhang face itself, not from a layer boundary,
+ * so the face has to be searched once per overhang area. The index makes that search a window lookup
+ * instead of a walk over every triangle for every area.
+ */
+struct OverhangFacetZIndex
+{
+    std::vector<double> z_min; // lowest vertex Z of each facet, in mesh order
+    std::vector<size_t> by_z;  // facet indices, ascending z_min, ties in mesh order
+
+    void build(const TriangleMesh &mesh);
+};
+
+/*!
+ * rief Lowest Z of a down facing facet inside `area` whose lowest vertex lies in the closed window
+ * [z_lo, z_hi], or nothing when the window holds no such facet.
+ */
+[[nodiscard]] std::optional<double> overhang_face_z(const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
+                                                    const Polygons &area, double z_lo, double z_hi);
+
+/*!
+ * rief Places the top contact of the overhang area that was sliced into `layer_idx`.
+ *
+ * A layer's slices are taken at its mid-plane, so the material that first appears in layer `layer_idx`
+ * starts inside the slab of the layer *below* it, `(bottom_z(layer_idx - 1), z(layer_idx - 1)]`. That is
+ * the window the face is searched in - closed, so a face landing exactly on a layer boundary belongs to
+ * the area of the layer above it, which is the case a uniform grid hits. The contact then goes on the
+ * highest whole layer whose top stays `top_z_distance` below the face, i.e. the gap is quantised upwards
+ * and never narrower than requested.
+ *
+ * Also raises the object material start of `layer_idx` to the face, so the clearance of the contact
+ * layer below is measured against the face rather than against a layer bottom that sits below it.
+ */
+struct OverhangContact
+{
+    LayerIndex            contact_layer { -1 };  // -1 when no whole layer is left to carry it
+    std::optional<double> face_z;                // the face measured for the area, in grid Zs
+};
+
+[[nodiscard]] OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, LayerIndex layer_idx,
+                                                     const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
+                                                     const Polygons &area, double z_offset, double top_z_distance);
 
 // Organic specific: Smooth branches and produce one cummulative mesh to be sliced.
 void organic_draw_branches(
