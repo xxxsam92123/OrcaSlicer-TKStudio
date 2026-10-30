@@ -9672,6 +9672,25 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
         } else {
             throw Slic3r::InvalidArgument("Invalid speed");
         }
+        // Orca: per-role ZAA speeds. Only the paths ContourZ actually contoured are affected, and only
+        // where the matching value is non-zero; otherwise the role speed chosen above stands. The
+        // first-layer, volumetric-flow and other limits below still apply to the override. A speed
+        // handed in by the caller (small perimeters, skirt, brim) is a deliberate override of its
+        // own and is left alone.
+        if (path.z_contoured) {
+            double zaa_speed = 0.;
+            if (path.role() == erExternalPerimeter)
+                zaa_speed = NOZZLE_CONFIG(zaa_outer_wall_speed);
+            else if (path.role() == erPerimeter)
+                zaa_speed = NOZZLE_CONFIG(zaa_inner_wall_speed);
+            else if (path.role() == erTopSolidInfill)
+                zaa_speed = NOZZLE_CONFIG(zaa_top_surface_speed);
+            else if (path.role() == erIroning)
+                zaa_speed = NOZZLE_CONFIG(zaa_ironing_speed);
+            // A nil entry (an older profile without the key) reads as NaN, so this also covers it.
+            if (zaa_speed > 0.)
+                speed = zaa_speed;
+        }
     }
     //BBS: if not set the speed, then use the filament_max_volumetric_speed directly
     double filament_max_volumetric_speed = FILAMENT_CONFIG(filament_max_volumetric_speed);

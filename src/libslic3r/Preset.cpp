@@ -1589,6 +1589,10 @@ static std::vector<std::string> s_Preset_print_options{
     "zaa_minimize_perimeter_height",
     "zaa_dont_alternate_fill_direction",
     "zaa_min_z",
+    "zaa_outer_wall_speed",
+    "zaa_inner_wall_speed",
+    "zaa_top_surface_speed",
+    "zaa_ironing_speed",
     "ironing_expansion",
 };
 

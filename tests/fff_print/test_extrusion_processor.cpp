@@ -7,8 +7,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/benchmark/catch_benchmark.hpp>
 #include "libslic3r/AABBTreeLines.hpp"
+#include "libslic3r/Config.hpp"
 #include "libslic3r/GCode.hpp"
 #include "libslic3r/GCode/ExtrusionProcessor.hpp"
+#include "libslic3r/libslic3r.h"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
@@ -17,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <cstring>
 #include <functional>
 #include "libslic3r/Line.hpp"
@@ -787,4 +790,182 @@ TEST_CASE("Benchmark caged overhang interior sampling", "[ExtrusionProcessor][!b
     {
         return caged_overhang_gcode(wall_generator);
     };
+}
+
+// ---------------------------------------------------------------------------------------------
+// ZAA per-role speeds: only the paths ContourZ marked as contoured may take them, and only where
+// the matching value is non-zero. Every other path keeps the ordinary role speed.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// Ordinary role speeds the ZAA values are told apart from.
+constexpr double zaa_base_outer_wall_speed  = 60.;
+constexpr double zaa_base_inner_wall_speed  = 70.;
+constexpr double zaa_base_top_surface_speed = 80.;
+constexpr double zaa_base_ironing_speed     = 90.;
+
+// A 15 mm sphere (the 50 mm test sphere scaled down). ContourZ contours a path only where the mesh
+// surface sits within about a layer of the slice plane, and on a sphere that band is wide near the
+// pole, so one slice has contoured moves of the outer walls, the inner walls, the top surfaces and
+// the ironing at once. A box tilted 15 degrees gets no top surface contours at all and no inner wall
+// ones either (10 degrees does contour its inner walls), so it cannot carry all four roles.
+TriangleMesh zaa_sphere()
+{
+    TriangleMesh sphere = mesh(TestMesh::sphere_50mm);
+    sphere.scale(0.3f);
+    return sphere;
+}
+
+DynamicPrintConfig zaa_speed_config(bool zaa_enabled, double zaa_outer, double zaa_inner, double zaa_top, double zaa_ironing,
+                                    double max_volumetric_speed = 100., double base_outer_wall_speed = zaa_base_outer_wall_speed)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        {"layer_height", 0.2},
+        {"initial_layer_print_height", 0.2},
+        {"outer_wall_line_width", 0.42},
+        {"inner_wall_line_width", 0.45},
+        {"wall_loops", 3},
+        {"top_shell_layers", 3},
+        {"bottom_shell_layers", 3},
+        {"sparse_infill_density", "0%"},
+        // Top surfaces are ironed as well, so both a top surface role and an ironing role exist.
+        {"ironing_type", "top"},
+        // Nothing but the settings under test may lower a role's speed.
+        {"slow_down_layers", 0},
+        {"slow_down_for_layer_cooling", 0},
+        {"slowdown_for_curled_perimeters", 0},
+        {"enable_overhang_speed", 0},
+        {"resonance_avoidance", 0},
+        {"filament_max_volumetric_speed", max_volumetric_speed},
+        {"outer_wall_speed", base_outer_wall_speed},
+        {"inner_wall_speed", zaa_base_inner_wall_speed},
+        {"top_surface_speed", zaa_base_top_surface_speed},
+        {"ironing_speed", zaa_base_ironing_speed},
+        {"zaa_enabled", zaa_enabled ? 1 : 0},
+        {"zaa_min_z", 0.05},
+        {"zaa_outer_wall_speed", zaa_outer},
+        {"zaa_inner_wall_speed", zaa_inner},
+        {"zaa_top_surface_speed", zaa_top},
+        {"zaa_ironing_speed", zaa_ironing},
+    });
+    return config;
+}
+
+std::string zaa_speed_gcode(const DynamicPrintConfig &config)
+{
+    return slice(std::initializer_list<TriangleMesh>{zaa_sphere()}, config);
+}
+
+// Feed rates in mm/min of the moves of each role ZAA can speed up, plus how many extruding moves
+// changed Z at all. Only a contoured path carries a per-point Z, so a Z change on an extruding move
+// is the G-code's own mark of one. Moves below `min_z` are skipped so the first layers, which have
+// their own speed contract, cannot stand in for the contoured ones.
+struct FeedRates {
+    std::vector<double> outer_wall, inner_wall, top_surface, ironing;
+    size_t              z_moving_moves = 0;
+};
+
+FeedRates role_feed_rates(const std::string &gcode, bool z_moving_only = true, double min_z = 1.)
+{
+    FeedRates            rates;
+    std::vector<double> *current = nullptr;
+    GCodeReader          parser;
+    parser.parse_buffer(gcode, [&rates, &current, z_moving_only, min_z](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.find("TYPE:") != std::string_view::npos || comment.find("FEATURE:") != std::string_view::npos) {
+            current = nullptr;
+            if (comment.find("Outer wall") != std::string_view::npos)
+                current = &rates.outer_wall;
+            else if (comment.find("Inner wall") != std::string_view::npos)
+                current = &rates.inner_wall;
+            else if (comment.find("Top surface") != std::string_view::npos)
+                current = &rates.top_surface;
+            else if (comment.find("Ironing") != std::string_view::npos)
+                current = &rates.ironing;
+        }
+
+        if (! line.extruding(self) || line.dist_XY(self) <= EPSILON)
+            return;
+        const bool z_moving = std::abs(line.dist_Z(self)) > EPSILON;
+        rates.z_moving_moves += z_moving;
+        if (current == nullptr || (z_moving_only && ! z_moving) || line.new_Z(self) < float(min_z))
+            return;
+        current->push_back(line.new_F(self));
+    });
+    return rates;
+}
+
+// Every matched move must print at `expected` mm/s: a filter that matched nothing, or one that let
+// another speed through, fails here instead of passing on an empty sample.
+void check_role_speed(const char *role, const std::vector<double> &feed_rates, double expected)
+{
+    UNSCOPED_INFO(role << ": matched " << feed_rates.size() << " contoured moves");
+    REQUIRE_FALSE(feed_rates.empty());
+    const auto extremes = std::minmax_element(feed_rates.begin(), feed_rates.end());
+    UNSCOPED_INFO(role << ": " << *extremes.first / MM_PER_MIN << " .. " << *extremes.second / MM_PER_MIN << " mm/s");
+    CHECK_THAT(*extremes.first / MM_PER_MIN, Catch::Matchers::WithinRel(expected, 0.01));
+    CHECK_THAT(*extremes.second / MM_PER_MIN, Catch::Matchers::WithinRel(expected, 0.01));
+}
+
+} // namespace
+
+TEST_CASE("ZAA speeds print each contoured role at its own speed", "[ExtrusionProcessor]")
+{
+    const FeedRates rates = role_feed_rates(zaa_speed_gcode(zaa_speed_config(true, 11., 13., 17., 19.)));
+
+    check_role_speed("outer wall", rates.outer_wall, 11.);
+    check_role_speed("inner wall", rates.inner_wall, 13.);
+    check_role_speed("top surface", rates.top_surface, 17.);
+    check_role_speed("ironing", rates.ironing, 19.);
+}
+
+TEST_CASE("ZAA speeds of zero keep each contoured role at its ordinary speed", "[ExtrusionProcessor]")
+{
+    const FeedRates rates = role_feed_rates(zaa_speed_gcode(zaa_speed_config(true, 0., 0., 0., 0.)));
+
+    check_role_speed("outer wall", rates.outer_wall, zaa_base_outer_wall_speed);
+    check_role_speed("inner wall", rates.inner_wall, zaa_base_inner_wall_speed);
+    check_role_speed("top surface", rates.top_surface, zaa_base_top_surface_speed);
+    check_role_speed("ironing", rates.ironing, zaa_base_ironing_speed);
+}
+
+TEST_CASE("ZAA speeds change nothing when ZAA is off", "[ExtrusionProcessor]")
+{
+    // Without ZAA no path is contoured, so the speeds must match the same slice with the ZAA speeds
+    // left at zero. `z_moving_moves` counts every extruding move, first layers included, so it also
+    // proves no path was contoured at all.
+    const FeedRates zaa_speeds_set  = role_feed_rates(zaa_speed_gcode(zaa_speed_config(false, 11., 13., 17., 19.)), false);
+    const FeedRates zaa_speeds_zero = role_feed_rates(zaa_speed_gcode(zaa_speed_config(false, 0., 0., 0., 0.)), false);
+
+    CHECK(zaa_speeds_set.z_moving_moves == 0);
+    REQUIRE_FALSE(zaa_speeds_set.outer_wall.empty());
+    REQUIRE_FALSE(zaa_speeds_set.inner_wall.empty());
+    REQUIRE_FALSE(zaa_speeds_set.top_surface.empty());
+    REQUIRE_FALSE(zaa_speeds_set.ironing.empty());
+
+    CHECK(zaa_speeds_set.outer_wall == zaa_speeds_zero.outer_wall);
+    CHECK(zaa_speeds_set.inner_wall == zaa_speeds_zero.inner_wall);
+    CHECK(zaa_speeds_set.top_surface == zaa_speeds_zero.top_surface);
+    CHECK(zaa_speeds_set.ironing == zaa_speeds_zero.ironing);
+
+    // And they really are the ordinary role speed, not something the ZAA keys leaked into.
+    check_role_speed("outer wall", zaa_speeds_set.outer_wall, zaa_base_outer_wall_speed);
+    check_role_speed("inner wall", zaa_speeds_set.inner_wall, zaa_base_inner_wall_speed);
+}
+
+TEST_CASE("A ZAA speed above the filament's volumetric limit is still capped", "[ExtrusionProcessor]")
+{
+    // 5mm3/s over a 0.42 x 0.2mm bead is about 59mm/s, far below the 2000mm/s ZAA speed below, so a
+    // contoured wall must end up at the same speed an ordinary wall with the same absurdly high speed
+    // does: the flow limit, not the configured speed.
+    const FeedRates zaa_capped  = role_feed_rates(zaa_speed_gcode(zaa_speed_config(true, 2000., 0., 0., 0., 5.)));
+    const FeedRates base_capped = role_feed_rates(zaa_speed_gcode(zaa_speed_config(true, 0., 0., 0., 0., 5., 2000.)));
+
+    REQUIRE_FALSE(zaa_capped.outer_wall.empty());
+    REQUIRE_FALSE(base_capped.outer_wall.empty());
+    info_feed_rates("capped ZAA outer wall", zaa_capped.outer_wall);
+    CHECK(zaa_capped.outer_wall == base_capped.outer_wall);
+    CHECK(*std::max_element(zaa_capped.outer_wall.begin(), zaa_capped.outer_wall.end()) < 200. * MM_PER_MIN);
 }
