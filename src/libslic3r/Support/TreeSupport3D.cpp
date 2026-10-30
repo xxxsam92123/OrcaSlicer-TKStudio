@@ -27,12 +27,14 @@
 #include "MutablePolygon.hpp"
 #include "BeltFloorContext.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
+#include "libslic3r/Support/TreeSupportContact.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Support/TreeModelVolumes.hpp"
 #include "libslic3r/Support/SupportParameters.hpp"
 #include "libslic3r/Support/SupportLayer.hpp"
 #include "SupportCommon.hpp"
 #include "libslic3r/Surface.hpp"
+#include "TriangleMesh.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TreeSupport.hpp"
 #include "I18N.hpp"
@@ -46,7 +48,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -370,30 +371,197 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 }
 #endif
 
+// Z of the lowest overhang face an area can have, searched in the Z window [z_lo, z_hi].
+//
+// The layer stack only records *where* the slicer first sees an overhang, which is the layer whose
+// slice reaches into it. On a variable layer height that layer can start a whole layer above the face
+// itself - the contract T-shape's plate starts at 12.0 inside the layer 11.8691 .. 12.0691 - so
+// measuring the gap from the layer boundary would leave the support 0.069 mm too close to the object,
+// and for a smaller gap it ends up inside the object. The face is a down facing facet of the mesh, so
+// take the lowest of those reaching into the window. A sloped face contributes the window bottom, which
+// can only widen the gap, never close it.
+//
+// The search runs once per overhang area, so the facet Z ranges are collected once per mesh instead of
+// being recomputed - together with a full walk over the triangles - for every area. A facet is a candidate
+// as soon as its Z range overlaps the window at all, so a sloped or large triangle whose lowest vertex
+// sits below the window is still found: the part of it inside the window is at or above the window bottom,
+// and that bottom is what it contributes. Indexing the facets by their lowest vertex alone would drop
+// exactly such a facet, and an area that also holds a higher downward facet would then measure the gap
+// from the higher one: 0.23 mm of air under the slope where 0.4 was asked for.
+void OverhangFacetZIndex::build(const TriangleMesh &mesh)
+{
+    const indexed_triangle_set &its        = mesh.its;
+    const size_t                num_facets = its.indices.size();
+    z_min.clear();
+    z_max.clear();
+    z_min.reserve(num_facets);
+    z_max.reserve(num_facets);
+    for (const stl_triangle_vertex_indices &triangle : its.indices) {
+        const Vec3f &a = its.vertices[triangle[0]];
+        const Vec3f &b = its.vertices[triangle[1]];
+        const Vec3f &c = its.vertices[triangle[2]];
+        z_min.emplace_back(std::min({ double(a.z()), double(b.z()), double(c.z()) }));
+        z_max.emplace_back(std::max({ double(a.z()), double(b.z()), double(c.z()) }));
+    }
+    by_z.resize(num_facets);
+    for (size_t i = 0; i < by_z.size(); ++ i)
+        by_z[i] = i;
+    std::stable_sort(by_z.begin(), by_z.end(), [this](size_t l, size_t r) { return z_min[l] < z_min[r]; });
+
+    // Segment tree over that order, holding each node's highest z_max, so a query drops a whole range of
+    // facets that end below the window without visiting them one by one.
+    size_t leaves = 1;
+    while (leaves < num_facets)
+        leaves <<= 1;
+    node_z_max.assign(2 * leaves, -std::numeric_limits<double>::infinity());
+    for (size_t i = 0; i < num_facets; ++ i)
+        node_z_max[leaves + i] = z_max[by_z[i]];
+    for (size_t node = leaves; node-- > 1;)
+        node_z_max[node] = std::max(node_z_max[2 * node], node_z_max[2 * node + 1]);
+}
+
+// Facets whose Z range [z_min, z_max] overlaps the closed window [z_lo, z_hi], in mesh order: the tie
+// breaking between facets that sit within `z_roundoff` of each other has to stay the one a full scan used.
+//
+// The window edges carry `TreeSupportLayerGrid::z_roundoff`, not the geometric EPSILON: the window is
+// closed, so a face lying exactly on a layer boundary is a candidate, and the round-off of a sum of layer
+// heights is all that tolerance may cover. A facet within 1e-4 mm of the window would otherwise be
+// treated as if it were inside it.
+//
+// The facets are ordered by z_min, so the window covers a prefix of that order and the walk starts at
+// its end. A subtree whose highest z_max stays below the window holds no candidate and is skipped whole,
+// which keeps the query proportional to the facets it returns.
+[[nodiscard]] static std::vector<size_t> facets_overlapping(const OverhangFacetZIndex &facet_z, const double z_lo,
+                                                            const double z_hi)
+{
+    std::vector<size_t> facets;
+    if (facet_z.by_z.empty())
+        return facets;
+    // Facets that start above the window sit at the end of the sorted order and are cut off here.
+    const auto   last = std::upper_bound(facet_z.by_z.begin(), facet_z.by_z.end(),
+                                         z_hi + TreeSupportLayerGrid::z_roundoff,
+                                         [&facet_z](double z, size_t facet) { return z < facet_z.z_min[facet]; });
+    const size_t num_starting_below = size_t(last - facet_z.by_z.begin());
+    if (num_starting_below == 0)
+        return facets;
+
+    struct Pending { size_t node, lo, hi; };
+    const size_t         leaves = facet_z.node_z_max.size() / 2;
+    std::vector<Pending> pending { { 1, 0, leaves } };
+    while (! pending.empty()) {
+        const Pending current = pending.back();
+        pending.pop_back();
+        // Padding leaves of the tree carry no facet, and a node whose facets all end below the window
+        // holds none either.
+        if (current.lo >= num_starting_below ||
+            facet_z.node_z_max[current.node] < z_lo - TreeSupportLayerGrid::z_roundoff)
+            continue;
+        if (current.hi - current.lo == 1) {
+            facets.emplace_back(facet_z.by_z[current.lo]);
+            continue;
+        }
+        const size_t mid = (current.lo + current.hi) / 2;
+        // Pushed right first, so the leaves come out in ascending z_min order.
+        pending.push_back({ 2 * current.node + 1, mid, current.hi });
+        pending.push_back({ 2 * current.node, current.lo, mid });
+    }
+    // Back into mesh order, so a facet that ties with another one is picked by the same rule as before.
+    std::sort(facets.begin(), facets.end());
+    return facets;
+}
+
+[[nodiscard]] std::optional<double> overhang_face_z(const TriangleMesh &mesh, const OverhangFacetZIndex &facet_z,
+                                                    const Polygons &area, const double z_lo, const double z_hi)
+{
+    if (area.empty() || facet_z.by_z.empty())
+        return std::nullopt;
+    std::optional<double>       face_z;
+    const indexed_triangle_set &its = mesh.its;
+    for (const size_t facet : facets_overlapping(facet_z, z_lo, z_hi)) {
+        // A facet that starts below the window cannot hold a face below the window, so the window bottom
+        // is the lowest Z it contributes. That is at or below the face it really holds there, so a gap
+        // measured from it can come out wider than requested but never narrower.
+        const double reference = std::max(facet_z.z_min[facet], z_lo);
+        // Strictly lower wins, so the retained Z is the minimum over the candidates and can never sit
+        // above it: a candidate within the geometric EPSILON above the minimum used to be skipped, which
+        // left the reference up to 1e-4 mm - a distance that can cross a layer boundary - too high. Ties
+        // keep the first facet in mesh order, which is the rule the full scan this replaced used.
+        if (face_z && reference >= *face_z)
+            continue;
+        const stl_triangle_vertex_indices &triangle = its.indices[facet];
+        const Vec3f &a = its.vertices[triangle[0]];
+        const Vec3f &b = its.vertices[triangle[1]];
+        const Vec3f &c = its.vertices[triangle[2]];
+        // Only down facing facets: an up facing one of a lower feature inside the same area would
+        // otherwise pull the contact below the overhang it belongs to. Sign of the Z component of the
+        // face normal, so no normalisation is needed (a degenerate facet counts as up facing).
+        if ((double(b.x()) - double(a.x())) * (double(c.y()) - double(b.y())) -
+            (double(b.y()) - double(a.y())) * (double(c.x()) - double(b.x())) >= 0.)
+            continue;
+        const Polygons footprint{ Polygon{ { Point::new_scale(a.x(), a.y()), Point::new_scale(b.x(), b.y()),
+                                            Point::new_scale(c.x(), c.y()) } } };
+        if (! intersection(footprint, area).empty())
+            face_z = reference;
+    }
+    return face_z;
+}
+
+OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIndex layer_idx, const TriangleMesh &mesh,
+                                        const OverhangFacetZIndex &facet_z, const Polygons &area,
+                                        const double top_z_distance)
+{
+    // The window is [bottom_z(layer_idx - 1), z(layer_idx)] of the grid, which on a uniform grid is two
+    // layer heights tall: a layer's slices are taken at its own mid-plane, so material that first appears
+    // in layer `layer_idx` starts below that mid-plane, i.e. inside the layer below or inside this one,
+    // and a face exactly on either boundary counts - that is the case a uniform grid hits. A face further
+    // down is a different overhang and would drop the contact by a whole layer for no reason.
+    //
+    // No frame conversion happens here. `mesh` is passed already transformed by `trafo_sliced()`, the
+    // frame the layers were sliced in, and `grid` holds exactly those Zs: build_layer_grid() copies each
+    // object layer's print_z minus `belt_global_z_offset()`, which PrintObject::slice() adds to
+    // `Layer::print_z` only after the slicing. The mesh and the grid therefore share one frame, and the
+    // belt offset belongs to the layer stack only - feeding it into this search moves the window off the
+    // face (upwards for the negative offset a lifted belt mesh has) and can place the contact above it.
+    const std::optional<double> face_z = overhang_face_z(mesh, facet_z, area,
+        grid.bottom_z(layer_idx - 1), grid.z(layer_idx));
+    // Z the air gap is measured from, in that same frame. Without a facet at all - a support enforcer
+    // adds areas with no down facing facet behind them - it is the bottom of the window that was just
+    // searched rather than this layer's bottom: the overhang area is the material of this layer's slice
+    // that the layer below does not support, so the face over it lies above the mid-plane slice of the
+    // layer below and that bottom is a lower bound of it. A contact placed under it therefore keeps
+    // `actual gap >= top_z_distance` either way, while measuring from this layer's bottom put the contact
+    // up to half a layer too close to a face that sits below it.
+    const double reference_z = face_z ? *face_z : grid.bottom_z(layer_idx - 1);
+    // Highest whole layer that keeps at least `top_z_distance` of air under that reference; see
+    // TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft.
+    const LayerIndex contact_layer = grid.place_top_contact(reference_z, top_z_distance);
+    // The contact layer's clearance is measured against the face, not against this layer's bottom,
+    // which sits below it on a variable layer height. `set_obj_bottom_z()` only moves the material start
+    // up, so the lower bound of a facet that reaches into the window from below leaves it where it was.
+    if (face_z)
+        grid.set_obj_bottom_z(layer_idx, *face_z);
+    return { contact_layer, face_z };
+}
+
 /*!
  * \brief Precalculates all avoidances, that could be required.
  *
  * \param storage[in] Background storage to access meshes.
  * \param currently_processing_meshes[in] Indexes of all meshes that are processed in this iteration
  */
-[[nodiscard]] static LayerIndex precalculate(const Print &print, const std::vector<Polygons> &overhangs, const TreeSupportSettings &config, const std::vector<size_t> &object_ids, TreeModelVolumes &volumes, std::function<void()> throw_on_cancel)
+
+[[nodiscard]] static LayerIndex precalculate(const std::vector<LayerIndex> &overhang_top_layer, const PrintObject &print_object, TreeModelVolumes &volumes, std::function<void()> throw_on_cancel)
 {
-    // calculate top most layer that is relevant for support
-    LayerIndex max_layer = 0;
-    for (size_t object_id : object_ids) {
-        const PrintObject &print_object      = *print.get_object(object_id);
-        const int       num_raft_layers      = int(config.raft_layers.size());
-        const int       num_layers           = int(print_object.layer_count()) + num_raft_layers;
-        int             max_support_layer_id = 0;
-        for (int layer_id = std::max<int>(num_raft_layers, 1); layer_id < num_layers; ++ layer_id)
-            if (! overhangs[layer_id].empty())
-                max_support_layer_id = layer_id;
-        max_layer = std::max(max_support_layer_id - int(config.z_distance_top_layers), 0);
-    }
-    if (max_layer > 0)
+    // The support layers are generated up to the highest top contact layer. How many layers lie
+    // between an overhang and its contact layer depends on the layer heights, so the count comes from
+    // the contact layers instead of from "overhang layer minus z_distance_top_layers".
+    LayerIndex num_support_layers = 0;
+    for (LayerIndex top_layer : overhang_top_layer)
+        num_support_layers = std::max(num_support_layers, top_layer + 1);
+    if (num_support_layers > 0)
         // The actual precalculation happens in TreeModelVolumes.
-        volumes.precalculate(*print.get_object(object_ids.front()), max_layer, throw_on_cancel);
-    return max_layer;
+        volumes.precalculate(print_object, num_support_layers, throw_on_cancel);
+    return num_support_layers;
 }
 
 // picked from convert_lines_to_internal()
@@ -1295,6 +1463,7 @@ static void generate_initial_areas(
     const TreeModelVolumes          &volumes,
     const TreeSupportSettings       &config,
     const std::vector<Polygons>     &overhangs,
+    const std::vector<LayerIndex>   &overhang_top_layer,
     std::vector<SupportElements>    &move_bounds,
     InterfacePlacer                 &interface_placer,
     std::function<void()>            throw_on_cancel)
@@ -1302,15 +1471,7 @@ static void generate_initial_areas(
     using                           AvoidanceType = TreeModelVolumes::AvoidanceType;
     TreeSupportMeshGroupSettings    mesh_group_settings(print_object);
 
-    // To ensure z_distance_top_layers are left empty between the overhang (zeroth empty layer), the support has to be added z_distance_top_layers+1 layers below
-    const size_t z_distance_delta = config.z_distance_top_layers + 1;
-
     const bool min_xy_dist = config.xy_distance > config.xy_min_distance;
-
-#if 0
-    if (mesh.overhang_areas.size() <= z_distance_delta)
-        return;
-#endif
 
     const coord_t connect_length = (config.support_line_width * 100. / mesh_group_settings.support_tree_top_rate) + std::max(2. * config.min_radius - 1.0 * config.support_line_width, 0.0);
     // As r*r=x*x+y*y (circle equation): If a circle with center at (0,0) the top most point is at (0,r) as in y=r.
@@ -1336,6 +1497,10 @@ static void generate_initial_areas(
     // does not turn valid in double the amount of layers a slope of support angle would take to travel xy_distance, nothing reasonable will come from it.
     // The 2*z_distance_delta is only a catch for when the support angle is very high.
     // Used only if not min_xy_dist.
+    // Deliberately the nominal layer height and the nominal layer count: this is a heuristic cap on
+    // how far below an overhang a tip may still be inserted, not a geometric quantity. Letting it
+    // follow per-layer thickness would change how many tips are dropped without moving anything
+    // (contract §4.1 keeps such heuristic thresholds at their nominal value).
     coord_t max_overhang_insert_lag = 0;
     if (config.z_distance_top_layers > 0) {
         max_overhang_insert_lag = 2 * config.z_distance_top_layers;
@@ -1349,24 +1514,21 @@ static void generate_initial_areas(
         }
     }
 
-    size_t                                          num_support_layers;
     int                                             raft_contact_layer_idx;
     // Layers with their overhang regions.
     std::vector<std::pair<size_t, const Polygons*>>  raw_overhangs;
 
     {
-        const size_t num_raft_layers     = config.raft_layers.size();
-        const size_t first_support_layer = std::max(int(num_raft_layers) - int(z_distance_delta), 1);
-        num_support_layers  = size_t(std::max(0, int(print_object.layer_count()) + int(num_raft_layers) - int(z_distance_delta)));
         raft_contact_layer_idx = generate_raft_contact(print_object, config, interface_placer);
-        // Enumerate layers for which the support tips may be generated from overhangs above.
-        raw_overhangs.reserve(num_support_layers - first_support_layer);
-        for (size_t layer_idx = first_support_layer; layer_idx < num_support_layers; ++ layer_idx)
-            if (const size_t overhang_idx = layer_idx + z_distance_delta; ! overhangs[overhang_idx].empty())
-                raw_overhangs.push_back({ layer_idx, &overhangs[overhang_idx] });
+        // Every overhang contributes its tips on the contact layer computed for it, see place_top_contact().
+        raw_overhangs.reserve(overhangs.size());
+        for (size_t overhang_idx = 0; overhang_idx < overhangs.size(); ++ overhang_idx)
+            if (const LayerIndex top_layer = overhang_top_layer[overhang_idx];
+                top_layer >= 0 && ! overhangs[overhang_idx].empty())
+                raw_overhangs.push_back({ size_t(top_layer), &overhangs[overhang_idx] });
     }
 
-    RichInterfacePlacer rich_interface_placer{ interface_placer, volumes, force_tip_to_roof, num_support_layers, move_bounds };
+    RichInterfacePlacer rich_interface_placer{ interface_placer, volumes, force_tip_to_roof, size_t(move_bounds.size()), move_bounds };
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, raw_overhangs.size()),
         [&volumes, &config, &raw_overhangs, &mesh_group_settings,
@@ -1657,7 +1819,7 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
         if (overspeed > 0) {
             coord_t safe_movement_distance =
                 (current_elem.use_min_xy_dist ? config.xy_min_distance : config.xy_distance) +
-                (std::min(config.z_distance_top_layers, config.z_distance_bottom_layers) > 0 ? config.min_feature_size : 0);
+                (config.has_top_gap && config.has_bottom_gap ? config.min_feature_size : 0);
             // Orca:
             // safe_movement_distance is used as the safe_offset_inc() step, so keep it non-zero
             // to preserve branch movement with zero-clearance support settings.
@@ -1728,15 +1890,19 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
             while (current_ceil_radius < target_radius && validWithRadius(volumes.getRadiusNextCeil(current_ceil_radius + 1, settings.use_min_distance)))
                 current_ceil_radius = volumes.getRadiusNextCeil(current_ceil_radius + 1, settings.use_min_distance);
             size_t resulting_eff_dtt = current_elem.effective_radius_height;
+            // The tip sits `distance_to_top` layers above the element: the radius a larger effective
+            // distance asks for is integrated between this layer and that tip.
+            const LayerIndex tip_layer = current_elem.layer_idx + LayerIndex(current_elem.distance_to_top);
             while (resulting_eff_dtt + 1 < current_elem.distance_to_top &&
-                config.getRadius(resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= current_ceil_radius &&
-                config.getRadius(resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= support_element_radius(config, current_elem))
+                config.getRadius_at(tip_layer, resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= current_ceil_radius &&
+                config.getRadius_at(tip_layer, resulting_eff_dtt + 1, current_elem.elephant_foot_increases) <= support_element_radius(config, current_elem))
                 ++ resulting_eff_dtt;
             current_elem.effective_radius_height = resulting_eff_dtt;
         }
         radius = support_element_collision_radius(config, current_elem);
 
-        const coord_t foot_radius_increase = std::max(config.bp_radius_increase_per_layer - config.branch_radius_increase_per_layer, 0.0);
+        const LayerIndex current_tip = current_elem.layer_idx + LayerIndex(current_elem.distance_to_top);
+        const coord_t foot_radius_increase = std::max(config.bp_radius_increase_at(current_elem.layer_idx) - config.branch_radius_increase_at(current_elem.layer_idx), 0.0);
         // Is nearly all of the time 1, but sometimes an increase of 1 could cause the radius to become bigger than recommendedMinRadius,
         // which could cause the radius to become bigger than precalculated.
         double planned_foot_increase = std::min(1.0, double(config.recommendedMinRadius(layer_idx - 1) - support_element_radius(config, current_elem)) / foot_radius_increase);
@@ -1745,7 +1911,7 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
 //        bool increase_bp_foot = false;
 
         if (increase_bp_foot && support_element_radius(config, current_elem) >= config.branch_radius && support_element_radius(config, current_elem) >= config.increase_radius_until_radius)
-            if (validWithRadius(config.getRadius(current_elem.effective_radius_height, current_elem.elephant_foot_increases + planned_foot_increase))) {
+            if (validWithRadius(config.getRadius_at(current_tip, current_elem.effective_radius_height, current_elem.elephant_foot_increases + planned_foot_increase))) {
                 current_elem.elephant_foot_increases += planned_foot_increase;
                 radius = support_element_collision_radius(config, current_elem);
             }
@@ -1847,6 +2013,14 @@ static void increase_areas_one_layer(
             assert(merging_area.parents.size() == 1);
             SupportElement          &parent         = layer_elements[merging_area.parents.front()];
             SupportElementState      elem           = SupportElementState::propagate_down(parent.state);
+            // Per-layer growth limits for the step from `layer_idx` down to the layer below it: the same
+            // angles applied to that layer's actual thickness instead of the nominal layer height
+            // (contract §4.1/§4.4). On a uniform grid these equal maximum_move_distance(_slow).
+            const coord_t            max_move       = config.maximum_move_distance_at(layer_idx);
+            const coord_t            max_move_slow  = config.maximum_move_distance_slow_at(layer_idx);
+            const double             bp_increase    = config.bp_radius_increase_at(layer_idx);
+            // Layer the branch tip of `elem` sits on: `distance_to_top` layers above the element.
+            const LayerIndex         elem_tip       = elem.layer_idx + LayerIndex(elem.distance_to_top);
             const Polygons          &wall_restriction =
                 // Abstract representation of the model outline. If an influence area would move through it, it could teleport through a wall.
                 volumes.getWallRestriction(support_element_collision_radius(config, parent.state), layer_idx, parent.state.use_min_xy_dist);
@@ -1863,7 +2037,8 @@ static void increase_areas_one_layer(
             coord_t extra_speed = 5; // The extra speed is added to both movement distances. Also move 5 microns faster than allowed to avoid rounding errors, this may cause issues at VERY VERY small layer heights.
             coord_t extra_slow_speed = 0; // Only added to the slow movement distance.
             const coord_t ceiled_parent_radius = volumes.ceilRadius(support_element_collision_radius(config, parent.state), parent.state.use_min_xy_dist);
-            coord_t projected_radius_increased = config.getRadius(parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases);
+            const LayerIndex parent_tip = parent.state.layer_idx + LayerIndex(parent.state.distance_to_top);
+            coord_t projected_radius_increased = config.getRadius_at(parent_tip, parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases);
             coord_t projected_radius_delta = projected_radius_increased - support_element_collision_radius(config, parent.state);
 
             // When z distance is more than one layer up and down the Collision used to calculate the wall restriction will always include the wall (and not just the xy_min_distance) of the layer above and below like this (d = blocked area because of z distance):
@@ -1875,7 +2050,7 @@ static void increase_areas_one_layer(
              */
             coord_t safe_movement_distance =
                 (elem.use_min_xy_dist ? config.xy_min_distance : config.xy_distance) +
-                (std::min(config.z_distance_top_layers, config.z_distance_bottom_layers) > 0 ? config.min_feature_size : 0);
+                (config.has_top_gap && config.has_bottom_gap ? config.min_feature_size : 0);
 
             // safe_movement_distance is used as a divisor and as the safe_offset_inc() step,
             // so keep it non-zero to avoid division by zero and preserve branch movement.
@@ -1889,20 +2064,20 @@ static void increase_areas_one_layer(
             else
                 // if a guaranteed radius increase is not possible, only increase the slow speed
                 // Ensure that the slow movement distance can not become larger than the fast one.
-                extra_slow_speed += std::min(projected_radius_delta, (config.maximum_move_distance + extra_speed) - (config.maximum_move_distance_slow + extra_slow_speed));
+                extra_slow_speed += std::min(projected_radius_delta, (max_move + extra_speed) - (max_move_slow + extra_slow_speed));
 
             if (config.layer_start_bp_radius > layer_idx &&
-                config.recommendedMinRadius(layer_idx - 1) < config.getRadius(elem.effective_radius_height + 1, elem.elephant_foot_increases)) {
+                config.recommendedMinRadius(layer_idx - 1) < config.getRadius_at(elem_tip, elem.effective_radius_height + 1, elem.elephant_foot_increases)) {
                 // can guarantee elephant foot radius increase
-                if (ceiled_parent_radius == volumes.ceilRadius(config.getRadius(parent.state.effective_radius_height + 1, parent.state.elephant_foot_increases + 1), parent.state.use_min_xy_dist))
-                    extra_speed += config.bp_radius_increase_per_layer;
+                if (ceiled_parent_radius == volumes.ceilRadius(config.getRadius_at(elem_tip, elem.effective_radius_height + 1, elem.elephant_foot_increases + 1), parent.state.use_min_xy_dist))
+                    extra_speed += bp_increase;
                 else
-                    extra_slow_speed += std::min(coord_t(config.bp_radius_increase_per_layer),
-                                                 config.maximum_move_distance - (config.maximum_move_distance_slow + extra_slow_speed));
+                    extra_slow_speed += std::min(coord_t(bp_increase),
+                                                 max_move - (max_move_slow + extra_slow_speed));
             }
 
-            const coord_t fast_speed = config.maximum_move_distance + extra_speed;
-            const coord_t slow_speed = config.maximum_move_distance_slow + extra_speed + extra_slow_speed;
+            const coord_t fast_speed = max_move + extra_speed;
+            const coord_t slow_speed = max_move_slow + extra_speed + extra_slow_speed;
 
             Polygons offset_slow, offset_fast;
 
@@ -1921,14 +2096,14 @@ static void increase_areas_one_layer(
                 }
             };
 
-            const bool parent_moved_slow = elem.last_area_increase.increase_speed < config.maximum_move_distance;
+            const bool parent_moved_slow = elem.last_area_increase.increase_speed < max_move;
             const bool avoidance_speed_mismatch = parent_moved_slow && elem.last_area_increase.type != AvoidanceType::Slow;
             if (elem.last_area_increase.move && elem.last_area_increase.no_error && elem.can_use_safe_radius && !mergelayer &&
                 !avoidance_speed_mismatch && (elem.distance_to_top >= config.tip_layers || parent_moved_slow)) {
                 // assume that the avoidance type that was best for the parent is best for me. Makes this function about 7% faster.
-                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < config.maximum_move_distance ? slow_speed : fast_speed,
+                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < max_move ? slow_speed : fast_speed,
                     increase_radius, elem.last_area_increase.no_error, !use_min_radius, elem.last_area_increase.move }, true);
-                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < config.maximum_move_distance ? slow_speed : fast_speed,
+                insertSetting({ elem.last_area_increase.type, elem.last_area_increase.increase_speed < max_move ? slow_speed : fast_speed,
                     !increase_radius, elem.last_area_increase.no_error, !use_min_radius, elem.last_area_increase.move }, true);
             }
             // branch may still go though a hole, so a check has to be done whether the hole was already passed, and the regular avoidance can be used.
@@ -1978,22 +2153,22 @@ static void increase_areas_one_layer(
             Polygons inc_wo_collision;
             // Check whether it is faster to calculate the area increased with the fast speed independently from the slow area, or time could be saved by reusing the slow area to calculate the fast one.
             // Calculated by comparing the steps saved when calcualting idependently with the saved steps when not.
-            bool offset_independant_faster = radius / safe_movement_distance - int(config.maximum_move_distance + extra_speed < radius + safe_movement_distance) >
-                                             round_up_divide((extra_speed + extra_slow_speed + config.maximum_move_distance_slow), safe_movement_distance);
+            bool offset_independant_faster = radius / safe_movement_distance - int(max_move + extra_speed < radius + safe_movement_distance) >
+                                             round_up_divide((extra_speed + extra_slow_speed + max_move_slow), safe_movement_distance);
             for (const AreaIncreaseSettings &settings : order) {
                 if (settings.move) {
                     if (offset_slow.empty() && (settings.increase_speed == slow_speed || ! offset_independant_faster)) {
                         // offsetting in 2 steps makes our offsetted area rounder preventing (rounding) errors created by to pointy areas. At this point one can see that the Polygons class
                         // was never made for precision in the single digit micron range.
-                        offset_slow = safe_offset_inc(parent.influence_area, extra_speed + extra_slow_speed + config.maximum_move_distance_slow,
+                        offset_slow = safe_offset_inc(parent.influence_area, extra_speed + extra_slow_speed + max_move_slow,
                             wall_restriction, safe_movement_distance, offset_independant_faster ? safe_movement_distance + radius : 0, 2);
                     }
                     if (offset_fast.empty() && settings.increase_speed != slow_speed) {
                         if (offset_independant_faster)
-                            offset_fast = safe_offset_inc(parent.influence_area, extra_speed + config.maximum_move_distance,
+                            offset_fast = safe_offset_inc(parent.influence_area, extra_speed + max_move,
                                 wall_restriction, safe_movement_distance, offset_independant_faster ? safe_movement_distance + radius : 0, 1);
                         else {
-                            const coord_t delta_slow_fast = config.maximum_move_distance - (config.maximum_move_distance_slow + extra_slow_speed);
+                            const coord_t delta_slow_fast = max_move - (max_move_slow + extra_slow_speed);
                             offset_fast = safe_offset_inc(offset_slow, delta_slow_fast, wall_restriction, safe_movement_distance, safe_movement_distance + radius, offset_independant_faster ? 2 : 1);
                         }
                     }
@@ -2006,7 +2181,7 @@ static void increase_areas_one_layer(
                     Polygons lines_offset = offset(to_polylines(parent.influence_area), scaled<float>(0.005), jtMiter, 1.2);
                     Polygons base_error_area = union_(parent.influence_area, lines_offset);
                     result = increase_single_area(volumes, config, settings, layer_idx, parent,
-                        base_error_area, to_bp_data, to_model_data, inc_wo_collision, (config.maximum_move_distance + extra_speed) * 1.5, mergelayer);
+                        base_error_area, to_bp_data, to_model_data, inc_wo_collision, (max_move + extra_speed) * 1.5, mergelayer);
 #ifdef TREE_SUPPORT_SHOW_ERRORS
                     BOOST_LOG_TRIVIAL(error)
 #else // TREE_SUPPORT_SHOW_ERRORS
@@ -2118,11 +2293,13 @@ static void increase_areas_one_layer(
     out.to_model_gracious = first.to_model_gracious && second.to_model_gracious; // valid as we do not merge non-gracious with gracious
 
     out.elephant_foot_increases = 0;
-    if (config.bp_radius_increase_per_layer > 0) {
+    // Per-layer growth of what a foot may add over a branch: both parts follow this layer's thickness.
+    const double foot_increase_per_layer = config.bp_radius_increase_at(out.layer_idx) - config.branch_radius_increase_at(out.layer_idx);
+    if (foot_increase_per_layer > 0) {
         coord_t foot_increase_radius = std::abs(std::max(support_element_collision_radius(config, second), support_element_collision_radius(config, first)) - support_element_collision_radius(config, out));
         // elephant_foot_increases has to be recalculated, as when a smaller tree with a larger elephant_foot_increases merge with a larger branch
         // the elephant_foot_increases may have to be lower as otherwise the radius suddenly increases. This results often in a non integer value.
-        out.elephant_foot_increases = foot_increase_radius / (config.bp_radius_increase_per_layer - config.branch_radius_increase_per_layer);
+        out.elephant_foot_increases = foot_increase_radius / foot_increase_per_layer;
     }
 
     // set last settings to the best out of both parents. If this is wrong, it will only cause a small performance penalty instead of weird behavior.
@@ -2502,6 +2679,8 @@ static void create_layer_pathing(const TreeModelVolumes &volumes, const TreeSupp
     const auto _tiny_area_threshold = tiny_area_threshold();
 
     // Ensures at least one merge operation per 3mm height, 50 layers, 1 mm movement of slow speed or 5mm movement of fast speed (whatever is lowest). Values were guessed.
+    // Deliberately the nominal layer height: this is a performance heuristic on how many layers to merge
+    // at once, not geometry, so it must not follow the per-layer thicknesses (contract §4.1).
     size_t max_merge_every_x_layers = std::min(std::min(5000 / (std::max(config.maximum_move_distance, coord_t(100))), 1000 / std::max(config.maximum_move_distance_slow, coord_t(20))), 3000 / config.layer_height);
     size_t merge_every_x_layers = 1;
     // Calculate the influence areas for each layer below (Top down)
@@ -2959,7 +3138,6 @@ static std::pair<int, int> discretize_circle(const Vec3f &center, const Vec3f &n
 static std::pair<float, float> extrude_branch(
     const std::vector<const SupportElement*>&path,
     const TreeSupportSettings               &config,
-    const SlicingParameters                 &slicing_params,
     const std::vector<SupportElements>      &move_bounds,
     bool                                     has_root,
     indexed_triangle_set                    &result)
@@ -2978,8 +3156,8 @@ static std::pair<float, float> extrude_branch(
         const SupportElement &prev    = *path[ipath - 1];
         const SupportElement &current = *path[ipath];
         assert(prev.state.layer_idx + 1 == current.state.layer_idx);
-        p1 = to_3d(unscaled<double>(prev   .state.result_on_layer), layer_z(slicing_params, config, prev   .state.layer_idx));
-        p2 = to_3d(unscaled<double>(current.state.result_on_layer), layer_z(slicing_params, config, current.state.layer_idx));
+        p1 = to_3d(unscaled<double>(prev   .state.result_on_layer), layer_z(config, prev   .state.layer_idx));
+        p2 = to_3d(unscaled<double>(current.state.result_on_layer), layer_z(config, current.state.layer_idx));
         v1 = (p2 - p1).normalized();
         if (ipath == 1) {
             nprev = v1;
@@ -3042,7 +3220,7 @@ static std::pair<float, float> extrude_branch(
         } else {
             const SupportElement &next = *path[ipath + 1];
             assert(current.state.layer_idx + 1 == next.state.layer_idx);
-            p3 = to_3d(unscaled<double>(next.state.result_on_layer), layer_z(slicing_params, config, next.state.layer_idx));
+            p3 = to_3d(unscaled<double>(next.state.result_on_layer), layer_z(config, next.state.layer_idx));
             v2 = (p3 - p2).normalized();
             ncurrent = (v1 + v2).normalized();
             float radius = unscaled<float>(support_element_radius(config, current));
@@ -3090,7 +3268,6 @@ static void organic_smooth_branches_avoid_collisions(
     };
     std::vector<LayerCollisionCache> layer_collision_cache;
     layer_collision_cache.reserve(1024);
-    const SlicingParameters &slicing_params = print_object.slicing_parameters();
     for (const std::pair<SupportElement*, int>& element : elements_with_link_down) {
         LayerIndex layer_idx = element.first->state.layer_idx;
         if (size_t num_layers = layer_idx + 1; num_layers > layer_collision_cache.size()) {
@@ -3155,7 +3332,7 @@ static void organic_smooth_branches_avoid_collisions(
             element.parents.empty() || (link_down == -1 && element.state.layer_idx > 0),
             unscaled<float>(support_element_radius(config, element)),
             // 3D position
-            to_3d(unscaled<float>(element.state.result_on_layer), float(layer_z(slicing_params, config, element.state.layer_idx)))
+            to_3d(unscaled<float>(element.state.result_on_layer), float(layer_z(config, element.state.layer_idx)))
         });
         // Update min_z coordinate to min_z of the tree below.
         CollisionSphere &collision_sphere = collision_spheres.back();
@@ -3186,9 +3363,9 @@ static void organic_smooth_branches_avoid_collisions(
         //FIXME limit the collision span by the tree slope.
         collision_sphere.min_z = std::max(collision_sphere.min_z, collision_sphere.position.z() - collision_sphere.radius);
         collision_sphere.max_z = std::min(collision_sphere.max_z, collision_sphere.position.z() + collision_sphere.radius);
-        collision_sphere.layer_begin = std::min(collision_sphere.element.state.layer_idx, layer_idx_ceil(slicing_params, config, collision_sphere.min_z));
+        collision_sphere.layer_begin = std::min(collision_sphere.element.state.layer_idx, layer_idx_ceil(config, collision_sphere.min_z));
         assert(collision_sphere.layer_begin < layer_collision_cache.size());
-        collision_sphere.layer_end   = std::min(LayerIndex(layer_collision_cache.size()), std::max(collision_sphere.element.state.layer_idx, layer_idx_floor(slicing_params, config, collision_sphere.max_z)) + 1);
+        collision_sphere.layer_end   = std::min(LayerIndex(layer_collision_cache.size()), std::max(collision_sphere.element.state.layer_idx, layer_idx_floor(config, collision_sphere.max_z)) + 1);
     }
 
     throw_on_cancel();
@@ -3215,7 +3392,7 @@ static void organic_smooth_branches_avoid_collisions(
         const LayerIndex layer_idx = sphere.element.state.layer_idx;
         const Vec2d current_pos = to_2d(sphere.position).cast<double>();
         const double current_radius = double(support_element_radius(config, sphere.element));
-        const double maximum_move_distance_slow = double(config.maximum_move_distance_slow);
+        const double maximum_move_distance_slow = double(config.maximum_move_distance_slow_at(layer_idx));
 
         if (sphere.element_below_id != -1 && layer_idx > 0) {
             const size_t lower_id = linear_data_layers[layer_idx - 1] + size_t(sphere.element_below_id);
@@ -3250,13 +3427,13 @@ static void organic_smooth_branches_avoid_collisions(
             collision_sphere.prev_position = collision_sphere.position;
         std::atomic<size_t> num_moved{ 0 };
         tbb::parallel_for(tbb::blocked_range<size_t>(0, collision_spheres.size()),
-            [&collision_spheres, &layer_collision_cache, &slicing_params, &config, &linear_data_layers, &num_moved, &throw_on_cancel, &limit_candidate_to_linked_layers](const tbb::blocked_range<size_t> range) {
+            [&collision_spheres, &layer_collision_cache, &config, &linear_data_layers, &num_moved, &throw_on_cancel, &limit_candidate_to_linked_layers](const tbb::blocked_range<size_t> range) {
             for (size_t collision_sphere_id = range.begin(); collision_sphere_id < range.end(); ++ collision_sphere_id)
                 if (CollisionSphere &collision_sphere = collision_spheres[collision_sphere_id]; ! collision_sphere.locked) {
                     // Calculate collision of multiple 2D layers against a collision sphere.
                     collision_sphere.last_collision_depth = - std::numeric_limits<double>::max();
                     for (uint32_t layer_id = collision_sphere.layer_begin; layer_id != collision_sphere.layer_end; ++ layer_id) {
-                        double dz = (layer_id - collision_sphere.element.state.layer_idx) * slicing_params.layer_height;
+                        double dz = config.layer_grid.z_span(collision_sphere.element.state.layer_idx, LayerIndex(layer_id));
                         if (double r2 = sqr(collision_sphere.radius) - sqr(dz); r2 > 0) {
                             if (const LayerCollisionCache &layer_collision_cache_item = layer_collision_cache[layer_id]; ! layer_collision_cache_item.empty()) {
                                 size_t hit_idx_out;
@@ -3267,7 +3444,7 @@ static void organic_smooth_branches_avoid_collisions(
                                     double collision_depth = sqrt(r2) - dist;
                                     if (collision_depth > collision_sphere.last_collision_depth) {
                                         collision_sphere.last_collision_depth = collision_depth;
-                                        collision_sphere.last_collision = to_3d(hit_point_out.cast<float>(), float(layer_z(slicing_params, config, layer_id)));
+                                        collision_sphere.last_collision = to_3d(hit_point_out.cast<float>(), float(layer_z(config, layer_id)));
                                     }
                                 }
                             }
@@ -3353,7 +3530,7 @@ static void organic_smooth_branches_avoid_collisions(
     std::vector<openvdb::Vec3R> pts, prev, projections;
     std::vector<float> distances;
     for (const std::pair<SupportElement*, int>& element : elements_with_link_down) {
-        Vec3d pt = to_3d(unscaled<double>(element.first->state.result_on_layer), layer_z(print_object.slicing_parameters(), config, element.first->state.layer_idx)) * scale;
+        Vec3d pt = to_3d(unscaled<double>(element.first->state.result_on_layer), layer_z(config, element.first->state.layer_idx)) * scale;
         pts.push_back({ pt.x(), pt.y(), pt.z() });
     }
 
@@ -3514,12 +3691,8 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             }
         }
 
-        // Generator for model collision, avoidance and internal guide volumes.
-        TreeModelVolumes volumes{ print_object, build_volume, config.maximum_move_distance, config.maximum_move_distance_slow, processing.second.front(),
-#ifdef SLIC3R_TREESUPPORTS_PROGRESS
-            m_progress_multiplier, m_progress_offset,
-#endif // SLIC3R_TREESUPPORTS_PROGRESS
-            exclusion_areas };
+        // The collision volumes are built below, once the top contact layers are known, so that the
+        // grid they receive already carries the lowered gap layers.
 
         //FIXME generating overhangs just for the first mesh of the group.
         assert(processing.second.size() == 1);
@@ -3558,8 +3731,48 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 #else
         std::vector<Polygons>        overhangs = generate_overhangs(config, *print.get_object(processing.second.front()), throw_on_cancel);
 #endif
+        // Map every overhang to the support layer that carries its top contact. The contact is placed on
+        // an existing support layer - the highest one whose top stays at least support_top_z_distance
+        // below the overhang - so every support layer keeps the object layer's Z and height and the air
+        // gap is quantised upwards, never closed. `config` refers to the copy owned by grouped_meshes.
+        std::vector<LayerIndex> overhang_top_layer(overhangs.size(), -1);
+        {
+            TreeSupportLayerGrid &grid   = processing.first.layer_grid;
+            // Raw millimetres: the lowest Z a contact may reach under the overhang.
+            const double          top_z  = processing.first.settings.support_top_z_distance_mm;
+            // The mesh in the frame the layers were sliced in, which is the frame the grid holds: the
+            // overhang face itself is not a layer boundary (see overhang_face_z), and neither the mesh nor
+            // the grid carries the belt global Z offset - build_layer_grid() removes it from the object
+            // layers, PrintObject::slice() adds it to `Layer::print_z` only after slicing.
+            TriangleMesh     mesh;
+            OverhangFacetZIndex facet_index;
+            if (std::any_of(overhangs.begin(), overhangs.end(), [](const Polygons &overhang) { return ! overhang.empty(); })) {
+                mesh = print_object.model_object()->raw_mesh();
+                mesh.transform(print_object.trafo_sliced());
+                // One pass over the facets for all the areas below, instead of one per area.
+                facet_index.build(mesh);
+            }
+            for (size_t overhang_idx = grid.raft_layers; overhang_idx < overhangs.size(); ++ overhang_idx)
+                if (! overhangs[overhang_idx].empty())
+                    overhang_top_layer[overhang_idx] =
+                        place_overhang_contact(grid, LayerIndex(overhang_idx), mesh, facet_index,
+                            overhangs[overhang_idx], top_z).contact_layer;
+        }
+
+        // Generator for model collision, avoidance and internal guide volumes.
+        // The two movement limits passed here are the nominal ones, for the layers the grid does not
+        // cover; the avoidance caches derive the per-layer limit from the same grid this generator
+        // settles its support layers on (see TreeModelVolumes::m_max_move_per_layer), so the region they
+        // propagate and the step a branch may take per layer stay the same number.
+        TreeModelVolumes volumes{ print_object, build_volume, config.maximum_move_distance, config.maximum_move_distance_slow, processing.second.front(),
+            &processing.first.layer_grid,
+#ifdef SLIC3R_TREESUPPORTS_PROGRESS
+            m_progress_multiplier, m_progress_offset,
+#endif // SLIC3R_TREESUPPORT_PROGRESS
+            exclusion_areas };
+
         // ### Precalculate avoidances, collision etc.
-        size_t num_support_layers = precalculate(print, overhangs, processing.first, processing.second, volumes, throw_on_cancel);
+        size_t num_support_layers = precalculate(overhang_top_layer, print_object, volumes, throw_on_cancel);
         bool   has_support = num_support_layers > 0;
         bool   has_raft    = config.raft_layers.size() > 0;
         num_support_layers = std::max(num_support_layers, config.raft_layers.size());
@@ -3601,7 +3814,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         };
 
         InterfacePlacer              interface_placer{
-            print_object.slicing_parameters(), support_params, config,
+            support_params, config,
             // Outputs
             layer_storage, top_contacts, interface_layers, base_interface_layers };
 
@@ -3613,7 +3826,7 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
             // ### Place tips of the support tree
             for (size_t mesh_idx : processing.second)
-                generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs, 
+                generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs, overhang_top_layer,
                     move_bounds, interface_placer, throw_on_cancel);
             auto t_gen = std::chrono::high_resolution_clock::now();
 
@@ -3945,12 +4158,11 @@ void organic_draw_branches(
         }
     }
 
-    const SlicingParameters &slicing_params = print_object.slicing_parameters();
     MeshSlicingParams mesh_slicing_params;
     mesh_slicing_params.mode = MeshSlicingParams::SlicingMode::Positive;
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
-        [&trees, &volumes, &config, &slicing_params, &move_bounds, &mesh_slicing_params, &interface_placer, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+        [&trees, &volumes, &config, &move_bounds, &mesh_slicing_params, &interface_placer, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
             indexed_triangle_set    partial_mesh;
             std::vector<float>      slice_z;
             std::vector<Polygons>   bottom_contacts;
@@ -3959,17 +4171,17 @@ void organic_draw_branches(
                 for (const Branch &branch : tree.branches) {
                     // Triangulate the tube.
                     partial_mesh.clear();
-                    std::pair<float, float> zspan = extrude_branch(branch.path, config, slicing_params, move_bounds, branch.has_root, partial_mesh);
+                    std::pair<float, float> zspan = extrude_branch(branch.path, config, move_bounds, branch.has_root, partial_mesh);
                     LayerIndex layer_begin = branch.has_root ?
                         branch.path.front()->state.layer_idx : 
-                        std::min(branch.path.front()->state.layer_idx, layer_idx_ceil(slicing_params, config, zspan.first));
+                        std::min(branch.path.front()->state.layer_idx, layer_idx_ceil(config, zspan.first));
                     LayerIndex layer_end   = (branch.has_tip ?
                         branch.path.back()->state.layer_idx :
-                        std::max(branch.path.back()->state.layer_idx, layer_idx_floor(slicing_params, config, zspan.second))) + 1;
+                        std::max(branch.path.back()->state.layer_idx, layer_idx_floor(config, zspan.second))) + 1;
                     slice_z.clear();
                     for (LayerIndex layer_idx = layer_begin; layer_idx < layer_end; ++ layer_idx) {
-                        const double print_z  = layer_z(slicing_params, config, layer_idx);
-                        const double bottom_z = layer_idx > 0 ? layer_z(slicing_params, config, layer_idx - 1) : 0.;
+                        const double print_z  = layer_z(config, layer_idx);
+                        const double bottom_z = config.layer_grid.bottom_z(layer_idx);
                         slice_z.emplace_back(float(0.5 * (bottom_z + print_z)));
                     }
 
@@ -4020,7 +4232,7 @@ void organic_draw_branches(
                                 Polygons contacts;
 
                                 // ORCA: non-zero bottom Z should not be clipped by placeable areas.
-                                if (config.support_rests_on_model && config.z_distance_bottom_layers > 0 && layer_begin > 0)
+                                if (config.support_rests_on_model && config.has_bottom_gap && layer_begin > 0)
                                     contacts = slice_front_contact;
                                 else {
                                     Polygons placeable = volumes.getPlaceableAreas(0, layer_begin, [] {});
@@ -4054,6 +4266,9 @@ void organic_draw_branches(
                             // mode, so it doubles as the gate (no effect on other printer types).
                             const bool                      belt_mode = !volumes.m_belt_floor.empty();
                             // Don't propagate further than 1.5 * bottom radius.
+                            // Deliberately the nominal layer height: this is a heuristic cap on how
+                            // far a hanging branch is propagated towards a surface, not a geometric
+                            // quantity (contract §4.1 lists it with the nominal-value keepers).
                             //LayerIndex                      layers_propagate_max = 2 * bottom_radius / config.layer_height;
                             LayerIndex                      layers_propagate_max = 5 * bottom_radius / config.layer_height;
                             LayerIndex                      layer_bottommost = (branch.path.front()->state.verylost && !belt_mode) ?
@@ -4120,7 +4335,7 @@ void organic_draw_branches(
                                     const int contact_idx = int(bottom_extra_slices.size()) - 1; // Use the lowest contact slice as the footprint.
 
                                     // ORCA: non-zero bottom Z should not be clipped by placeable areas.
-                                    if (config.support_rests_on_model && config.z_distance_bottom_layers > 0 && layer_begin > 0)
+                                    if (config.support_rests_on_model && config.has_bottom_gap && layer_begin > 0)
                                         contacts = intersection_clipped(bottom_extra_slices[contact_idx].polygons, Polygons{volumes.m_bed_area}, ApplySafetyOffset::Yes);
                                     else {
                                         Polygons placeable = volumes.getPlaceableAreas(0, layer_begin, [] {});
@@ -4128,7 +4343,7 @@ void organic_draw_branches(
                                     }
                                 } else {
                                     // Fallback: use the current contact slice when no propagation happened.
-                                    if (config.support_rests_on_model && config.z_distance_bottom_layers > 0 && layer_begin > 0)
+                                    if (config.support_rests_on_model && config.has_bottom_gap && layer_begin > 0)
                                         contacts = slice_front_contact;
                                     else {
                                         Polygons placeable = volumes.getPlaceableAreas(0, layer_begin, [] {});
@@ -4157,7 +4372,7 @@ void organic_draw_branches(
                         // solid floor pad for branches that terminate on the tilted belt surface.
                         if (volumes.m_belt_floor.empty() &&
                             branch.has_root && config.support_rests_on_model && branch.path.front()->state.layer_idx > 0 &&
-                            config.settings.support_floor_layers > 0 && config.z_distance_bottom_layers > 0 &&
+                            config.settings.support_floor_layers > 0 && config.has_bottom_gap &&
                             bottom_contacts.empty() && !slice_front_contact.empty())
                             bottom_contacts.emplace_back(slice_front_contact);
 
@@ -4267,7 +4482,7 @@ void organic_draw_branches(
         }
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, std::min(move_bounds.size(), slices.size()), 1),
-        [&print_object, &config, &slices, &bottom_contacts, &top_contacts, &intermediate_layers, &layer_storage, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+        [&config, &slices, &bottom_contacts, &top_contacts, &intermediate_layers, &layer_storage, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
             Slice &slice = slices[layer_idx];
             assert(intermediate_layers[layer_idx] == nullptr);
@@ -4296,12 +4511,12 @@ void organic_draw_branches(
             if (! bottom_contact_polygons.empty()) {
                 base_layer_polygons = diff(base_layer_polygons, bottom_contact_polygons);
                 SupportGeneratorLayer *bottom_contact_layer = bottom_contacts[layer_idx] = &layer_allocate(
-                    layer_storage, SupporLayerType::BottomContact, print_object.slicing_parameters(), config, layer_idx);
+                    layer_storage, SupporLayerType::BottomContact, config, layer_idx);
                 bottom_contact_layer->polygons = std::move(bottom_contact_polygons);
             }
             if (! base_layer_polygons.empty()) {
                 SupportGeneratorLayer *base_layer = intermediate_layers[layer_idx] = &layer_allocate(
-                    layer_storage, SupporLayerType::Base, print_object.slicing_parameters(), config, layer_idx);
+                    layer_storage, SupporLayerType::Base, config, layer_idx);
                 base_layer->polygons = union_(base_layer_polygons);
             }
 

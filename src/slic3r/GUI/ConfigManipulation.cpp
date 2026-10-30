@@ -1096,8 +1096,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     // settings specific to organic trees
     for (auto el : {"tree_support_branch_angle_organic", "tree_support_branch_distance_organic", "tree_support_branch_diameter_organic", "tree_support_angle_slow", "tree_support_tip_diameter", "tree_support_top_rate", "tree_support_branch_diameter_angle"})
         toggle_line(el, support_is_organic, -1, _L("Enable tree supports with the Organic or Default style to show this setting."));
-    // ORCA: Independent support layer height is not compatible with organic tree supports,
-    // as they rely on the support layers being the same as the object layers to determine where to place branches.
+    // ORCA: Independent support layer height is not compatible with organic tree supports. Their layer
+    // grid is the object's own layers (raft included) and the top contact of an overhang is placed on
+    // the highest whole layer that keeps the requested air gap, so support and object layers stay
+    // synchronised; a fully independent support layer height is not supported.
     toggle_line("independent_support_layer_height", have_support_material && !support_is_organic, -1,
                 !have_support_material ? support_reason : _L("Independent support layer height is unavailable for organic tree supports."));
 

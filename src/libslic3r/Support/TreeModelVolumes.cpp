@@ -69,7 +69,8 @@ static Polygons calculateMachineBorderCollision(Polygon machine_border)
 TreeModelVolumes::TreeModelVolumes(
     const PrintObject &print_object,
     const BuildVolume &build_volume,
-    const coord_t max_move, const coord_t max_move_slow, size_t current_mesh_idx, 
+    const coord_t max_move, const coord_t max_move_slow, size_t current_mesh_idx,
+    const TreeSupportLayerGrid *layer_grid,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
     double progress_multiplier, double progress_offset, 
 #endif // SLIC3R_TREESUPPORTS_PROGRESS
@@ -110,7 +111,22 @@ TreeModelVolumes::TreeModelVolumes(
     {
         m_anti_overhang = print_object.slice_support_blockers();
         TreeSupportMeshGroupSettings mesh_settings(print_object);
+        // Take the grid the generator built its support layers on - one entry per object layer, raft
+        // layers first - so the collision volumes resolve the same Zs. No layer was moved onto a gap Z
+        // and none carries a gap remainder as its height.
+        if (layer_grid != nullptr && ! layer_grid->empty())
+            mesh_settings.layer_grid = *layer_grid;
         const TreeSupportSettings config{ mesh_settings, print_object.slicing_parameters() };
+        // Per-layer movement limits for the avoidance propagation, see m_max_move_per_layer. The -2 is
+        // the same rounding allowance the scalars above carry, so a uniform grid reproduces them exactly.
+        if (! config.layer_grid.empty()) {
+            m_max_move_per_layer.resize(config.layer_grid.size());
+            m_max_move_slow_per_layer.resize(config.layer_grid.size());
+            for (LayerIndex idx = 0; idx < LayerIndex(config.layer_grid.size()); ++ idx) {
+                m_max_move_per_layer[idx]      = std::max<coord_t>(config.maximum_move_distance_at(idx) - 2, 0);
+                m_max_move_slow_per_layer[idx] = std::max<coord_t>(config.maximum_move_distance_slow_at(idx) - 2, 0);
+            }
+        }
         m_current_min_xy_dist = config.xy_min_distance;
         m_current_min_xy_dist_delta = config.xy_distance - m_current_min_xy_dist;
         assert(m_current_min_xy_dist_delta >= 0);
@@ -216,12 +232,29 @@ void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord
     // like inital layer diameter are only done in once.
     TreeSupportSettings config(m_layer_outlines[m_current_outline_idx].first, print_object.slicing_parameters());
 
+    // Radius an element `distance_to_top` layers below its tip can reach. The generator asks for
+    // `getRadius_at(tip_layer, distance_to_top)`, which integrates the real layer heights between the
+    // tip and the element. A uniform grid makes that independent of the tip, a variable layer height
+    // does not: the same depth covers a different Z span depending on where the tip sits (a tip under
+    // the thin layers grows less than one under the thick ones). The caches below have to hold every
+    // radius the generator may ask for, otherwise the missing radius is recalculated on demand, and a
+    // request for a layer below the ones already calculated for that radius trips the cache's
+    // contiguous layer range (std::length_error, "vector too long"). So bound the radius by the widest
+    // tip anywhere in the grid. On a uniform grid every tip gives the same radius, so nothing changes.
+    const LayerIndex radius_tip_layer = std::min<LayerIndex>(LayerIndex(max_layer), LayerIndex(config.layer_grid.size()) - 1);
+    const auto       radius_below_tip = [&config, radius_tip_layer](const size_t distance_to_top, const double elephant_foot_increases = 0.) {
+        coord_t radius = config.getRadius_at(radius_tip_layer, distance_to_top, elephant_foot_increases);
+        for (LayerIndex tip = std::min<LayerIndex>(LayerIndex(distance_to_top), radius_tip_layer); tip < radius_tip_layer; ++ tip)
+            radius = std::max(radius, config.getRadius_at(tip, distance_to_top, elephant_foot_increases));
+        return radius;
+    };
+
     {
         // calculate which radius each layer in the tip may have.
         std::vector<coord_t> possible_tip_radiis;
         for (size_t distance_to_top = 0; distance_to_top <= config.tip_layers; ++ distance_to_top) {
-            possible_tip_radiis.emplace_back(ceilRadius(config.getRadius(distance_to_top)));
-            possible_tip_radiis.emplace_back(ceilRadius(config.getRadius(distance_to_top) + m_current_min_xy_dist_delta));
+            possible_tip_radiis.emplace_back(ceilRadius(radius_below_tip(distance_to_top)));
+            possible_tip_radiis.emplace_back(ceilRadius(radius_below_tip(distance_to_top) + m_current_min_xy_dist_delta));
         }
         sort_remove_duplicates(possible_tip_radiis);
         // It theoretically may happen in the tip, that the radius can change so much in-between 2 layers, 
@@ -251,9 +284,9 @@ void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord
                 assert(it->second >= current_layer);
         };
         // regular radius
-        update_radius_until_layer(ceilRadius(config.getRadius(distance_to_top, 0) + m_current_min_xy_dist_delta));
+        update_radius_until_layer(ceilRadius(radius_below_tip(distance_to_top) + m_current_min_xy_dist_delta));
         // the maximum radius that the radius with the min_xy_dist can achieve
-        update_radius_until_layer(ceilRadius(config.getRadius(distance_to_top, 0)));
+        update_radius_until_layer(ceilRadius(radius_below_tip(distance_to_top)));
         update_radius_until_layer(ceilRadius(config.recommendedMinRadius(current_layer) + m_current_min_xy_dist_delta));
     }
 
@@ -491,6 +524,50 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             const coord_t       layer_height              = settings.layer_height;
             const int           z_distance_bottom_layers  = int(round(double(settings.support_bottom_distance) / double(layer_height)));
             const int           z_distance_top_layers     = int(round(double(settings.support_top_distance) / double(layer_height)));
+            // Number of layers above / below each layer whose Z range still overlaps the clearance
+            // distance. Derived from the layer grid, which holds the real layer Zs, so a varying layer
+            // height and a distance that is not a multiple of the layer height stay correct. Empty when
+            // the group carries no grid, in which case the round(distance / layer height) values above
+            // are used for every layer.
+            std::vector<int>    num_layers_above;
+            std::vector<int>    num_layers_below;
+            int                 max_layers_above          = z_distance_top_layers;
+            int                 max_layers_below          = z_distance_bottom_layers;
+            if (const TreeSupportLayerGrid &grid = settings.layer_grid; grid.size() == outlines.size()) {
+                // Raw millimetres: the organic grid measures the clearance in Z, not in whole layers.
+                const double top_distance    = settings.support_top_z_distance_mm;
+                const double bottom_distance = settings.support_bottom_z_distance_mm;
+                num_layers_above.assign(outlines.size(), 0);
+                num_layers_below.assign(outlines.size(), 0);
+                max_layers_above = 0;
+                max_layers_below = 0;
+                for (LayerIndex layer_idx = 0; layer_idx < LayerIndex(outlines.size()); ++ layer_idx) {
+                    // Support material ends at the layer's own top: the top contact is placed on an
+                    // existing layer rather than bending the stack to its own Z, so the layer top is
+                    // where the clearance starts.
+                    const double z = grid.z(layer_idx);
+                    // A layer above counts while the object inside it is still less than the clearance
+                    // away. The object's own bottom is used rather than the layer bottom: a layer whose
+                    // slice reaches an overhang starts at the face, which sits above the layer bottom,
+                    // and measuring against the layer bottom would drag the overhang layer into the
+                    // clearance range and leave no room for the contact tips.
+                    while (layer_idx + num_layers_above[layer_idx] + 1 < LayerIndex(outlines.size()) &&
+                           grid.obj_bottom_z(layer_idx + num_layers_above[layer_idx] + 1) < z + top_distance - EPSILON)
+                        ++ num_layers_above[layer_idx];
+                    // A layer below counts while its top is still less than the clearance away.
+                    while (layer_idx - num_layers_below[layer_idx] - 1 >= 0 &&
+                           grid.z(layer_idx - num_layers_below[layer_idx] - 1) > z - bottom_distance - EPSILON)
+                        ++ num_layers_below[layer_idx];
+                    max_layers_above = std::max(max_layers_above, num_layers_above[layer_idx]);
+                    max_layers_below = std::max(max_layers_below, num_layers_below[layer_idx]);
+                }
+            }
+            const auto layers_above = [&num_layers_above, z_distance_top_layers](LayerIndex layer_idx) {
+                return layer_idx < LayerIndex(num_layers_above.size()) ? num_layers_above[layer_idx] : z_distance_top_layers;
+            };
+            const auto layers_below = [&num_layers_below, z_distance_bottom_layers](LayerIndex layer_idx) {
+                return layer_idx < LayerIndex(num_layers_below.size()) ? num_layers_below[layer_idx] : z_distance_bottom_layers;
+            };
             const coord_t       xy_distance               = outline_idx == m_current_outline_idx ? m_current_min_xy_dist : 
                 // technically this causes collision for the normal xy_distance to be larger by m_current_min_xy_dist_delta for all 
                 // not currently processing meshes as this delta will be added at request time.
@@ -503,8 +580,8 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             // 1) Calculate offsets of collision areas in parallel.
             LayerPolygonCache collision_areas_offsetted;
             collision_areas_offsetted.allocate(
-                std::max<LayerIndex>(0, data.begin() - z_distance_bottom_layers),
-                std::min<LayerIndex>(outlines.size(), data.end() + z_distance_top_layers));
+                std::max<LayerIndex>(0, data.begin() - max_layers_below),
+                std::min<LayerIndex>(outlines.size(), data.end() + max_layers_above));
             tbb::parallel_for(tbb::blocked_range<LayerIndex>(collision_areas_offsetted.begin(), collision_areas_offsetted.end()),
                 [&outlines, &machine_border = std::as_const(m_machine_border), offset_value = radius + xy_distance, &collision_areas_offsetted, &throw_on_cancel]
                 (const tbb::blocked_range<LayerIndex> &range) {
@@ -525,14 +602,16 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             const bool processing_last_mesh = outline_pos + 1 == layer_outline_indices.size();
             tbb::parallel_for(tbb::blocked_range<LayerIndex>(data.begin(), data.end()),
                 [&collision_areas_offsetted, &outlines, &machine_border = m_machine_border, &anti_overhang = m_anti_overhang, radius,
-                    xy_distance, z_distance_bottom_layers, z_distance_top_layers, min_resolution = m_min_resolution, &data, processing_last_mesh, &throw_on_cancel]
+                    xy_distance, &layers_above, &layers_below, min_resolution = m_min_resolution, &data, processing_last_mesh, &throw_on_cancel]
                 (const tbb::blocked_range<LayerIndex>& range) {
                     for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++ layer_idx) {
+                        const int num_below = layers_below(layer_idx);
+                        const int num_above = layers_above(layer_idx);
                         Polygons collisions;
-                        for (int i = - z_distance_bottom_layers; i <= 0; ++ i)
+                        for (int i = - num_below; i <= 0; ++ i)
                             if (int j = layer_idx + i; collision_areas_offsetted.has(j))
                                 append(collisions, collision_areas_offsetted[j]);
-                        for (int i = 1; i <= z_distance_top_layers; ++ i)
+                        for (int i = 1; i <= num_above; ++ i)
                             if (int j = layer_idx + i; j < int(outlines.size())) {
                                 Polygons collision_areas_original = machine_border;
                                 append(collision_areas_original, outlines[j]);
@@ -564,7 +643,7 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                                 // overhang that is expected to be supported is overwritten by the remaining part of the xy distance of the
                                 // layer below the to be supported area.
                                 coord_t required_range_x =
-                                    (xy_distance - ((i - (z_distance_top_layers == 1 ? 0.5 : 0)) * xy_distance / z_distance_top_layers)); 
+                                    (xy_distance - ((i - (num_above == 1 ? 0.5 : 0)) * xy_distance / num_above));
                                     // the conditional -0.5 ensures that plastic can never touch on the diagonal
                                     // downward when the z_distance_top_layers = 1. It is assumed to be better to
                                     // not support an overhang<90 degree than to risk fusing to it.
@@ -593,12 +672,12 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             // 3) Optionally calculate placables.
             if (calculate_placable) {
                 // Now calculate the placable areas.
-                tbb::parallel_for(tbb::blocked_range<LayerIndex>(std::max(z_distance_bottom_layers + 1, data.begin()), data.end()),
+                tbb::parallel_for(tbb::blocked_range<LayerIndex>(std::max(max_layers_below + 1, data.begin()), data.end()),
                     [&collision_areas_offsetted, &outlines, &anti_overhang = m_anti_overhang, processing_last_mesh,
-                     min_resolution = m_min_resolution, z_distance_bottom_layers, xy_distance, &data_placeable, &throw_on_cancel]
+                     min_resolution = m_min_resolution, &layers_below, xy_distance, &data_placeable, &throw_on_cancel]
                 (const tbb::blocked_range<LayerIndex>& range) {
                     for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++ layer_idx) {
-                        LayerIndex layer_idx_below = layer_idx - z_distance_bottom_layers - 1;
+                        LayerIndex layer_idx_below = layer_idx - layers_below(layer_idx) - 1;
                         assert(layer_idx_below >= 0);
                         const Polygons &current = collision_areas_offsetted[layer_idx];
                         const Polygons &below   = outlines[layer_idx_below];
@@ -721,21 +800,16 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
             // The following loop propagating avoidance regions bottom up is inherently serial.
             const bool  collision_holefree = (task.slow() || task.holefree()) && task.radius < m_increase_until_radius + m_current_min_xy_dist_delta;
             const float max_move           = task.slow() ? m_max_move_slow : m_max_move;
+            // Movement of the layer the region is propagated into, i.e. the same per-layer limit the
+            // generator moves a branch by (see m_max_move_per_layer). Uniform grids return the scalars.
+            const std::vector<coord_t> &move_per_layer = task.slow() ? m_max_move_slow_per_layer : m_max_move_per_layer;
+            const auto move_at = [&move_per_layer, max_move](const LayerIndex layer_idx) {
+                return layer_idx < LayerIndex(move_per_layer.size()) ? float(move_per_layer[layer_idx]) : max_move;
+            };
             // Limiting the offset step so that unioning the shrunk latest_avoidance with the current layer collisions
             // will not create gaps in the resulting avoidance region letting a tree support branch tunneling through an object wall.
-            float move_step      = 1.9 * std::max(task.radius, m_current_min_xy_dist);
-            if (move_step < EPSILON) return;
-            int   move_steps     = round_up_divide<int>(max_move, move_step);
-            assert(move_steps > 0);
-            float last_move_step = max_move - (move_steps - 1) * move_step;
-            if (last_move_step < scaled<float>(0.05)) {
-                assert(move_steps > 1);
-                if (move_steps > 1) {
-                    // Avoid taking a very short last step, stretch the other steps a bit instead.
-                    move_step = max_move / (-- move_steps);
-                    last_move_step = move_step;
-                }
-            }
+            const float step_limit = 1.9 * std::max(task.radius, m_current_min_xy_dist);
+            if (step_limit < EPSILON) return;
             // minDist as the delta was already added, also avoidance for layer 0 will return the collision.
             Polygons    latest_avoidance   = getAvoidance(task.radius, task.start_layer - 1, task.type, task.to_model, true);
             std::vector<std::pair<RadiusLayerPair, Polygons>> data;
@@ -743,6 +817,19 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
             for (LayerIndex layer_idx = task.start_layer; layer_idx <= task.max_required_layer; ++ layer_idx) {
                 // Merge current layer collisions with shrunk last_avoidance.
                 const Polygons &current_layer_collisions = collision_holefree ? getCollisionHolefree(task.radius, layer_idx) : getCollision(task.radius, layer_idx, true);
+                const float layer_move = move_at(layer_idx);
+                float       move_step  = step_limit;
+                int         move_steps = std::max(1, round_up_divide<int>(layer_move, move_step));
+                assert(move_steps > 0);
+                float last_move_step = layer_move - (move_steps - 1) * move_step;
+                // A layer whose movement limit is below the minimum step moves in that one step, so the
+                // `move_steps > 1` guard is a real case with the per-layer limit - not an invariant the
+                // way it was for the nominal scalar.
+                if (move_steps > 1 && last_move_step < scaled<float>(0.05)) {
+                    // Avoid taking a very short last step, stretch the other steps a bit instead.
+                    move_step = layer_move / (-- move_steps);
+                    last_move_step = move_step;
+                }
                 // For mildly steep branch angles only one step will be taken.
                 for (int istep = 0; istep < move_steps; ++ istep)
                     latest_avoidance = union_(current_layer_collisions,
