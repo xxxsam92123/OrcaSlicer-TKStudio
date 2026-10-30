@@ -650,6 +650,13 @@ jobs:
           chmod +x "$appimage"
           "$appimage" --appimage-extract
           ./scripts/build_preset_cache.sh -b build build/package/resources/profiles squashfs-root/resources/profiles
+          # appimagetool's rolling build now validates AppDir permissions and
+          # refuses a tree whose directories are not readable/executable for
+          # every user; --appimage-extract can recreate them as 0700. Normalise
+          # the tree before repacking so the shipped AppImage carries the same
+          # usable modes instead of failing the check.
+          chmod -R a+rX squashfs-root
+          chmod a+rx squashfs-root/AppRun
           appimagetool=$(find build -name "appimagetool.AppImage" | head -1)
           ARCH=$(uname -m) "$appimagetool" --appimage-extract-and-run squashfs-root "$appimage"
           rm -rf squashfs-root
