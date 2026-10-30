@@ -1465,8 +1465,9 @@ public:
             // this flag, and it is the call unwinding here.
             m_released.store(true, std::memory_order_release);
     }
-    // Step 4 gave every rebuilt PrintObject its regions: the state is live again, so the marker
-    // stays consumed exactly as it does for any other apply() from here on.
+    // Step 4 gave every rebuilt PrintObject its regions - or the rebuild turned out to reproduce a
+    // different object set than the release recorded: the state is live again, so the marker stays
+    // consumed exactly as it does for any other apply() from here on.
     void disarm() { m_armed = false; }
 
 private:
@@ -1790,7 +1791,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         model_inputs_unchanged(m_model, model, m_sliced_model_object_ids);
     // Armed after the proof above and before step 1 allocates: from here until step 4 has rebuilt
     // the objects, the state the marker vouches for is gone, so a failure in between has to leave
-    // the marker set again. See ScopedReleasedStateRestore; disarmed at the end of step 4.
+    // the marker set again. See ScopedReleasedStateRestore; disarmed at the end of step 4, or as
+    // soon as the rebuild turns out not to reproduce the object set the release recorded.
     // Only a release this apply() proved to be coming back is restored. If the inputs moved while
     // released, the steps below rewrite the very snapshot that proof is made against (m_config,
     // m_model, the sliced object ids), so restoring the marker over that advanced snapshot would
@@ -2260,9 +2262,20 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         std::set<ObjectID> rebuilt_ids;
         for (const PrintObject *object : m_objects)
             rebuilt_ids.insert(object->model_object()->id());
-        if (released_unchanged)
+        if (released_unchanged) {
             released_rebuilt_same_objects =
                 rebuilt_ids == std::set<ObjectID>(m_sliced_model_object_ids.begin(), m_sliced_model_object_ids.end());
+            if (! released_rebuilt_same_objects)
+                // An object came or went on this plate while it was released. The proof above looks
+                // only at the objects the release recorded, so it cannot see that difference; the
+                // snapshot below can then only hold one of the two sets. This apply() is therefore
+                // not the release coming back, and restoring the marker over the advanced snapshot
+                // would let the next apply() read that set as the released one: it would find
+                // released_rebuilt_same_objects true and mark the plate's stale G-code file ready.
+                // Disarm before the snapshot moves, so a failure in the region pass below leaves
+                // the marker consumed and the next apply() reports the change instead.
+                released_state_restore.disarm();
+        }
         // The print's objects now match the model it just applied, so this is the set a later
         // release has to record again anyway; keep it consistent in the meantime.
         m_sliced_model_object_ids.assign(rebuilt_ids.begin(), rebuilt_ids.end());
