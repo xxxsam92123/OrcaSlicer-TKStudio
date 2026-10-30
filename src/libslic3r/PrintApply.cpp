@@ -1448,8 +1448,10 @@ void Print::update_shrinkage_compensation(size_t num_extruders, std::vector<int>
 class ScopedReleasedStateRestore
 {
 public:
-    // `armed` is the value the consumed release had: a print that was not released has nothing to
-    // restore, and a failure in the middle of a normal apply() must not turn it into a released one.
+    // `armed` is the release this apply() consumed and proved to be coming back: a print that was
+    // not released has nothing to restore, and neither does a change that arrived while it was
+    // released, because apply() has then already rewritten the snapshot that proof was made
+    // against. A normal apply() failing in the middle must not turn the print into a released one.
     ScopedReleasedStateRestore(std::atomic<bool> &released, bool armed) : m_released(released), m_armed(armed) {}
     ScopedReleasedStateRestore(const ScopedReleasedStateRestore&) = delete;
     ScopedReleasedStateRestore& operator=(const ScopedReleasedStateRestore&) = delete;
@@ -1775,10 +1777,6 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // release coming back rather than a change. See released_unchanged. Atomic, because a release
     // of this print may be running on another thread than the one calling apply().
     const bool released_state = m_slicing_state_released.exchange(false);
-    // Armed right after the exchange and before anything below allocates: from here until step 4 has
-    // rebuilt the objects, the state the marker vouches for is gone, so a failure in between has to
-    // leave the marker set again. See ScopedReleasedStateRestore; disarmed at the end of step 4.
-    ScopedReleasedStateRestore released_state_restore(m_slicing_state_released, released_state);
     // Whether the inputs are still the ones this print's result was produced from. A released print
     // has no PrintObjects, so the rebuild in step 4 cannot tell that apart from a real change: every
     // step it would invalidate is already invalid (release invalidated them all) and every
@@ -1790,6 +1788,17 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     const bool released_unchanged = released_state &&
         full_config_diff.empty() && print_diff.empty() && object_diff.empty() && region_diff.empty() &&
         model_inputs_unchanged(m_model, model, m_sliced_model_object_ids);
+    // Armed after the proof above and before step 1 allocates: from here until step 4 has rebuilt
+    // the objects, the state the marker vouches for is gone, so a failure in between has to leave
+    // the marker set again. See ScopedReleasedStateRestore; disarmed at the end of step 4.
+    // Only a release this apply() proved to be coming back is restored. If the inputs moved while
+    // released, the steps below rewrite the very snapshot that proof is made against (m_config,
+    // m_model, the sliced object ids), so restoring the marker over that advanced snapshot would
+    // let the next apply() read the real change as unchanged and keep the plate's stale G-code
+    // file marked ready. That case keeps the conservative outcome instead: the export step stays
+    // invalidated and the plate is resliced.
+    ScopedReleasedStateRestore released_state_restore(
+        m_slicing_state_released, released_state && released_unchanged);
 
     // Do not use the ApplyStatus as we will use the max function when updating apply_status.
     unsigned int apply_status = APPLY_STATUS_UNCHANGED;
@@ -1997,13 +2006,18 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         // The list actually can be empty if all instances are out of the print bed.
         //assert(print_objects_range.begin() != print_objects_range.end());
         // All PrintObjects in print_objects_range shall point to the same prints_objects_regions
-        // A PrintObject left behind by an apply() that failed before its region pass has no regions
-        // yet, and that rebuilt object list is what the restored release marker resumes from: there
-        // is nothing to reuse, so the status stays Invalid and step 4 generates them from scratch.
-        if (print_objects_range.begin() != print_objects_range.end() &&
-            print_objects_range.begin()->print_object->m_shared_regions != nullptr) {
-            model_object_status.print_object_regions = print_objects_range.begin()->print_object->m_shared_regions;
-            model_object_status.print_object_regions->ref_cnt_inc();
+        if (print_objects_range.begin() != print_objects_range.end()) {
+            // A PrintObject left behind by an apply() that failed before its region pass has no
+            // regions yet, and that rebuilt object list is what the restored release marker resumes
+            // from. There is nothing to reuse, so the status is set Invalid explicitly rather than
+            // left to the default, and the null check in step 4 generates the regions from scratch.
+            if (print_objects_range.begin()->print_object->m_shared_regions != nullptr) {
+                model_object_status.print_object_regions = print_objects_range.begin()->print_object->m_shared_regions;
+                model_object_status.print_object_regions->ref_cnt_inc();
+            } else {
+                model_object_status.print_object_regions_status =
+                    ModelObjectStatus::PrintObjectRegionsStatus::Invalid;
+            }
         }
         if (solid_or_modifier_differ || model_origin_translation_differ || layer_height_ranges_differ ||
             ! model_object.layer_height_profile.timestamp_matches(model_object_new.layer_height_profile)) {
