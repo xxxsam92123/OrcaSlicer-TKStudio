@@ -1161,10 +1161,6 @@ void add_correct_opts_to_options_list(const std::string &opt_key, std::map<std::
 
 std::string Tab::options_list_storage_key(const std::string& opt_key) const
 {
-    if (opt_key == "printable_area" || opt_key == "bed_exclude_area" || opt_key == "compatible_prints" ||
-        opt_key == "compatible_printers" || opt_key == "thumbnails" || opt_key == "wrapping_exclude_area")
-        return opt_key;
-
     if (m_config == nullptr || !m_config->has(opt_key))
         return opt_key;
 
@@ -1172,13 +1168,7 @@ std::string Tab::options_list_storage_key(const std::string& opt_key) const
     if (option == nullptr || !option->is_vector())
         return opt_key;
 
-    const ConfigOptionDef* def = m_config->def()->get(opt_key);
-    if (def == nullptr)
-        return opt_key;
-
-    const bool serialized = def->gui_flags == "serialized";
-    const bool is_plugin_field = def->gui_type == ConfigOptionDef::GUIType::plugin_picker;
-    return (serialized || is_plugin_field) ? opt_key : opt_key + "#0";
+    return is_edited_as_whole_list(m_config->def(), opt_key) ? opt_key : opt_key + "#0";
 }
 
 // Orca: deep_diff() flags every vector entry at or past the reference vector's length as changed,
@@ -3729,6 +3719,15 @@ void TabPrint::update()
     }
 }
 
+int TabPrint::extruder_variant_index(int extruder_id, NozzleVolumeType nozzle_type)
+{
+    const auto *extruders = m_preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnumsGeneric>("extruder_type");
+    if (extruders == nullptr || extruder_id < 0 || extruder_id >= int(extruders->size()))
+        return -1;
+    return m_config->get_index_for_extruder(extruder_id + 1, "print_extruder_id", ExtruderType(extruders->values[extruder_id]), nozzle_type,
+                                            "print_extruder_variant");
+}
+
 void TabPrint::clear_pages()
 {
     Tab::clear_pages();
@@ -4840,7 +4839,7 @@ void TabFilament::build()
             // Compare on the bare key: a per-variant row reports an indexed id
             // ("adaptive_pressure_advance_model#0"), while the model row does not.
             if (opt_key.substr(0, opt_key.find('#')) == "adaptive_pressure_advance_model")
-                m_config_manipulation.check_adaptive_pressure_advance_model(&filament_config);
+                m_config_manipulation.check_adaptive_pressure_advance_model(&filament_config, selected_variant_index());
 
             on_value_change(opt_key, value);
         };
