@@ -675,6 +675,55 @@ TEST_CASE("Z anti-aliasing keeps the infill rotation template's step", "[Fill]")
     CHECK(steps > 0);
 }
 
+TEST_CASE("Z anti-aliasing stops alternating the infill direction only on the layers it resamples", "[Fill]")
+{
+    // The `line` pattern turns the infill by 90 degrees on odd layer ids, so a layer that keeps
+    // the usual alternation shows up as a second value in the angle sequence.
+    const int raft_layers = GENERATE(0, 1);
+    CAPTURE(raft_layers);
+
+    auto angles_for = [raft_layers](bool dont_alternate) {
+        Print print;
+        Slic3r::Test::init_and_process_print({Slic3r::Test::cube(10)}, print,
+                                            {{"sparse_infill_pattern", "line"},
+                                             {"sparse_infill_density", "40%"},
+                                             // No shells, so every layer is sparse infill.
+                                             {"top_shell_layers", 0},
+                                             {"bottom_shell_layers", 0},
+                                             {"layer_height", 0.2},
+                                             {"zaa_enabled", 1},
+                                             {"zaa_min_z", 0.05},
+                                             {"zaa_dont_alternate_fill_direction", dont_alternate ? 1 : 0},
+                                             {"raft_layers", raft_layers}});
+        return angles_per_layer(print, sparse_role);
+    };
+
+    // ZAA on its own changes nothing about the direction: the switch is what suppresses it.
+    const std::vector<int> alternating = angles_for(false);
+    const std::vector<int> constant    = angles_for(true);
+
+    // Z contouring varies the layer heights, so the count is not 10mm / 0.2mm here.
+    REQUIRE(alternating.size() > 10);
+    REQUIRE(alternating.size() == constant.size());
+    REQUIRE(std::count(alternating.begin(), alternating.end(), -1) == 0);
+    REQUIRE(std::count(constant.begin(), constant.end(), -1) == 0);
+
+    for (size_t i = 1; i < alternating.size(); ++i) {
+        CAPTURE(i, alternating[i - 1], alternating[i]);
+        CHECK(alternating[i] != alternating[i - 1]);
+    }
+
+    // The first object layer is not a ZAA sampling layer, so the switch leaves its direction alone.
+    CAPTURE(constant.front(), alternating.front());
+    CHECK(constant.front() == alternating.front());
+
+    // Every layer ZAA resamples holds one direction instead of alternating.
+    for (size_t i = 1; i < constant.size(); ++i) {
+        CAPTURE(i, constant[1], constant[i]);
+        CHECK(constant[i] == constant[1]);
+    }
+}
+
 TEST_CASE("Ironing follows the solid infill rotation template", "[Fill]")
 {
     Print print;
