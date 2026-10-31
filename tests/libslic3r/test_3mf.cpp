@@ -8,6 +8,7 @@
 #include "catch2/generators/catch_generators_range.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Format/3mf.hpp"
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/Format/STL.hpp"
@@ -485,7 +486,10 @@ static bool load_project(const std::string& path, Model& model, const ScopedTemp
     return loaded;
 }
 
-TEST_CASE("A plate's G-code statistics are stored next to its G-code", "[3mf]")
+// The statistics of a plate are written beside its G-code, and read back with it: a project saved
+// with statistics has them, at about a megabyte per plate, instead of the 100+ MB of G-code a plate
+// would otherwise have to be parsed for on the next export after the project is opened again.
+TEST_CASE("A plate's G-code statistics survive a project round trip", "[3mf]")
 {
     const bool with_statistics = GENERATE(false, true);
     ScopedTemporaryFile gcode(".gcode");
@@ -505,7 +509,7 @@ TEST_CASE("A plate's G-code statistics are stored next to its G-code", "[3mf]")
     plate.gcode_file      = gcode.string();
     plate.is_sliced_valid = true;
     if (with_statistics)
-        plate.statistics = R"({ "version": 1 })";
+        plate.statistics = R"({ "version": 1, "layers": [ { "z": 0.2 } ] })";
     ScopedTemporaryFile file(".3mf");
     const std::string   path = file.string();
     StoreParams         sp;
@@ -521,6 +525,32 @@ TEST_CASE("A plate's G-code statistics are stored next to its G-code", "[3mf]")
     CHECK(read_cad_recipe_entry(path, stored, "Metadata/plate_1.statistics.json") == with_statistics);
     if (with_statistics)
         CHECK(stored == plate.statistics);
+
+    // Loading hands the document to the plate rather than leaving it in the archive: that is what
+    // lets an export of the opened project skip summing it from the G-code.
+    ScopedTemporaryDir load_backup_dir("orca_statistics_load");
+    // As a project's backup directory is laid out by the application: the importer writes the plate
+    // files it extracts under <backup>/Metadata, and does not create that directory itself.
+    boost::filesystem::create_directories(load_backup_dir.string() + "/Metadata");
+    Model              loaded_model;
+    loaded_model.set_backup_path(load_backup_dir.string());
+    DynamicPrintConfig        dst_config;
+    ConfigSubstitutionContext ctxt{ ForwardCompatibilitySubstitutionRule::Enable };
+    PlateDataPtrs             plates;
+    std::vector<Preset*>      project_presets;
+    bool                      is_bbl_3mf = false, is_orca_3mf = false;
+    Semver                    file_version;
+    REQUIRE(load_bbs_3mf(path.c_str(), &dst_config, &ctxt, &loaded_model, &plates, &project_presets, &is_bbl_3mf, &is_orca_3mf,
+                         &file_version, nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(plates.size() == 1);
+    if (with_statistics)
+        CHECK(plates.front()->statistics == plate.statistics);
+    else
+        CHECK(plates.front()->statistics.empty());
+    // The G-code is extracted as before, so a plate whose document is absent is summed from it.
+    CHECK(boost::filesystem::exists(load_backup_dir.string() + "/Metadata/plate_1.gcode"));
+    CHECK_FALSE(boost::filesystem::exists(load_backup_dir.string() + "/Metadata/plate_1.statistics.json"));
+    release_PlateData_list(plates);
 }
 
 TEST_CASE("A project with a plate id below 1 fails to load", "[3mf][Regression]")

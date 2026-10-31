@@ -103,7 +103,10 @@ struct PlateData
     std::string     nozzle_volume_types;
     std::string     gcode_file;
     std::string     gcode_file_md5;
-    // The G-code's statistics as JSON, stored with the G-code when not empty.
+    // The G-code's statistics as JSON, stored with the G-code when not empty. Read back from the
+    // archive on load (Metadata/plate_N.statistics.json), so a plate of a project saved with
+    // statistics does not have to be summed from its G-code again; see
+    // GCodeProcessorResult::statistics_json.
     std::string     statistics;
     std::string     thumbnail_file;
     std::string     no_light_thumbnail_file;

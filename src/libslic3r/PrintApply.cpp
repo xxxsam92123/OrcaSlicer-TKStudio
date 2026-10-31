@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <boost/log/trivial.hpp>
 #include <cassert>
 #include <cfloat>
@@ -244,6 +245,109 @@ static bool layer_height_ranges_equal(const t_layer_config_ranges &lr1, const t_
             std::abs(kvp1.first.second - kvp2.first.second) > EPSILON ||
             (check_layer_height && std::abs(kvp1.second.option("layer_height")->getFloat() - kvp2.second.option("layer_height")->getFloat()) > EPSILON))
             return false;
+    }
+    return true;
+}
+
+// The ModelObject `id` names in `model`, or nullptr. Objects are matched by ID rather than by
+// position, because apply() reorders the shared model when another plate's object comes or goes.
+static const ModelObject* find_model_object_by_id(const Model &model, const ObjectID &id)
+{
+    for (const ModelObject *object : model.objects)
+        if (object->id() == id)
+            return object;
+    return nullptr;
+}
+
+// Whether `model` still describes the same printable input as `applied` - the snapshot apply()
+// keeps of the model it last sliced - for the objects `sliced_object_ids` names, which are the
+// objects this print's result was produced from. A released print has no PrintObjects left, so the
+// rebuild in step 4 cannot tell "nothing changed, this is the release coming back" from "the model
+// moved": every step it would invalidate is already invalid and every PrintObject it would compare
+// is gone. The caller uses this to prove the former before it keeps a plate's G-code result.
+// Only this print's objects are compared. apply() is handed the shared model of the whole project,
+// so another plate's object moving or losing a volume is not a change to this plate's G-code; a
+// comparison over all objects would invalidate every finished plate after any edit anywhere.
+// It is deliberately conservative: it compares what apply() compares (object config, layer
+// profile and ranges, origin, the four painted-data sets, brim points, volumes, instances) plus the
+// mesh identity, which a copy shares, so a replaced mesh is caught; anything it cannot compare
+// counts as changed. A false "changed" only costs a re-slice, a false "unchanged" would keep a
+// result that no longer describes the plate.
+static bool model_inputs_unchanged(const Model &applied, const Model &model, const std::vector<ObjectID> &sliced_object_ids)
+{
+    if (applied.id() != model.id())
+        return false;
+    // A released print without a recorded object set is not provably unchanged.
+    if (sliced_object_ids.empty())
+        return false;
+    // Only this plate's custom G-codes reach the print: apply() copies the entry of the plate it
+    // is applied for and leaves the other plates' entries alone.
+    {
+        const auto it_applied = applied.plates_custom_gcodes.find(model.curr_plate_index);
+        const auto it_model   = model.plates_custom_gcodes.find(model.curr_plate_index);
+        const bool has_applied = it_applied != applied.plates_custom_gcodes.end();
+        const bool has_model   = it_model != model.plates_custom_gcodes.end();
+        if (has_applied != has_model)
+            return false;
+        if (has_applied && it_applied->second != it_model->second)
+            return false;
+    }
+    for (const ObjectID &object_id : sliced_object_ids) {
+        const ModelObject *pa = find_model_object_by_id(applied, object_id);
+        const ModelObject *pb = find_model_object_by_id(model, object_id);
+        // An object this plate's result was produced from is gone from one of the two models: the
+        // result cannot describe the plate any more.
+        if (pa == nullptr || pb == nullptr)
+            return false;
+        const ModelObject &a = *pa;
+        const ModelObject &b = *pb;
+        if (! a.config.timestamp_matches(b.config))
+            return false;
+        if (! a.layer_height_profile.timestamp_matches(b.layer_height_profile))
+            return false;
+        if (! layer_height_ranges_equal(a.layer_config_ranges, b.layer_config_ranges, b.layer_height_profile.empty()))
+            return false;
+        if (! a.origin_translation.isApprox(b.origin_translation))
+            return false;
+        // The volumes first, and one by one: the four painted-data helpers below call
+        // model_property_changed(), which asserts that the volume lists match. Comparing the whole
+        // lists here also covers model_volume_list_changed() for every volume type apply() filters
+        // on (model parts, modifiers, supports, precise seam), so the assert holds.
+        if (a.volumes.size() != b.volumes.size() || a.instances.size() != b.instances.size())
+            return false;
+        for (size_t j = 0; j < a.volumes.size(); ++j) {
+            const ModelVolume &va = *a.volumes[j];
+            const ModelVolume &vb = *b.volumes[j];
+            if (va.id() != vb.id() || va.type() != vb.type())
+                return false;
+            if (! va.config.timestamp_matches(vb.config))
+                return false;
+            if (! va.get_matrix().isApprox(vb.get_matrix()))
+                return false;
+            // Copies share the mesh, so a replaced mesh is a different pointer. A mesh edited in
+            // place keeps it - the same blind spot model_volume_list_changed() has, which compares
+            // ids and matrices rather than the triangles.
+            if (va.mesh_ptr() != vb.mesh_ptr())
+                return false;
+        }
+        // The painted data does not live in the mesh, the volume config or the volumes' matrices,
+        // so nothing above can see it. apply() invalidates a step for each of these four sets, and
+        // each of them changes the exported G-code: supports, per-facet filament (colours), fuzzy
+        // skin and seam placement. They are pairwise independent TriangleSelectors.
+        if (model_custom_supports_data_changed(a, b) ||
+            model_mmu_segmentation_data_changed(a, b) ||
+            model_fuzzy_skin_data_changed(a, b) ||
+            model_custom_seam_data_changed(a, b) ||
+            model_brim_points_data_changed(a, b))
+            return false;
+        for (size_t j = 0; j < a.instances.size(); ++j) {
+            const ModelInstance &ia = *a.instances[j];
+            const ModelInstance &ib = *b.instances[j];
+            if (ia.id() != ib.id() || ia.printable != ib.printable)
+                return false;
+            if (! ia.get_transformation().get_matrix().isApprox(ib.get_transformation().get_matrix()))
+                return false;
+        }
     }
     return true;
 }
@@ -1333,6 +1437,44 @@ void Print::update_shrinkage_compensation(size_t num_extruders, std::vector<int>
         set_compensation(extruders.front());
 }
 
+// The released marker of a print whose slicing state is gone is what makes the next apply() read
+// its rebuild as that release coming back rather than as a change. apply() consumes it before the
+// rebuild, and the rebuild is where a memory-short run fails: PrintObjects, their configs and their
+// regions are all allocated there. A marker that says "live" in front of an empty or half rebuilt
+// object list is a state no later apply() can tell from a changed model, so it reports the plate's
+// finished result as invalidated and nothing records the release again. Restoring the marker on the
+// way out leaves the print as the release left it, which is what the state still is; the exception
+// itself is left to propagate.
+class ScopedReleasedStateRestore
+{
+public:
+    // `armed` is the release this apply() consumed and proved to be coming back: a print that was
+    // not released has nothing to restore, and neither does a change that arrived while it was
+    // released, because apply() has then already rewritten the snapshot that proof was made
+    // against. A normal apply() failing in the middle must not turn the print into a released one.
+    ScopedReleasedStateRestore(std::atomic<bool> &released, bool armed) : m_released(released), m_armed(armed) {}
+    ScopedReleasedStateRestore(const ScopedReleasedStateRestore&) = delete;
+    ScopedReleasedStateRestore& operator=(const ScopedReleasedStateRestore&) = delete;
+    // Plain member data on purpose: arming this guard must not allocate, because it is armed to make
+    // a failed allocation survivable.
+    ~ScopedReleasedStateRestore()
+    {
+        if (m_armed)
+            // Pairs with the acquire loads of used_filaments_for_normalize() and
+            // object_count_for_normalize(). Not an exchange: apply() is the only place that clears
+            // this flag, and it is the call unwinding here.
+            m_released.store(true, std::memory_order_release);
+    }
+    // Step 4 gave every rebuilt PrintObject its regions - or the rebuild turned out to reproduce a
+    // different object set than the release recorded: the state is live again, so the marker stays
+    // consumed exactly as it does for any other apply() from here on.
+    void disarm() { m_armed = false; }
+
+private:
+    std::atomic<bool> &m_released;
+    bool               m_armed;
+};
+
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, bool extruder_applied)
 {
 #ifdef _DEBUG
@@ -1347,7 +1489,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	new_full_config.option("printer_settings_id",          true);
 
     // BBS
-    std::vector <unsigned int> used_filaments = this->extruders(true);
+    // Not this->extruders() directly: a released print has no PrintObject left to derive this from
+    // and the release recorded what the slice used. See used_filaments_for_normalize().
+    std::vector <unsigned int> used_filaments = this->used_filaments_for_normalize();
     std::unordered_set <unsigned int> used_filament_set(used_filaments.begin(), used_filaments.end());
 
     // A mixed slot is virtual: the filaments actually consumed are its components, so add them
@@ -1366,7 +1510,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // Orca: used_filaments and objects() still describe the previous model. The check after the
     // region update normalizes this copy again by the current ones.
     DynamicPrintConfig unnormalized_config = new_full_config;
-    t_config_option_keys changed_keys = new_full_config.normalize_fdm_2(objects().size(), used_filaments.size());
+    // Not this->objects().size() directly: a released print has no PrintObject left to count and
+    // the release recorded how many it had. See object_count_for_normalize().
+    t_config_option_keys changed_keys = new_full_config.normalize_fdm_2((int)this->object_count_for_normalize(), (int)used_filaments.size());
     if (changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got changed_keys, size=%1%")%changed_keys.size();
         for (int i = 0; i < changed_keys.size(); i++)
@@ -1628,6 +1774,34 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         m_config.filament_map_2.values[index] = slot_index >= 0 ? slot_index : filament_maps[index] - 1;
     }
 
+    // Consumed here: apply() is what rebuilds a released print, and the rebuild below is that
+    // release coming back rather than a change. See released_unchanged. Atomic, because a release
+    // of this print may be running on another thread than the one calling apply().
+    const bool released_state = m_slicing_state_released.exchange(false);
+    // Whether the inputs are still the ones this print's result was produced from. A released print
+    // has no PrintObjects, so the rebuild in step 4 cannot tell that apart from a real change: every
+    // step it would invalidate is already invalid (release invalidated them all) and every
+    // PrintObject it would compare is gone along with the per-object config and instance
+    // comparisons of steps 1-3. Prove it here, against the snapshot apply() keeps, before step 1
+    // starts rewriting that snapshot. The four config diffs are print-level (this print's config,
+    // its defaults and this plate's custom G-codes); the objects are filtered to the ones this
+    // print's result was produced from, so another plate's edit does not count here.
+    const bool released_unchanged = released_state &&
+        full_config_diff.empty() && print_diff.empty() && object_diff.empty() && region_diff.empty() &&
+        model_inputs_unchanged(m_model, model, m_sliced_model_object_ids);
+    // Armed after the proof above and before step 1 allocates: from here until step 4 has rebuilt
+    // the objects, the state the marker vouches for is gone, so a failure in between has to leave
+    // the marker set again. See ScopedReleasedStateRestore; disarmed at the end of step 4, or as
+    // soon as the rebuild turns out not to reproduce the object set the release recorded.
+    // Only a release this apply() proved to be coming back is restored. If the inputs moved while
+    // released, the steps below rewrite the very snapshot that proof is made against (m_config,
+    // m_model, the sliced object ids), so restoring the marker over that advanced snapshot would
+    // let the next apply() read the real change as unchanged and keep the plate's stale G-code
+    // file marked ready. That case keeps the conservative outcome instead: the export step stays
+    // invalidated and the plate is resliced.
+    ScopedReleasedStateRestore released_state_restore(
+        m_slicing_state_released, released_state && released_unchanged);
+
     // Do not use the ApplyStatus as we will use the max function when updating apply_status.
     unsigned int apply_status = APPLY_STATUS_UNCHANGED;
     auto update_apply_status = [&apply_status](bool invalidated)
@@ -1638,8 +1812,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got print_diff %1%, object_diff %2%, region_diff %3%, set status to APPLY_STATUS_CHANGED")%print_diff.size() %object_diff.size() %region_diff.size();
     }
 
-    // Grab the lock for the Print / PrintObject milestones.
-	std::scoped_lock<std::mutex> lock(this->state_mutex());
+    // Grab the lock for the Print / PrintObject milestones. unique_lock rather than scoped_lock:
+    // the released-print path below marks the export step done at the end, and that has to happen
+    // with this lock released, as the step state takes it again.
+	std::unique_lock<std::mutex> lock(this->state_mutex());
 
     // The following call may stop the background processing.
     if (! print_diff.empty())
@@ -1833,8 +2009,17 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         //assert(print_objects_range.begin() != print_objects_range.end());
         // All PrintObjects in print_objects_range shall point to the same prints_objects_regions
         if (print_objects_range.begin() != print_objects_range.end()) {
-            model_object_status.print_object_regions = print_objects_range.begin()->print_object->m_shared_regions;
-            model_object_status.print_object_regions->ref_cnt_inc();
+            // A PrintObject left behind by an apply() that failed before its region pass has no
+            // regions yet, and that rebuilt object list is what the restored release marker resumes
+            // from. There is nothing to reuse, so the status is set Invalid explicitly rather than
+            // left to the default, and the null check in step 4 generates the regions from scratch.
+            if (print_objects_range.begin()->print_object->m_shared_regions != nullptr) {
+                model_object_status.print_object_regions = print_objects_range.begin()->print_object->m_shared_regions;
+                model_object_status.print_object_regions->ref_cnt_inc();
+            } else {
+                model_object_status.print_object_regions_status =
+                    ModelObjectStatus::PrintObjectRegionsStatus::Invalid;
+            }
         }
         if (solid_or_modifier_differ || model_origin_translation_differ || layer_height_ranges_differ ||
             ! model_object.layer_height_profile.timestamp_matches(model_object_new.layer_height_profile)) {
@@ -1941,6 +2126,17 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	        }
         }
     }
+
+    // A print whose slicing state was released has no PrintObjects left, so the rebuild in step 4
+    // invalidates every step. When the inputs were proven unchanged, that invalidation is the
+    // release coming back rather than a change to slice for: the plate's existing result still
+    // describes them and still points at its G-code file, and reporting INVALIDATED would have the
+    // callers throw that result away. A released print whose inputs did change is reported as
+    // INVALIDATED at the end of apply(), where the change is made visible even though the steps it
+    // would have invalidated were already invalid.
+    // What the steps above decided is remembered here: the release may only be excused for the
+    // invalidation the rebuild itself causes, never for one steps 1-3 already detected.
+    const unsigned int apply_status_before_rebuild = apply_status;
 
     // 4) Generate PrintObjects from ModelObjects and their instances.
     {
@@ -2055,6 +2251,34 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             for (PrintObject *object : m_objects)
                 update_apply_status(object->invalidate_step(posSlice));
         }
+    }
+
+    // What the rebuild above produced, for a released print: the objects this plate holds now. The
+    // comparison at the top of apply() can only look at the objects it already knew about, so an
+    // object that appeared on this plate - or left it - is only visible here. A different set than
+    // the release took away means the plate's G-code does not describe what would be printed now.
+    bool released_rebuilt_same_objects = released_unchanged;
+    if (released_state) {
+        std::set<ObjectID> rebuilt_ids;
+        for (const PrintObject *object : m_objects)
+            rebuilt_ids.insert(object->model_object()->id());
+        if (released_unchanged) {
+            released_rebuilt_same_objects =
+                rebuilt_ids == std::set<ObjectID>(m_sliced_model_object_ids.begin(), m_sliced_model_object_ids.end());
+            if (! released_rebuilt_same_objects)
+                // An object came or went on this plate while it was released. The proof above looks
+                // only at the objects the release recorded, so it cannot see that difference; the
+                // snapshot below can then only hold one of the two sets. This apply() is therefore
+                // not the release coming back, and restoring the marker over the advanced snapshot
+                // would let the next apply() read that set as the released one: it would find
+                // released_rebuilt_same_objects true and mark the plate's stale G-code file ready.
+                // Disarm before the snapshot moves, so a failure in the region pass below leaves
+                // the marker consumed and the next apply() reports the change instead.
+                released_state_restore.disarm();
+        }
+        // The print's objects now match the model it just applied, so this is the set a later
+        // release has to record again anyway; keep it consistent in the meantime.
+        m_sliced_model_object_ids.assign(rebuilt_ids.begin(), rebuilt_ids.end());
     }
 
     // Per-part gradient: compute the per-slot enable bit vector once for this Print::apply pass.
@@ -2185,6 +2409,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         it_print_object = it_print_object_end;
     }
 
+    // Every PrintObject in m_objects has its regions now, so this print's slicing state is rebuilt
+    // and live: a failure from here on leaves a state apply() can continue from, and the marker
+    // stays consumed.
+    released_state_restore.disarm();
+
     if (print_regions_reshuffled) {
         // Update Print::m_print_regions from objects.
         struct cmp { bool operator() (const PrintRegion *l, const PrintRegion *r) const { return l->config_hash() == r->config_hash() && l->config() == r->config(); } };
@@ -2206,8 +2435,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     }
 
     //BBS: check the config again
-    int new_used_filaments = this->extruders(true).size();
-    t_config_option_keys new_changed_keys = unnormalized_config.normalize_fdm_2(objects().size(), new_used_filaments);
+    // Step 4 rebuilt this print's objects, so both inputs are derived from them again - apply()
+    // consumed the release flag before the rebuild. Read through the accessors anyway, as the
+    // first pass above does: this is the normalization whose config a later release records.
+    int new_used_filaments = (int)this->used_filaments_for_normalize().size();
+    t_config_option_keys new_changed_keys = unnormalized_config.normalize_fdm_2((int)this->object_count_for_normalize(), new_used_filaments);
     // Compare both passes with what was applied above, so a key disabled there can be enabled again.
     append(new_changed_keys, changed_keys);
     new_changed_keys.erase(std::remove_if(new_changed_keys.begin(), new_changed_keys.end(), [&](const std::string &key) {
@@ -2280,6 +2512,28 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	//BBS: add timestamp logic
 	if (apply_status != APPLY_STATUS_UNCHANGED)
 		m_modified_count++;
+    if (released_state && !released_rebuilt_same_objects)
+        // The inputs moved while this print had no state to invalidate. Steps 1-3 could only
+        // report that as CHANGED at best (a step that is already invalid cannot be invalidated
+        // again) and the object rebuild below cannot tell it from the release coming back, so the
+        // change is reported here: the plate's G-code result no longer describes its model, and a
+        // caller that kept it would present a stale preview and export a stale file.
+        apply_status = APPLY_STATUS_INVALIDATED;
+    if (released_rebuilt_same_objects) {
+        // Only the rebuild's own invalidation may be excused. Anything the steps above reported as
+        // invalidated was a real change to slice for, and keeping the plate's result would hide it.
+        if (apply_status == APPLY_STATUS_INVALIDATED && apply_status_before_rebuild < APPLY_STATUS_INVALIDATED)
+            apply_status = APPLY_STATUS_CHANGED;
+        if (apply_status < APPLY_STATUS_INVALIDATED) {
+            // This print's G-code is on disk and describes exactly this model and config, so the
+            // print is as exported as a project loaded from its own 3MF: the export step is done
+            // again, which is what the preview, the send path and the export paths read.
+            // set_gcode_file_ready() takes the state mutex this function took for the rebuild, so
+            // the lock goes first. Nothing below this point reads the state it guards.
+            lock.unlock();
+            this->set_gcode_file_ready();
+        }
+    }
 	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: finished,  this %2%, m_modified_count %3%, apply_status %4%, m_support_used %5%")%__LINE__ %this %m_modified_count %apply_status %m_support_used;
 	return static_cast<ApplyStatus>(apply_status);
 }

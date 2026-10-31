@@ -39,9 +39,11 @@
 #include <cstddef>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <math.h>
 #include <optional>
 #include <set>
@@ -1077,6 +1079,27 @@ public:
     // In case the following methods need to modify data processed by process() or export_gcode(),
     // a cancellation callback is executed to stop the background processing before the operation.
     void                clear() override;
+    // Gives back what slicing the plate produced - the PrintObjects with their layers, supports,
+    // fill and extrusion paths, and the first-layer adhesion geometry - while keeping what a
+    // finished plate still reports: the statistics, the support-used flag, the used filaments, the
+    // config, the plate origin and the model snapshot apply() diffs against. A batch that slices
+    // plate after plate exports each plate's G-code and then calls this, so a project's live set
+    // does not grow with the number of plates it has already left behind. The print stays
+    // consistent: a later apply() rebuilds the objects from that snapshot, the way it does for a
+    // print whose slicing was invalidated by a config change.
+    // The slicing state is the worker thread's input, so the caller has to have stopped the
+    // background processing that owns this print. That is checked, not assumed: the call refuses,
+    // deletes nothing and returns false while any step of this print is still running, and it
+    // invalidates the steps without running the cancellation callback (which belongs to whoever
+    // started the print, see BackgroundSlicingProcess::start()).
+    bool                release_slicing_state();
+    // Statistics document of `result`'s G-code file, summed by parsing it. For a plate whose
+    // preview payload was released and whose document was never cached - a project opened from a
+    // sliced 3MF only gets the file, not the moves. The document is a function of that file alone,
+    // so it is cached in `result.statistics_json` and served from there afterwards: parsing a full
+    // bed's G-code takes seconds, and every later 3MF export asks for the same document again.
+    // Throws when the file cannot be processed.
+    std::string         gcode_statistics_from_file(GCodeProcessorResult &result) const;
     bool                empty() const override { return m_objects.empty(); }
     // List of existing PrintObject IDs, to remove notifications for non-existent IDs.
     std::vector<ObjectID> print_object_ids() const override;
@@ -1312,6 +1335,15 @@ public:
     void set_gcode_file_ready();
     void set_gcode_file_invalidated();
     void export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // Whether `result`'s G-code file may be re-read instead of slicing: this print's export step is
+    // done, and the file that result names is still the one this plate exported and still readable
+    // (GCodeProcessorResult::preview_payload_restorable()). The two halves have to be asked
+    // together, because only the pair means "the file holds this print's G-code": the export step
+    // alone is what apply() restores for a released print whose objects it just rebuilt
+    // (PrintApply.cpp), and that claim outlives the file it rests on - a released plate's file is a
+    // temp file, and a temp cleanup, an unmounted drive or another instance's cleanup can take it
+    // away between the release and the plate being selected again.
+    bool can_process_previous_gcode_file(const GCodeProcessorResult* result) const;
     // Re-reads the moves and line offsets of `result` from its G-code file after the file was rewritten in
     // place (post-processing scripts or plugins), so the preview and its G-code window follow the file on
     // disk. Everything else in `result` was computed while slicing and is kept. If the file cannot be
@@ -1560,11 +1592,43 @@ private:
     // Following section will be consumed by the GCodeGenerator.
     ToolOrdering 							m_tool_ordering;
     WipeTowerData                           m_wipe_tower_data {m_tool_ordering};
+    // Drops the sliced objects and everything keyed by their pointers, keeping what a finished
+    // plate still reports. The caller holds state_mutex and has already invalidated the steps.
+    void                                    drop_slicing_state_locked();
+    // What DynamicPrintConfig::normalize_fdm_2() has to see when apply() normalizes the incoming
+    // config: the filaments this plate prints with, and how many objects it prints them on. Both
+    // are derived from the PrintObjects, which a released print no longer has, so apply() cannot
+    // re-derive them on the apply() that rebuilds it - and then the config values that
+    // normalization derives (no prime tower for a single filament, no independent support layer
+    // height under a tower) would not be reproduced, the incoming config would differ from the
+    // one this print normalized while slicing, and a finished plate would be invalidated for it.
+    // The release records them instead (drop_slicing_state_locked()).
+    std::vector<unsigned int> used_filaments_for_normalize() const;
+    size_t                    object_count_for_normalize() const;
 
     // Estimated print time, filament consumed.
     PrintStatistics                         m_print_statistics;
     bool                                    m_support_used {false};
     StatisticsByExtruderCount               m_statistics_by_extruder_count;
+    // Set by release_slicing_state(), consumed by the next apply(): the PrintObjects are gone, so
+    // that apply() rebuilds them, and the rebuild is the release coming back rather than a change.
+    // Atomic because apply() reads and consumes it on its caller's thread while a release may be
+    // running on another one.
+    std::atomic<bool>                       m_slicing_state_released {false};
+    // IDs of the ModelObjects this print's last slice was produced from - one per object of this
+    // plate that had a PrintObject. Kept across release_slicing_state(), which deletes those
+    // objects: the next apply() needs to know which objects of the shared model belong to this
+    // print, or a change to another plate's object would be taken for a change to this plate's.
+    std::vector<ObjectID>                   m_sliced_model_object_ids;
+    // The normalize_fdm_2() inputs of the slice this print's result came from, recorded by
+    // drop_slicing_state_locked() while the PrintObjects that derive them still exist. Read by
+    // used_filaments_for_normalize() / object_count_for_normalize() for as long as the state is
+    // released - i.e. for the apply() that rebuilds it. Protected by m_sliced_inputs_mutex: the
+    // release writes them under state_mutex (holding both), but the apply() that reads them does
+    // not hold state_mutex at that point, so the second lock is what serialises the two.
+    std::vector<unsigned int>               m_sliced_used_filaments;
+    size_t                                  m_sliced_object_count {0};
+    mutable std::mutex                      m_sliced_inputs_mutex;
 
     std::vector<unsigned int> m_slice_used_filaments;
     std::vector<unsigned int> m_slice_used_filaments_first_layer;

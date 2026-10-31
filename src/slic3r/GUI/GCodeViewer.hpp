@@ -214,7 +214,9 @@ private:
     // Belt printers: the print Z of each viewer layer, in the viewer's layer numbering.
     std::vector<double> m_belt_layer_zs;
     //BBS: save m_gcode_result as well
-    const GCodeProcessorResult* m_gcode_result;
+    // Default-initialized to nullptr: references_result() may be queried before the first
+    // load_as_gcode(), which is the first place that assigns this member (M4).
+    const GCodeProcessorResult* m_gcode_result{ nullptr };
     std::array<unsigned int, static_cast<size_t>(EMoveType::Count)> m_move_type_counts{};
     std::array<std::array<float, static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count)>, static_cast<size_t>(EMoveType::Count)> m_move_type_times{};
     std::array<float, static_cast<size_t>(EMoveType::Count)> m_move_type_distances{};
@@ -401,6 +403,11 @@ public:
     // void _render_calibration_thumbnail_framebuffer(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, OpenGLManager& opengl_manager);
     // void render_calibration_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, OpenGLManager& opengl_manager);
     bool has_data() const { return !m_viewer.get_extrusion_roles().empty(); }
+
+    // True while this viewer still points at the given result. It keeps that pointer from the last
+    // load_as_gcode() and reads the result's moves for the moves slider, so a payload may only be
+    // given back once the viewer has been handed another result.
+    bool references_result(const GCodeProcessorResult* result) const { return m_gcode_result == result; }
 
     bool can_export_toolpaths() const;
     std::vector<int> get_plater_extruder();

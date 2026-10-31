@@ -7,6 +7,7 @@
 #include "PrintBase.hpp"
 #include <utility>
 #include <string>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "libslic3r.h"
@@ -27,6 +28,7 @@
 #include "TriangleSelector.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
 #include <exception>
+#include <stdexcept>
 #include <ostream>
 #include "ExPolygon.hpp"
 #include "Layer.hpp"
@@ -37,6 +39,7 @@
 #include <chrono>
 #include <optional>
 #include "GCode/GCodeProcessor.hpp"
+#include "GCode/GCodeStatistics.hpp"
 #include "GCode/ThumbnailData.hpp"
 #include "ExtrusionEntity.hpp"
 #include <math.h>
@@ -237,17 +240,170 @@ struct FilamentType {
 
 void Print::clear()
 {
-	std::scoped_lock<std::mutex> lock(this->state_mutex());
-    // The following call should stop background processing if it is running.
+    // clear() keeps the contract it always had: it may stop the background processing that owns
+    // this print. The cancelling invalidation is called before the state lock is taken, unlike in
+    // the code this replaces, because the callback it reaches stops that processing and waits for
+    // the worker thread, which takes this same lock to publish its steps. The step state itself is
+    // still changed under the lock below, by drop_slicing_state_locked()'s caller-side contract.
     this->invalidate_all_steps();
+    std::scoped_lock<std::mutex> lock(this->state_mutex());
+    this->drop_slicing_state_locked();
+    m_model.clear_objects();
+    m_statistics_by_extruder_count.clear();
+    // clear() drops the model snapshot as well, so there is nothing left for apply() to rebuild
+    // from: the print starts over as an empty one, not as a released one.
+    m_slicing_state_released = false;
+    m_sliced_model_object_ids.clear();
+}
+
+bool Print::release_slicing_state()
+{
+	std::scoped_lock<std::mutex> lock(this->state_mutex());
+    // The PrintObjects below are the worker thread's input: deleting them while it is inside
+    // process() is a use-after-free. Every caller stops that processing first - the CLI run loop,
+    // and Plater::priv::on_process_completed(), which calls BackgroundSlicingProcess::stop() before
+    // it releases anything - and a started step is exactly a worker thread inside this print, so
+    // the requirement is checked here instead of being documented and hoped for.
+    for (size_t step = 0; step < size_t(psCount); ++step)
+        if (this->is_step_started_unguarded(static_cast<PrintStep>(step))) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": refusing to release %1%, step %2% is still running") % this % step;
+            return false;
+        }
+    // No cancellation callback for this invalidation: the callback belongs to whoever started the
+    // print (BackgroundSlicingProcess::start() installs one that stops that process), not to the
+    // print, and calling it from here would reach into whichever print that process runs now.
+    this->invalidate_all_steps_without_cancel();
+    this->drop_slicing_state_locked();
+    // Set last: apply() reads this flag and then the object IDs the call above recorded, so it must
+    // not be visible before they are in place. The slicing state is gone from here on, and the next
+    // apply() rebuilds it; that rebuild is not a change the caller has to slice for - it is this
+    // call coming back.
+    m_slicing_state_released = true;
+    return true;
+}
+
+// The caller holds state_mutex and has already invalidated the steps: what is left is giving the
+// objects back together with everything keyed by their pointers.
+void Print::drop_slicing_state_locked()
+{
+    // Which ModelObjects this print's result was produced from, recorded before the objects that
+    // know it are deleted: apply() compares these against the shared model, so that another
+    // plate's changes are not taken for this plate's.
+    m_sliced_model_object_ids.clear();
+    for (const PrintObject *object : m_objects) {
+        const ObjectID id = object->model_object()->id();
+        if (std::find(m_sliced_model_object_ids.begin(), m_sliced_model_object_ids.end(), id) == m_sliced_model_object_ids.end())
+            m_sliced_model_object_ids.push_back(id);
+    }
+    // The inputs apply() normalizes the incoming config with, recorded for the same reason and at
+    // the same point: both are derived from the PrintObjects and the regions about to go, and the
+    // apply() that rebuilds this print has to reproduce the normalization that produced the config
+    // it keeps. See used_filaments_for_normalize().
+    {
+        // Under m_sliced_inputs_mutex as well as state_mutex: the readers take that one alone, on
+        // whatever thread is applying the print.
+        std::scoped_lock<std::mutex> inputs_lock(m_sliced_inputs_mutex);
+        m_sliced_used_filaments = this->extruders(true);
+        m_sliced_object_count   = m_objects.size();
+    }
+    // Caches keyed by PrintObject have to go before the objects their keys point at, and the
+    // first-layer geometry goes with the objects it was measured on. Everything below is rebuilt
+    // by the next process(); nothing here is read back after the plate's G-code has been exported.
+    m_sequential_dynamic_orderings.clear();
+    m_brimMap.clear();
+    m_brimFilamentMap.clear();
+    m_brimMapByInstance.clear();
+    m_objectBrimAreasByInstance.clear();
+    m_skirt_brim_groups.clear();
+    m_skirt.clear();
+    m_first_layer_convex_hull.points.clear();
+    m_skirt_convex_hull.clear();
+    // Same for the tool ordering: its layer tools and gradient bookkeeping are keyed by the
+    // PrintObject pointers about to be deleted. first_extruder() and all_extruders() stay, because
+    // the 3MF metadata (OrcaSlicer.cpp) and the plate bounding box (Plater.cpp) read them from a
+    // plate that is already released.
+    m_tool_ordering.release_object_references();
 	for (PrintObject *object : m_objects)
 		delete object;
 	m_objects.clear();
     m_print_regions.clear();
-    m_model.clear_objects();
-    m_statistics_by_extruder_count.clear();
     m_same_shrinkage_compensations = false;
     m_shrinkage_compensation = Vec3d::Ones();
+    // m_model deliberately stays: it is the snapshot the next apply() compares its argument
+    // against, which is what tells a release-only rebuild apart from a changed model, and the
+    // objects rebuilt from it point their ModelObject back into it. It is a copy of the model
+    // apply() was handed - the whole project's, not only this plate's, which is why the comparisons
+    // are filtered by m_sliced_model_object_ids - so it stays resident per plate. Smaller than the
+    // layers, supports and fill this call gives back, but not free. clear() drops it right after
+    // this call.
+}
+
+// The two inputs DynamicPrintConfig::normalize_fdm_2() derives config values from. While the
+// slicing state is released there is no PrintObject to derive them from, and an empty answer is
+// not the neutral one: it leaves the derived values (enable_prime_tower on a single filament,
+// independent_support_layer_height under a tower) as the incoming config has them, while the
+// config this print keeps has them normalized. apply() would take that difference for a change and
+// invalidate a finished plate whose G-code is still on disk. The release records both; see
+// drop_slicing_state_locked().
+//
+// The recorded pair is read under m_sliced_inputs_mutex. The release writes it while holding
+// state_mutex too, and apply() - the only reader that matters - does not hold that lock when it
+// asks for these, so without the second lock the reader would race the release instead of
+// serialising against it. The lock order is always state_mutex then m_sliced_inputs_mutex; no
+// caller takes them the other way round.
+std::vector<unsigned int> Print::used_filaments_for_normalize() const
+{
+    if (m_slicing_state_released.load(std::memory_order_acquire)) {
+        std::scoped_lock<std::mutex> lock(m_sliced_inputs_mutex);
+        return m_sliced_used_filaments;
+    }
+    return this->extruders(true);
+}
+
+size_t Print::object_count_for_normalize() const
+{
+    if (m_slicing_state_released.load(std::memory_order_acquire)) {
+        std::scoped_lock<std::mutex> lock(m_sliced_inputs_mutex);
+        return m_sliced_object_count;
+    }
+    return m_objects.size();
+}
+
+std::string Print::gcode_statistics_from_file(GCodeProcessorResult &result) const
+{
+    // The document is derived from the file alone, so a cached one needs no parse at all. It is
+    // cleared by GCodeProcessorResult::reset(), i.e. whenever the result stops describing a
+    // single completed export, and it is filled from the project the result was loaded from when
+    // the project carried it.
+    if (!result.statistics_json.empty())
+        return result.statistics_json;
+    GCodeProcessor processor;
+    // Process-wide, so this is a write from the calling thread - the UI thread, for every export -
+    // while the background slicing worker writes it too. It has to be set before the parse below
+    // picks its reserved tags, so the parse runs while no slicing step is running.
+    GCodeProcessor::s_IsBBLPrinter = is_BBL_printer();
+    const Vec3d origin = this->get_plate_origin();
+    processor.set_xy_offset(origin(0), origin(1));
+    // The nozzle-grouping context the export used, or the per-layer times of the document would
+    // not be the ones the plate reports.
+    if (result.nozzle_group_result)
+        processor.initialize_from_context(result.nozzle_group_result);
+    processor.process_file(result.filename);
+    // A file that never moved parses to a well formed document that reports nothing - and the
+    // processor always comes back with its dummy first move, so the move list cannot tell. That
+    // document is not the statistics of a plate: an export that took it for one would write it and
+    // report success, which is what the command line's --export-statistics must not do.
+    const std::string statistics = gcode_statistics_json(processor.result());
+    if (!statistics_json_has_data(statistics))
+        return {};
+    // Keep it on the result: parsing a full bed's G-code costs seconds, and every 3MF export of a
+    // project opened from a sliced 3MF would otherwise parse every plate again. Under the result's
+    // lock, as the other writers of the field do.
+    {
+        std::lock_guard<std::mutex> lock(result.result_mutex);
+        result.statistics_json = statistics;
+    }
+    return statistics;
 }
 
 bool Print::has_tpu_filament() const
@@ -5696,7 +5852,11 @@ std::string Print::output_filename(const std::string &filename_base) const
     auto full_print_config = this->full_print_config();
     const ConfigOptionStrings* filament_settings_id = full_print_config.option<ConfigOptionStrings>("filament_settings_id");
     std::string filament_name = "";
-    auto extruders = this->extruders(true);
+    // Not extruders(true) directly: a released print has no PrintObject left to derive the used
+    // filaments from, and an empty list would leave the {filament_name} placeholder blank in the
+    // name of the G-code it exports next. used_filaments_for_normalize() is the same list, kept
+    // from before the release.
+    auto extruders = this->used_filaments_for_normalize();
     if(!extruders.empty()) {
         // first extruder is the default extruder
         int extruder_id = extruders.front();
@@ -5745,6 +5905,12 @@ void Print::set_gcode_file_invalidated()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ <<  boost::format(": done");
 }
 
+// Whether the G-code file `result` names may be re-read instead of slicing. See the declaration.
+bool Print::can_process_previous_gcode_file(const GCodeProcessorResult* result) const
+{
+    return this->finished() && result != nullptr && result->preview_payload_restorable();
+}
+
 //BBS: add gcode file preload logic
 void Print::export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
@@ -5770,7 +5936,14 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
             processor.initialize_from_context(result->nozzle_group_result);
         processor.configure_exclusion_volume_path_check(this->config());
         //processor.enable_producers(true);
-        processor.process_file(file);
+        // GCodeProcessor::process_file() reports a file it could not open or read as false, and
+        // leaves the result with nothing but its dummy first move. That is not this print's G-code:
+        // taking it would make the plate present an empty preview as its own finished slice, and the
+        // caller marks the result as restored right after this returns. The move list cannot tell -
+        // the dummy move keeps it one move long either way - so ask the parse itself. Throw instead:
+        // the catch below turns it into the error the caller reports.
+        if (! processor.process_file(file))
+            throw std::runtime_error("the G-code file could not be read");
 
         // filament seq is loaded from file, processor result will override the value
         auto filament_seq_loaded = result->filament_change_sequence;
@@ -5778,6 +5951,10 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
         *result = std::move(processor.extract_result());
         result->filament_change_sequence = filament_seq_loaded;
         result->nozzle_change_sequence   = nozzle_seq_loaded;
+        // The moves this result now holds are what its statistics document is summed from; the
+        // export path caches it here too, so a plate read back from its file reports the same
+        // statistics after its payload is released.
+        result->cache_statistics_json();
     } catch (std::exception &ex) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<  boost::format(": found errors when process gcode file %1%") %file.c_str();
         {
@@ -5817,7 +5994,11 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
     if (result->nozzle_group_result)
         processor.initialize_from_context(result->nozzle_group_result);
     try {
-        processor.process_file(result->filename);
+        // process_file() reports a file it could not open or read as false instead of throwing, and
+        // leaves the result with its dummy first move only. Treat that like the parse failure it is,
+        // so the handler below runs for both: a dummy move is not this plate's payload.
+        if (! processor.process_file(result->filename))
+            throw std::runtime_error("the G-code file could not be read");
     } catch (const std::exception& ex) {
         // The edited file is what gets printed, so failing to preview it must not fail the slice.
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": cannot re-read the G-code file " << result->filename << ": " << ex.what();

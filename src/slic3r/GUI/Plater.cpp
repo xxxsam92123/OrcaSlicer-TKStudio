@@ -170,6 +170,7 @@
 #include "libslic3r/Format/STEP.hpp"
 #include "libslic3r/Format/AMF.hpp"
 //#include "libslic3r/Format/3mf.hpp"
+#include "libslic3r/Format/ProjectStrategy.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/Model.hpp"
@@ -7669,6 +7670,17 @@ struct Plater::priv
     void on_action_export_sliced_file(SimpleEvent&);
     void on_action_export_all_sliced_file(SimpleEvent&);
     void on_action_select_sliced_plate(wxCommandEvent& evt);
+    // Slice all: hand back the per-move preview payload and the sliced objects of a plate that is
+    // finished and no longer the one under the preview. Its G-code file, valid flag and statistics
+    // stay; switching back to it re-reads the moves through PartPlate::restore_slice_payload().
+    void release_finished_plate_resources(int plate_index);
+    // Slice all: give back every finished plate's slice resources, for the error path where the run
+    // stops with the whole batch's results still resident.
+    void release_finished_plate_resources_of_batch(int except_plate_index);
+    // Manual plate switch: the plate that was current before the switch is finished and the preview
+    // has moved off it, so its slice resources go back the same way a batch gives them back. Called
+    // once per switch, after the preview and the background process point at the new plate.
+    void release_plate_left_by_switch(int previous_plate_index);
     //BBS: change dark/light mode
     void on_change_color_mode(SimpleEvent& evt);
     void on_apple_change_color_mode(wxSysColourChangedEvent& evt);
@@ -13266,6 +13278,78 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format("exit.");
 }
 
+// Slice all: a finished plate's moves are the largest part of what it still holds, and they are
+// re-readable from its own G-code file, so a batch does not have to carry them for every plate it
+// has already left behind. Its sliced objects go the same way, through the shared
+// PartPlateList entry, so the GUI and the command line release exactly the same things. Only a
+// plate that is not the previewed one may be released: the preview keeps a raw pointer to the
+// previewed plate's result and reads that plate's print.
+void Plater::priv::release_finished_plate_resources(int plate_index)
+{
+    if (plate_index < 0 || plate_index >= partplate_list.get_plate_count())
+        return;
+    if (plate_index == partplate_list.get_curr_plate_index())
+        return;
+
+    PartPlate *plate = partplate_list.get_plate(plate_index);
+    if (plate == nullptr || !plate->is_slice_result_valid())
+        return;
+
+    // The release deletes the print's PrintObjects, so the background task that owns them has to be
+    // stopped and its thread back in the idle state. Print::release_slicing_state() checks it too
+    // and refuses, but a refused release here means a slice batch that silently keeps growing, so
+    // it is worth saying out loud which invariant was broken.
+    if (!background_process.idle()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": plate %1% was not released, the background process is not idle (%2%)") % plate_index % int(background_process.state());
+        return;
+    }
+
+    if (plate->release_finished_slice_resources())
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% slice resources released, %2%") % plate_index % log_memory_info();
+}
+
+void Plater::priv::release_finished_plate_resources_of_batch(int except_plate_index)
+{
+    partplate_list.release_finished_plate_resources(except_plate_index);
+}
+
+// A manual plate switch leaves a finished plate behind just as a batch moving on does, and that
+// plate's G-code file is still on disk: both the preview payload and the print's sliced objects can
+// go back to the heap there. The switch has already pointed the background process and the preview
+// at the new plate when this runs, which is the same order the batch releases in
+// (Plater::priv::on_process_completed()).
+//
+// Two things keep it away from what is still in use: a running batch releases its own plates, and
+// the G-code viewer reads the moves of the result it last loaded, so a plate whose result the viewer
+// still points at keeps them. Nothing here may fail the switch - the release entry only warns.
+void Plater::priv::release_plate_left_by_switch(int previous_plate_index)
+{
+    if (previous_plate_index < 0 || previous_plate_index == partplate_list.get_curr_plate_index())
+        return;
+    // Slice all drives its own release for every plate it leaves (see the batch entry above); a
+    // second one from here would run before its own bookkeeping for that plate.
+    if (m_is_slicing)
+        return;
+    // Loading a project selects its first plate while the list and the prints are still being
+    // rebuilt, which is not a switch away from a plate that is finished.
+    if (q != nullptr && q->is_loading_project())
+        return;
+
+    PartPlate *plate = partplate_list.get_plate(previous_plate_index);
+    if (plate == nullptr || !plate->is_slice_result_valid() || plate->get_slice_result() == nullptr)
+        return;
+
+    // The viewer holds the result it converted last and reads its moves for the moves slider. Until
+    // the switch has handed it the new plate's result, the old one is still in use.
+    GLCanvas3D *canvas = preview != nullptr ? preview->get_canvas3d() : nullptr;
+    if (canvas != nullptr && canvas->get_gcode_viewer().references_result(plate->get_slice_result())) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% keeps its slice resources, the G-code viewer still reads its result") % previous_plate_index;
+        return;
+    }
+
+    release_finished_plate_resources(previous_plate_index);
+}
+
 void Plater::priv::on_slicing_completed(wxCommandEvent & evt)
 {
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": event_type %1%, string %2%") % evt.GetEventType() % evt.GetString();
@@ -13451,6 +13535,28 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
             process_completed_with_error = partplate_list.get_curr_plate_index();;
         }
         has_error = true;
+        // Slice all: the batch stops on this error, and everything it has already produced is still
+        // resident. Hand that memory back, so a retry does not start from the footprint that failed
+        // the allocation. The plate this round failed on goes invalid first: its result no longer
+        // describes the G-code file it still names, so nothing may be released or read back against
+        // it. A failed allocation also ends the batch outright: the slicing context it left behind
+        // is not trustworthy, so continuing plate after plate is not an option.
+        if (PartPlate *failed_plate = background_process.get_current_plate(); failed_plate != nullptr)
+            // Before the release below, so the plate this round failed on is not among the ones
+            // that give their sliced objects back (it is also excluded by index, but its result is
+            // no longer the G-code file it names). The completion handler invalidates the current
+            // plate again further down with the event's own success flag; this one is here because
+            // the release decision is made here.
+            failed_plate->update_slice_result_valid_state(false);
+        if (m_slice_all) {
+            release_finished_plate_resources_of_batch(partplate_list.get_curr_plate_index());
+            if (background_process.last_process_error_was_bad_alloc()) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": slice all stopped after std::bad_alloc on plate %1%, %2%") % partplate_list.get_curr_plate_index() % log_memory_info();
+            }
+            // Any failed batch is unsafe to continue from: export, reload, and ordinary
+            // processing failures can all leave the shared Print context incomplete.
+            m_slice_all = false;
+        }
         is_finished = true;
     }
     if (evt.cancelled()) {
@@ -13571,8 +13677,13 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         m_cur_slice_plate++;
 
         q->Freeze();
-        q->select_plate(m_cur_slice_plate);
+        const int select_ret = q->select_plate(m_cur_slice_plate);
         partplate_list.select_plate_view();
+        // The plate that just finished is no longer the previewed one, so its moves and its sliced
+        // objects can go back to the heap now; only release once the switch has taken the preview
+        // off it.
+        if (select_ret == 0)
+            release_finished_plate_resources(m_cur_slice_plate - 1);
         int ret = q->start_next_slice();
         if (ret) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(":slicing all, plate %1% can not be sliced, will stop")%m_cur_slice_plate;
@@ -18305,10 +18416,11 @@ void Plater::load_gcode(const wxString& filename)
     // process gcode
     GCodeProcessor processor;
     processor.init_filament_maps_and_nozzle_type_when_import_only_gcode();
+    bool read = false;
     try
     {
         GCodeProcessor::s_IsBBLPrinter = wxGetApp().preset_bundle->is_bbl_vendor();
-        processor.process_file(filename.ToUTF8().data());
+        read = processor.process_file(filename.ToUTF8().data());
     }
     catch (const std::exception& ex)
     {
@@ -18316,8 +18428,24 @@ void Plater::load_gcode(const wxString& filename)
         show_error(this, ex.what());
         return;
     }
+    if (! read)
+    {
+        // process_file() reports a file it could not open or read as false instead of throwing. Its
+        // result then holds nothing but the dummy first move, which is not this file's preview:
+        // taking it would present an empty plate as the G-code that was just loaded, and mark the
+        // result as one this file exported.
+        unload_file_settings();
+        show_error(this, Slic3r::format(_u8L("Failed to process the G-code file %1%."), filename.ToUTF8().data()), false);
+        return;
+    }
     *current_result = std::move(processor.extract_result());
     //current_result->filename = filename;
+    // The statistics document of this file is summed from the moves it just produced; produce it
+    // now so a plate that later releases its payload still reports complete statistics. And the
+    // file this result was read from is exactly the one its payload can be read back from later:
+    // GCodeProcessor::process_file() named it, so the plate may be released like an exported one.
+    current_result->cache_statistics_json();
+    current_result->mark_export_completed();
 
     BedType bed_type = current_result->bed_type;
     if (bed_type != BedType::btCount) {
@@ -20623,8 +20751,20 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
 
     //BBS: add bbs 3mf logic
     PlateDataPtrs plate_data_list;
-    p->partplate_list.store_to_3mf_structure(plate_data_list, (strategy & SaveStrategy::WithGcode || strategy & SaveStrategy::WithSliceInfo), export_plate_idx,
-                                             strategy & SaveStrategy::WithStatistics);
+    // Statistics are best-effort here: a plate whose document cannot be collected (one loaded from
+    // a sliced 3MF whose G-code file has gone, say) is written without it, with a warning, instead
+    // of failing the save of the whole project. Only a caller that asks for them as a requirement -
+    // the command line with --export-statistics - turns that into an error.
+    const int plate_data_ret = p->partplate_list.store_to_3mf_structure(plate_data_list, (strategy & SaveStrategy::WithGcode || strategy & SaveStrategy::WithSliceInfo), export_plate_idx,
+                                             strategy & SaveStrategy::WithStatistics, false);
+    if (plate_data_ret != 0) {
+        // The only non-zero return store_to_3mf_structure() can produce is a required statistics
+        // document that could not be collected - which this call does not require. Kept as a
+        // contract check: reaching it means the function grew a failure the caller has to handle.
+        release_PlateData_list(plate_data_list);
+        show_error(this, _L("Failed to collect the statistics of a sliced plate. The project was not saved."), false);
+        return -1;
+    }
 
     // Orca: non-BBL G-code isn't post-processed in place, so run the scripts on a copy before packing it.
     std::vector<std::string> pp_tmp_files;
@@ -22729,6 +22869,8 @@ int Plater::select_plate(int plate_index, bool need_slice)
     int ret;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: plate %2%, need_slice %3% ")%__LINE__ %plate_index  %need_slice;
     take_snapshot("select partplate!");
+    // Whatever the switch does below, this is the plate the preview is on until it succeeds.
+    const int previous_plate_index = p->partplate_list.get_curr_plate_index();
     ret = p->partplate_list.select_plate(plate_index);
     if (!ret) {
         if (is_view3D_shown())
@@ -22877,6 +23019,13 @@ int Plater::select_plate(int plate_index, bool need_slice)
             }
         }
     }
+
+    // The preview, the background process and the G-code viewer are on the new plate by now, so the
+    // plate that was current before this call gives its slice resources back. A manual switch over a
+    // finished project would otherwise keep every plate visited since the last batch resident, which
+    // is what drove the footprint to the pagefile ceiling on a 19 plate project.
+    if (!ret)
+        p->release_plate_left_by_switch(previous_plate_index);
 
     SimpleEvent event(EVT_GLCANVAS_PLATE_SELECT);
     p->on_plate_selected(event);
@@ -23383,6 +23532,8 @@ int Plater::select_plate_by_hover_id(int hover_id, bool right_click, bool isModi
     action      = isModidyPlateName ? PartPlate::PLATE_NAME_HOVER_ID : hover_id % PartPlate::GRABBER_COUNT;
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": enter, hover_id %1%, plate_index %2%, action %3%")%hover_id % plate_index %action;
+    // Only action 0 switches plates; this is the plate it switches away from.
+    const int previous_plate_index = action == 0 ? p->partplate_list.get_curr_plate_index() : -1;
     if (action == 0)
     {
         //select plate
@@ -23638,6 +23789,12 @@ int Plater::select_plate_by_hover_id(int hover_id, bool right_click, bool isModi
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "invalid action %1%, with right_click=%2%" << action << right_click;
         ret = -1;
     }
+
+    // The plate the switch left behind gives its slice resources back here as well: this is the
+    // second way the user selects a plate (the 3D view's plate grabbers), and it must free exactly
+    // the same things as Plater::select_plate() does.
+    if (action == 0 && !ret)
+        p->release_plate_left_by_switch(previous_plate_index);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: return %2%")%__LINE__ % ret;
     return ret;
