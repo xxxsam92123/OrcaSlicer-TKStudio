@@ -36,6 +36,7 @@
 #include <iomanip>
 #include <iostream>
 #include <initializer_list>
+#include <math.h>
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Point.hpp"
 #include <set>
