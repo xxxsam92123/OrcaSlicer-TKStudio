@@ -5463,6 +5463,18 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
     EMoveType type = move_type(delta_pos);
     const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
+
+    // Arc fitting can leave a top-level G1 extrusion whose XY displacement is below EPSILON while
+    // its E is still positive. The extruded volume is then divided by a path the head never
+    // travelled, which reports a bead cross section of tens of mm2 for a move no nozzle made.
+    // This is the same analytic case as the "no displacement, return" test above, so it takes the
+    // same way out: no vertex, no time block, nothing to divide. It is deliberately not a Flow
+    // threshold - the value of m_mm3_per_mm plays no part here - and the origin gate keeps the
+    // G2/G3 discretization segments, which may be shorter than EPSILON by construction, on their
+    // existing path.
+    if (type == EMoveType::Extrude && origin == G1DiscretizationOrigin::G1 && delta_xyz < float(EPSILON))
+        return;
+
     m_travel_dist = delta_xyz;
 
     if (!m_processing_homing_move) {
@@ -7750,6 +7762,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         ? m_first_layer_height
         : m_end_position[Z] - m_z_offset;
 
+    // The trailing field is MoveVertex::prepare_stage: the same condition the time blocks are
+    // stamped with, so the preview can leave the start G-code's moves out of the printed layers.
     m_result.moves.push_back({
         m_last_line_id,
         type,
@@ -7778,7 +7792,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         std::max<unsigned int>(1, m_layer_id) - 1,
         internal_only,
         m_object_label_id,
-        m_print_z
+        m_print_z,
+        m_processing_start_custom_gcode
     });
 
     if (type == EMoveType::Seam) {
@@ -8333,6 +8348,8 @@ void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_la
         m_actual_speed_id_map.emplace_back(block_id, (unsigned int)write);
         for (; entry > 0 && actual_speed_moves[entry - 1].position.has_value(); --entry) {
             const TimeMachine::ActualSpeedMove& it = actual_speed_moves[entry - 1];
+            // Copied from the block's own move, so the inserted vertex keeps its prepare_stage tag and
+            // a prepare-stage block's split vertices are dropped from the preview along with it.
             GCodeProcessorResult::MoveVertex new_move = block_move;
             new_move.time = { 0.0f, 0.0f };
             new_move.position = *it.position;
