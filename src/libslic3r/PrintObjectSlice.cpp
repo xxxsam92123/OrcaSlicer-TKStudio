@@ -53,7 +53,7 @@ namespace Slic3r {
 bool PrintObject::clip_multipart_objects = true;
 bool PrintObject::infill_only_where_needed = false;
 
-static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coordf_t lo, coordf_t hi)
+static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coordf_t lo, coordf_t hi, bool &zaa_sampling)
 {
     bool zaa_active   = false;
     coordf_t z_offset = 0.0;
@@ -68,7 +68,10 @@ static coordf_t compute_slice_z(PrintObject* print_object, size_t i_layer, coord
         }
     }
 
-    if (!zaa_active || i_layer == 0) {
+    // The first object layer always samples at its mid height, so it is not a ZAA layer either.
+    zaa_sampling = zaa_active && i_layer != 0;
+
+    if (!zaa_sampling) {
         return 0.5 * (lo + hi);
     }
 
@@ -92,9 +95,10 @@ LayerPtrs new_layers(
     for (size_t i_layer = 0; i_layer < object_layers.size(); i_layer += 2) {
         coordf_t lo = object_layers[i_layer];
         coordf_t hi = object_layers[i_layer + 1];
-        coordf_t slice_z = compute_slice_z(print_object, i_layer, lo, hi);
+        bool     zaa_sampling = false;
+        coordf_t slice_z = compute_slice_z(print_object, i_layer, lo, hi, zaa_sampling);
 
-        Layer *layer = new Layer(id ++, print_object, hi - lo, hi + zmin, slice_z);
+        Layer *layer = new Layer(id ++, print_object, hi - lo, hi + zmin, slice_z, zaa_sampling);
         out.emplace_back(layer);
         if (prev != nullptr) {
             prev->upper_layer = layer;

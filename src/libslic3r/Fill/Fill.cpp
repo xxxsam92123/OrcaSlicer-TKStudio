@@ -1387,6 +1387,14 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 }
 #endif
 
+// Whether the infill of `region_config` keeps one direction on this layer. The switch only makes
+// sense where Z anti-aliasing moved the slice plane off the layer's mid height: on every other
+// layer (the first object layer, raft layers) the infill alternates as it always did.
+bool Layer::suppress_infill_alternation(const PrintRegionConfig &region_config) const
+{
+    return this->zaa_sampling_layer() && region_config.zaa_enabled && region_config.zaa_dont_alternate_fill_direction;
+}
+
 // friend to Layer
 void Layer::make_fills(const FillAdaptive::RegionOctrees* fill_octrees, FillLightning::Generator* lightning_generator)
 {
@@ -1453,7 +1461,7 @@ void Layer::make_fills(const FillAdaptive::RegionOctrees* fill_octrees, FillLigh
         f->layer_id = this->id();
         {
             const auto &rcfg = m_regions[surface_fill.region_id]->region().config();
-            f->dont_alternate_fill_direction = rcfg.zaa_enabled && rcfg.zaa_dont_alternate_fill_direction;
+            f->dont_alternate_fill_direction = this->suppress_infill_alternation(rcfg);
         }
         f->z 		= this->print_z;
         f->angle 	= surface_fill.params.angle;
@@ -1784,7 +1792,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(const FillAdapti
         f->layer_id = this->id() - this->object()->get_layer(0)->id(); // We need to subtract raft layers.
         {
             const auto &rcfg = m_regions[surface_fill.region_id]->region().config();
-            f->dont_alternate_fill_direction = rcfg.zaa_enabled && rcfg.zaa_dont_alternate_fill_direction;
+            f->dont_alternate_fill_direction = this->suppress_infill_alternation(rcfg);
         }
         f->z        = this->print_z;
         f->angle    = surface_fill.params.angle;
@@ -1999,7 +2007,7 @@ void Layer::make_ironing()
 	for (size_t i = 0; i < by_extruder.size();) {
 		// Find span of regions equivalent to the ironing operation.
 		IroningParams &ironing_params = by_extruder[i];
-        f->dont_alternate_fill_direction = ironing_params.layerm->region().config().zaa_enabled && ironing_params.layerm->region().config().zaa_dont_alternate_fill_direction;
+        f->dont_alternate_fill_direction = this->suppress_infill_alternation(ironing_params.layerm->region().config());
 		// Create the filler object.
 		if( f_pattern != ironing_params.pattern )
 		{
