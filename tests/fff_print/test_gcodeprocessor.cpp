@@ -18,6 +18,7 @@
 #include "test_utils.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <initializer_list>
@@ -258,11 +259,9 @@ TEST_CASE("Reserved keyword detection reports every offending line", "[GCodeProc
 
 namespace {
 
-void process_gcode(const std::string &gcode, GCodeProcessorResult &result)
+// s_IsBBLPrinter selects the "; FEATURE: " role tags the G-code uses.
+void process_gcode(const std::string &gcode, GCodeProcessorResult &result, const FullPrintConfig &config)
 {
-    FullPrintConfig config;
-    config.gcode_flavor.value = gcfMarlinFirmware;
-    // s_IsBBLPrinter selects the "; FEATURE: " role tags the G-code uses.
     const bool       was_bbl_printer = GCodeProcessor::s_IsBBLPrinter;
     const ScopeGuard restore_bbl_printer([was_bbl_printer] { GCodeProcessor::s_IsBBLPrinter = was_bbl_printer; });
     GCodeProcessor::s_IsBBLPrinter = true;
@@ -272,6 +271,13 @@ void process_gcode(const std::string &gcode, GCodeProcessorResult &result)
     processor.apply_config(config);
     processor.process_file(temp.string());
     result = std::move(processor.extract_result());
+}
+
+void process_gcode(const std::string &gcode, GCodeProcessorResult &result)
+{
+    FullPrintConfig config;
+    config.gcode_flavor.value = gcfMarlinFirmware;
+    process_gcode(gcode, result, config);
 }
 
 // Closed outer-wall squares, each after a fast travel and before an inner-wall move, so the processor
@@ -333,6 +339,162 @@ bool is_block_move(const GCodeProcessorResult::MoveVertex &move)
 }
 
 } // namespace
+
+// The start G-code runs in a "prepare" stage before the printed part: heat, home, prime. The processor
+// marks its moves with MoveVertex::prepare_stage and counts their time as prepare time instead of a
+// layer's, which is what lets the preview leave them out of the first printed layer's paths.
+TEST_CASE("Start G-code prepare-stage moves are marked apart from the first printed layer", "[GCodeProcessor]")
+{
+    // The role tag before the first G1 opens the prepare stage. The prime line is an extrusion that
+    // belongs to no layer, pinned to the first layer's Z.
+    const std::string gcode =
+        "M83\n"
+        "G90\n"
+        "; FEATURE: Custom\n"
+        "G1 Z5.8 F600\n"
+        "G1 X290 Y10 E10 F12000\n"
+        "; CHANGE_LAYER\n"
+        "; LAYER_HEIGHT: 0.2\n"
+        "; FEATURE: Outer wall\n"
+        "G1 X10 Y50 Z0.2 F12000\n"
+        "G1 X200 Y50 E5 F1800\n";
+
+    GCodeProcessorResult result;
+    process_gcode(gcode, result);
+
+    const auto extrusion_ending_at = [&result](float x) {
+        return std::find_if(result.moves.begin(), result.moves.end(), [x](const GCodeProcessorResult::MoveVertex& move) {
+            return move.type == EMoveType::Extrude && std::fabs(move.position[X] - x) < 0.001f;
+        });
+    };
+
+    const auto prime = extrusion_ending_at(290.0f);
+    REQUIRE(prime != result.moves.end());
+    CHECK(prime->prepare_stage);
+
+    const auto wall = extrusion_ending_at(200.0f);
+    REQUIRE(wall != result.moves.end());
+    CHECK_FALSE(wall->prepare_stage);
+    // A prepare-stage move precedes the first printed one, so the preview has the position to start
+    // the first printed path from instead of the origin.
+    CHECK(std::any_of(result.moves.begin(), wall, [](const GCodeProcessorResult::MoveVertex& move) { return move.prepare_stage; }));
+
+    SECTION("every vertex of the prepare-stage extrusion is marked, its actual-speed splits too")
+    {
+        // The prime line's vertices are the only extrusions below Y 20, and the move is long and fast
+        // enough for the acceleration to split it into more than its own vertex.
+        size_t vertices = 0;
+        for (const GCodeProcessorResult::MoveVertex& move : result.moves) {
+            if (move.type != EMoveType::Extrude || move.position[Y] >= 20.0f)
+                continue;
+            CAPTURE(move.position[X], move.position[Y], move.internal_only);
+            ++vertices;
+            CHECK(move.prepare_stage);
+        }
+        CHECK(vertices > 1);
+    }
+
+    SECTION("no vertex of the first printed extrusion is marked")
+    {
+        size_t vertices = 0;
+        for (const GCodeProcessorResult::MoveVertex& move : result.moves) {
+            if (move.type != EMoveType::Extrude || move.position[Y] < 20.0f)
+                continue;
+            CAPTURE(move.position[X], move.position[Y], move.internal_only);
+            ++vertices;
+            CHECK_FALSE(move.prepare_stage);
+        }
+        CHECK(vertices > 1);
+    }
+
+    SECTION("the prepare stage's time is counted as prepare time, not as a layer's")
+    {
+        const size_t normal = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal);
+        double       prepare_move_time = 0.0;
+        for (const GCodeProcessorResult::MoveVertex& move : result.moves)
+            if (move.prepare_stage)
+                prepare_move_time += double(move.time[normal]);
+        CHECK(prepare_move_time > 0.0);
+        // The same time the time blocks tagged, so the total print time still holds it.
+        CHECK_THAT(double(result.print_statistics.modes[normal].prepare_time), Catch::Matchers::WithinRel(prepare_move_time, 1e-3));
+        CHECK(result.print_statistics.modes[normal].prepare_time < result.print_statistics.modes[normal].time);
+    }
+}
+
+// Arc fitting can leave a segment shorter than the 0.001 mm the writer prints, with a positive E still
+// on it. Dividing that filament by a length no nozzle travelled reports a bead cross section of tens of
+// mm2, and the preview shows a flow of thousands of mm3/s for a move it cannot even draw.
+TEST_CASE("A sub-resolution extrusion reports no bead cross section", "[GCodeProcessor][Regression]")
+{
+    // The middle move covers 3.32e-6 mm in X and Y, five and thirteen steps of the float the processor
+    // holds Marlin coordinates in at this magnitude: below both the 0.001 mm the writer prints and the
+    // 1e-4 EPSILON the processor treats as no displacement. Only its E is a real, positive amount.
+    const std::string gcode =
+        "M83\n"
+        "G90\n"
+        "; FEATURE: Outer wall\n"
+        "G1 Z0.2 F12000\n"
+        "G1 X8 Y2 F12000\n"
+        "G1 X2 Y2 E0.2 F3000\n"
+        "G1 X2.000001192 Y2.0000031 E.00003\n"
+        "G1 X12 Y2 E0.33 F3000\n";
+
+    GCodeProcessorResult result;
+    process_gcode(gcode, result);
+
+    // A bead cannot be wider than a nozzle nor taller than a layer: the real moves here are 0.4 x 0.2 mm,
+    // 0.08 mm2, and even 1 mm2 would take a nozzle this printer does not have. The division above reports
+    // about 21 mm2 instead.
+    //
+    // Flow alone is not enough to pin the defect down: clamping mm3_per_mm would satisfy it while still
+    // recording a bead on a move the head never made. So the recorded geometry is judged too, but only for
+    // vertices whose reported flow is already plausible - a vertex that fails the flow check is reported
+    // once, not twice. The head travelled 3.32e-6 mm, which the processor itself treats as no displacement
+    // (EPSILON, 1e-4), so that vertex must not survive as an extrusion vertex within EPSILON of the
+    // extrusion vertex before it. Every Extrude move does carry some XY displacement (a move without one
+    // is not typed Extrude), so a legitimate extrusion vertex cannot trip this check.
+    bool  has_previous_extrusion = false;
+    Vec2f previous_extrusion     = Vec2f::Zero();
+    for (const GCodeProcessorResult::MoveVertex &move : result.moves) {
+        if (move.type != EMoveType::Extrude)
+            continue;
+        CAPTURE(move.position[X], move.position[Y], move.mm3_per_mm, move.volumetric_rate());
+        CHECK(move.mm3_per_mm < 1.0f);
+        const Vec2f end(move.position[X], move.position[Y]);
+        if (move.mm3_per_mm < 1.0f && has_previous_extrusion) {
+            CAPTURE(previous_extrusion[X], previous_extrusion[Y], (end - previous_extrusion).norm());
+            CHECK((end - previous_extrusion).norm() >= float(EPSILON));
+        }
+        previous_extrusion     = end;
+        has_previous_extrusion = true;
+    }
+
+    // Leaving the sub-resolution move out must keep the two real extrusions, and their flow, where they
+    // were: the one before it ends at X 2 and the one after it at X 12. The sub-resolution endpoint sits
+    // 1.19e-6 further in X (and 3.32e-6 further in the plane), so a 5e-7 window - about two float steps at
+    // this magnitude - matches the intended endpoint and can capture neither of the other two.
+    const auto extrusion_ending_at = [&result](float x) {
+        return std::find_if(result.moves.begin(), result.moves.end(), [x](const GCodeProcessorResult::MoveVertex &move) {
+            return move.type == EMoveType::Extrude && std::fabs(move.position[X] - x) < 5.0e-7f;
+        });
+    };
+    // 1.75 mm filament is 2.405 mm2 across, so 0.2 mm of it over 6 mm is a 0.080 mm2 bead.
+    const double filament_cross_section = M_PI * 0.875 * 0.875;
+    // Both real extrusions run at F3000, i.e. 50 mm/s, so their preview flow is their bead times 50.
+    const double feedrate_mm_s = 3000.0 / 60.0;
+    const auto   before        = extrusion_ending_at(2.0f);
+    REQUIRE(before != result.moves.end());
+    CAPTURE(before->position[X], before->position[Y], before->mm3_per_mm, before->volumetric_rate());
+    CHECK_THAT(double(before->mm3_per_mm), Catch::Matchers::WithinRel(filament_cross_section * 0.2 / 6.0, 1e-3));
+    CHECK_THAT(double(before->volumetric_rate()), Catch::Matchers::WithinRel(filament_cross_section * 0.2 / 6.0 * feedrate_mm_s, 1e-3));
+
+    // And 0.33 mm of it over 10 mm is a 0.079 mm2 bead.
+    const auto after = extrusion_ending_at(12.0f);
+    REQUIRE(after != result.moves.end());
+    CAPTURE(after->position[X], after->position[Y], after->mm3_per_mm, after->volumetric_rate());
+    CHECK_THAT(double(after->mm3_per_mm), Catch::Matchers::WithinRel(filament_cross_section * 0.33 / 10.0, 1e-3));
+    CHECK_THAT(double(after->volumetric_rate()), Catch::Matchers::WithinRel(filament_cross_section * 0.33 / 10.0 * feedrate_mm_s, 1e-3));
+}
 
 TEST_CASE("Loaded manual tool change comments switch subsequent moves when enabled", "[GCodeProcessor][Regression]")
 {
@@ -754,4 +916,269 @@ TEST_CASE("Each extrusion weighs its filament's density", "[GCodeProcessor]")
     const Vec3d light = center_of(masses[0]->total());
     const Vec3d dense = center_of(masses[1]->total());
     CHECK_THAT((plate - light).dot(dense - light) / (dense - light).squaredNorm(), Catch::Matchers::WithinAbs(0.75, 0.01));
+}
+
+// A G1 that repeats the current point exactly asks for no path at all, yet its positive E still has
+// to be classified. The pre-existing zero-displacement rule already does it: E moving alone is an
+// Unretract, never an Extrude, so nothing is recorded as a bead on a segment the head did not travel.
+// Task 2's guard is not even consulted here - it asks for type == Extrude first.
+TEST_CASE("A G1 that repeats the current point records no extrusion vertex", "[GCodeProcessor][Regression]")
+{
+    // These boundary cases assert flow in mm3_per_mm, i.e. extruded filament volume over path length,
+    // so the filament diameter they depend on is pinned instead of inherited from the config defaults.
+    FullPrintConfig config;
+    config.gcode_flavor.value       = gcfMarlinFirmware;
+    config.filament_diameter.values = { 1.75 };
+    config.nozzle_diameter.values   = { 0.4 };
+
+    const std::string gcode =
+        "M83\n"
+        "G90\n"
+        "; FEATURE: Outer wall\n"
+        "G1 Z0.2 F12000\n"
+        "G1 X20 Y10 F12000\n"
+        "G1 X30 Y10 E1 F1800\n"
+        "G1 X30 Y10 E.00003\n"
+        "G1 X40 Y10 E1 F1800\n";
+
+    GCodeProcessorResult result;
+    process_gcode(gcode, result, config);
+
+    // The time estimator splits long moves into internal_only vertices of its own; those are not what
+    // the G-code asked for, so every count below is over the command vertices.
+    std::vector<size_t> extrusions;
+    for (size_t i = 0; i < result.moves.size(); ++i)
+        if (result.moves[i].type == EMoveType::Extrude && !result.moves[i].internal_only)
+            extrusions.push_back(i);
+    REQUIRE(extrusions.size() == 2);
+
+    // 1 mm of 1.75 mm filament (2.405 mm2) over a 10 mm path is a 0.2405 mm2 bead.
+    const double filament_cross_section = M_PI * 0.875 * 0.875;
+    CHECK_THAT(result.moves[extrusions[0]].position[X], Catch::Matchers::WithinAbs(30.0f, 1e-5f));
+    CHECK_THAT(result.moves[extrusions[1]].position[X], Catch::Matchers::WithinAbs(40.0f, 1e-5f));
+    CHECK_THAT(double(result.moves[extrusions[0]].mm3_per_mm), Catch::Matchers::WithinRel(filament_cross_section / 10.0, 1e-3));
+    CHECK_THAT(double(result.moves[extrusions[1]].mm3_per_mm), Catch::Matchers::WithinRel(filament_cross_section / 10.0, 1e-3));
+
+    // At the repeated point itself there is one arriving extrusion and then the E-only move, which is
+    // typed Unretract. A second Extrude there would be a bead on a zero-length path.
+    size_t extrusions_at_repeat = 0;
+    bool   unretract_at_repeat  = false;
+    for (const GCodeProcessorResult::MoveVertex &move : result.moves) {
+        if (move.internal_only || std::fabs(move.position[X] - 30.0f) > 1e-6f || std::fabs(move.position[Y] - 10.0f) > 1e-6f)
+            continue;
+        CAPTURE(static_cast<int>(move.type), move.delta_extruder);
+        extrusions_at_repeat += (move.type == EMoveType::Extrude) ? 1 : 0;
+        unretract_at_repeat |= (move.type == EMoveType::Unretract);
+    }
+    CHECK(extrusions_at_repeat == 1);
+    CHECK(unretract_at_repeat);
+}
+
+// A retract and its unretract do not move the head, so their XYZ delta is exactly zero. They are typed
+// by their E sign alone (Retract / Unretract) and are never Extrude, which is what keeps Task 2's
+// extrusion guard from touching them.
+TEST_CASE("A retract and its unretract keep their own types at a standstill", "[GCodeProcessor][Regression]")
+{
+    FullPrintConfig config;
+    config.gcode_flavor.value       = gcfMarlinFirmware;
+    config.filament_diameter.values = { 1.75 };
+    config.nozzle_diameter.values   = { 0.4 };
+
+    const std::string gcode =
+        "M83\n"
+        "G90\n"
+        "; FEATURE: Outer wall\n"
+        "G1 Z0.2 F12000\n"
+        "G1 X50 Y10 F12000\n"
+        "G1 X70 Y10 E1 F1800\n"
+        "G1 E-.8 F1800\n"
+        "G1 E.8 F1800\n"
+        "G1 X90 Y10 E1 F1800\n";
+
+    GCodeProcessorResult result;
+    process_gcode(gcode, result, config);
+
+    const auto vertex_at = [&result](float x, EMoveType type) {
+        return std::find_if(result.moves.begin(), result.moves.end(), [x, type](const GCodeProcessorResult::MoveVertex &move) {
+            return move.type == type && !move.internal_only && std::fabs(move.position[X] - x) < 1e-6f;
+        });
+    };
+
+    size_t retracts = 0;
+    size_t unretracts = 0;
+    for (const GCodeProcessorResult::MoveVertex &move : result.moves) {
+        retracts += (move.type == EMoveType::Retract) ? 1 : 0;
+        unretracts += (move.type == EMoveType::Unretract) ? 1 : 0;
+    }
+    CHECK(retracts == 1);
+    CHECK(unretracts == 1);
+
+    const auto retract = vertex_at(70.0f, EMoveType::Retract);
+    REQUIRE(retract != result.moves.end());
+    CAPTURE(retract->position[X], retract->position[Y], retract->delta_extruder, retract->travel_dist);
+    CHECK_THAT(retract->position[Y], Catch::Matchers::WithinAbs(10.0f, 1e-6f));
+    CHECK_THAT(double(retract->delta_extruder), Catch::Matchers::WithinAbs(-0.8, 1e-6));
+    // No path at all: the whole move is E, so its travel distance is zero, not a sub-resolution sliver.
+    CHECK_THAT(double(retract->travel_dist), Catch::Matchers::WithinAbs(0.0, 1e-6));
+
+    const auto unretract = vertex_at(70.0f, EMoveType::Unretract);
+    REQUIRE(unretract != result.moves.end());
+    CAPTURE(unretract->position[X], unretract->position[Y], unretract->delta_extruder, unretract->travel_dist);
+    CHECK_THAT(unretract->position[Y], Catch::Matchers::WithinAbs(10.0f, 1e-6f));
+    CHECK_THAT(double(unretract->delta_extruder), Catch::Matchers::WithinAbs(0.8, 1e-6));
+    CHECK_THAT(double(unretract->travel_dist), Catch::Matchers::WithinAbs(0.0, 1e-6));
+
+    // The two real extrusions around them are untouched: 1 mm of filament over 20 mm of path each.
+    const double filament_cross_section = M_PI * 0.875 * 0.875;
+    const auto   before = vertex_at(70.0f, EMoveType::Extrude);
+    REQUIRE(before != result.moves.end());
+    CHECK_THAT(double(before->mm3_per_mm), Catch::Matchers::WithinRel(filament_cross_section / 20.0, 1e-3));
+    const auto after = vertex_at(90.0f, EMoveType::Extrude);
+    REQUIRE(after != result.moves.end());
+    CHECK_THAT(double(after->mm3_per_mm), Catch::Matchers::WithinRel(filament_cross_section / 20.0, 1e-3));
+}
+
+// The cut Task 2 added is EPSILON, 1e-4 mm. A legitimate path one order of magnitude above it - the
+// 0.001 mm the writer quantizes its output to - must stay an extrusion with the flow of its real
+// length, otherwise a working filter would be eating normal print paths.
+TEST_CASE("A 0.001 mm XY extrusion keeps its path length and its flow", "[GCodeProcessor][Regression]")
+{
+    FullPrintConfig config;
+    config.gcode_flavor.value       = gcfMarlinFirmware;
+    config.filament_diameter.values = { 1.75 };
+    config.nozzle_diameter.values   = { 0.4 };
+
+    const std::string gcode =
+        "M83\n"
+        "G90\n"
+        "; FEATURE: Outer wall\n"
+        "G1 Z0.2 F12000\n"
+        "G1 X60 Y10 F12000\n"
+        "G1 X60.001 Y10 E0.0000333 F1800\n"
+        "G1 X60.051 Y10 E0.001665 F1800\n";
+
+    GCodeProcessorResult result;
+    process_gcode(gcode, result, config);
+
+    std::vector<size_t> extrusions;
+    for (size_t i = 0; i < result.moves.size(); ++i)
+        if (result.moves[i].type == EMoveType::Extrude && !result.moves[i].internal_only)
+            extrusions.push_back(i);
+    REQUIRE(extrusions.size() == 2);
+
+    // Walk back over the internal_only vertices the time estimator may have added to the travel, so
+    // the path length is measured from the vertex the G-code itself asked for.
+    size_t previous = extrusions[0];
+    while (previous > 0 && result.moves[previous - 1].internal_only)
+        --previous;
+    REQUIRE(previous > 0);
+    const GCodeProcessorResult::MoveVertex &travel_end = result.moves[previous - 1];
+    REQUIRE(travel_end.type == EMoveType::Travel);
+
+    const GCodeProcessorResult::MoveVertex &shortest = result.moves[extrusions[0]];
+    const double distance = std::hypot(double(shortest.position[X]) - double(travel_end.position[X]),
+                                       double(shortest.position[Y]) - double(travel_end.position[Y]));
+    CAPTURE(distance, shortest.position[X], shortest.mm3_per_mm);
+    // 60.001 is held as a float, i.e. 60.0009995, so the recorded length is 9.9945e-4 mm.
+    CHECK_THAT(distance, Catch::Matchers::WithinAbs(0.001, 1e-6));
+    // Ten EPSILONs: the sub-resolution cut must be far below this move.
+    CHECK(distance > 5.0 * double(EPSILON));
+
+    const double filament_cross_section = M_PI * 0.875 * 0.875;
+    const double expected = filament_cross_section * 0.0000333 / distance;
+    CHECK_THAT(double(shortest.mm3_per_mm), Catch::Matchers::WithinRel(expected, 2e-3));
+    // A bead, not the blow-up the sub-resolution division produced (tens of mm2).
+    CHECK(shortest.mm3_per_mm < 1.0f);
+
+    // The following move is fifty times longer and carries fifty times the E, so it is the same bead:
+    // the position bookkeeping still makes the two agree.
+    const GCodeProcessorResult::MoveVertex &follow_up = result.moves[extrusions[1]];
+    const double follow_distance = std::hypot(double(follow_up.position[X]) - double(shortest.position[X]),
+                                              double(follow_up.position[Y]) - double(shortest.position[Y]));
+    CAPTURE(follow_distance, follow_up.position[X], follow_up.mm3_per_mm);
+    CHECK_THAT(follow_distance, Catch::Matchers::WithinAbs(0.05, 1e-6));
+    CHECK_THAT(double(follow_up.mm3_per_mm),
+               Catch::Matchers::WithinRel(filament_cross_section * 0.001665 / follow_distance, 2e-3));
+    CHECK_THAT(double(follow_up.mm3_per_mm), Catch::Matchers::WithinRel(double(shortest.mm3_per_mm), 2e-3));
+}
+
+// A G2/G3 arc is discretized into many short G1 extrusions inside process_G2_G3, all of them handed to
+// process_G1 with G1DiscretizationOrigin::G2G3. The guard Task 2 added only fires for origin == G1, so
+// the arc keeps every segment it had before: same count, same geometry, same E.
+TEST_CASE("A G2/G3 semicircle keeps every discretized extrusion segment", "[GCodeProcessor][Regression]")
+{
+    const bool clockwise = GENERATE(false, true);
+    CAPTURE(clockwise);
+
+    FullPrintConfig config;
+    config.gcode_flavor.value       = gcfMarlinFirmware;
+    config.filament_diameter.values = { 1.75 };
+    config.nozzle_diameter.values   = { 0.4 };
+
+    // Centre (40, 10), radius 10, half turn, F1200 = 20 mm/s.
+    const std::string gcode =
+        std::string("M83\n"
+                    "G90\n"
+                    "; FEATURE: Outer wall\n"
+                    "G1 Z0.2 F12000\n"
+                    "G1 X50 Y10 F12000\n") +
+        (clockwise ? "G2" : "G3") + " X30 Y10 I-10 J0 E0.5 F1200\n";
+
+    GCodeProcessorResult result;
+    process_gcode(gcode, result, config);
+
+    std::vector<size_t> arc_vertices;
+    for (size_t i = 0; i < result.moves.size(); ++i)
+        if (result.moves[i].type == EMoveType::Extrude && !result.moves[i].internal_only)
+            arc_vertices.push_back(i);
+    REQUIRE(!arc_vertices.empty());
+
+    // segment_mm = clamp(min(sqrt(8 * 10 * 0.02), 20 / 50), 0.1, 2.0) = 0.4 and
+    // segments = max(10 * pi / 0.4 + 0.8, 1) = 79, the Marlin branch's own count. Every segment ends in
+    // its own extrusion vertex; a dropped one would show up here.
+    CHECK(arc_vertices.size() == 79);
+
+    // From the first to the last arc vertex every move is an extrusion: the arc is not interrupted.
+    for (size_t i = arc_vertices.front(); i <= arc_vertices.back(); ++i) {
+        CAPTURE(i, static_cast<int>(result.moves[i].type), result.moves[i].position[X], result.moves[i].position[Y]);
+        CHECK(result.moves[i].type == EMoveType::Extrude);
+    }
+
+    const Vec2f  center(40.0f, 10.0f);
+    double       total_e     = 0.0;
+    double       min_segment = 1e9;
+    for (size_t k = 0; k < arc_vertices.size(); ++k) {
+        const GCodeProcessorResult::MoveVertex &move = result.moves[arc_vertices[k]];
+        const Vec2f                              point(move.position[X], move.position[Y]);
+        CAPTURE(k, point[X], point[Y], move.delta_extruder);
+        // On the circle the arc was asked for.
+        CHECK_THAT(double((point - center).norm()), Catch::Matchers::WithinAbs(10.0, 1e-3));
+        total_e += double(move.delta_extruder);
+        if (k > 0) {
+            const GCodeProcessorResult::MoveVertex &previous = result.moves[arc_vertices[k - 1]];
+            const Vec2f                              previous_point(previous.position[X], previous.position[Y]);
+            min_segment = std::min(min_segment, double((point - previous_point).norm()));
+        }
+    }
+    // The arc delivers exactly the E the file asked for, so no segment's filament was dropped.
+    CAPTURE(total_e, min_segment);
+    CHECK_THAT(total_e, Catch::Matchers::WithinRel(0.5, 1e-4));
+    // Segments are ~0.3976 mm, three orders of magnitude above EPSILON, so the guard's delta_xyz < 1e-4
+    // test is false on every one of them: the pre-Task-2 code and the current code take the same branch,
+    // and the arc path is untouched by construction.
+    CHECK_THAT(min_segment, Catch::Matchers::WithinAbs(0.3976, 1e-3));
+    CHECK(min_segment > 100.0 * double(EPSILON));
+
+    // First vertex one segment along the circle, last exactly at the commanded endpoint.
+    const GCodeProcessorResult::MoveVertex &first_arc = result.moves[arc_vertices.front()];
+    CAPTURE(first_arc.position[X], first_arc.position[Y]);
+    CHECK_THAT(first_arc.position[X], Catch::Matchers::WithinAbs(49.9921f, 1e-3f));
+    CHECK_THAT(first_arc.position[Y], Catch::Matchers::WithinAbs(clockwise ? 9.6024f : 10.3976f, 1e-3f));
+    // The turn direction survives the discretization: G2 runs below Y 10, G3 above it.
+    CHECK((first_arc.position[Y] < 10.0f) == clockwise);
+
+    const GCodeProcessorResult::MoveVertex &last_arc = result.moves[arc_vertices.back()];
+    CAPTURE(last_arc.position[X], last_arc.position[Y], last_arc.delta_extruder);
+    CHECK_THAT(last_arc.position[X], Catch::Matchers::WithinAbs(30.0f, 1e-5f));
+    CHECK_THAT(last_arc.position[Y], Catch::Matchers::WithinAbs(10.0f, 1e-5f));
 }

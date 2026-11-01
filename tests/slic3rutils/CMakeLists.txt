@@ -12,6 +12,8 @@ add_executable(${_TEST_NAME}_tests
     test_filament_bitmap_utils.cpp
     test_colour_picker_field.cpp
     test_filament_color_picker.cpp
+    # The preview's move filter; libslic3r_gui is linked only by this suite.
+    test_libvgcode_conversion.cpp
     test_device_progress.cpp
     test_device_manager_integration.cpp
     test_web_media_controller.cpp

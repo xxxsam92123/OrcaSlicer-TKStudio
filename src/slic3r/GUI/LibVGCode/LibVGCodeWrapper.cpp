@@ -247,6 +247,16 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
     }
 
     const std::vector<Slic3r::GCodeProcessorResult::MoveVertex>& moves = result.moves;
+    // The start G-code's prepare stage - heat, home, prime - emits moves, among them the prime
+    // line's extruding ones, that are not part of the printed model: their bead is the prime bead's
+    // (5.8 mm tall and 1.35 mm wide, because the pinned Z is what the height falls back to), their Z
+    // is pinned to the first layer and their time is the start-up wait. The preview still draws
+    // them, because they are part of the G-code the user is looking at, but it must not measure
+    // them: every vertex carries MoveVertex::prepare_stage into PathVertex::prepare_stage, and
+    // libvgcode leaves the flagged vertices out of the colour ranges and out of the times it
+    // accumulates, so a 5.8 mm "layer" or a ~17 min first layer cannot stretch the legends. Their
+    // time still reaches the user as the print statistics' prepare time.
+    //
     // One vertex per move after the first, plus a phantom in front of every path start. Reserving
     // the exact count leaves nothing to shrink afterwards, and shrinking would copy the whole array
     // while both copies are alive.
@@ -282,7 +292,7 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
                 static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
                 /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
                 /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-                /* ORCA: Add Jerk visualization support */ curr.jerk };
+                /* ORCA: Add Jerk visualization support */ curr.jerk, curr.prepare_stage };
 #else
             const libvgcode::PathVertex vertex = { xform_pos(prev.position), curr.height, curr.width, curr.feedrate, prev.actual_feedrate,
                 curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
@@ -290,7 +300,7 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
                 static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), { 0.0f, 0.0f },
                 /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
                 /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-                /* ORCA: Add Jerk visualization support */ curr.jerk };
+                /* ORCA: Add Jerk visualization support */ curr.jerk, curr.prepare_stage };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
             ret.vertices.emplace_back(vertex);
         }
@@ -303,7 +313,7 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
             static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), curr.time,
             /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
             /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-            /* ORCA: Add Jerk visualization support */ curr.jerk };
+            /* ORCA: Add Jerk visualization support */ curr.jerk, curr.prepare_stage };
 #else
         const libvgcode::PathVertex vertex = { xform_pos(curr.position), curr.height, curr.width, curr.feedrate, curr.actual_feedrate,
             curr.mm3_per_mm, curr.fan_speed, curr.temperature, convert(curr.extrusion_role), curr_type,
@@ -311,7 +321,7 @@ GCodeInputData convert(const Slic3r::GCodeProcessorResult& result, const std::ve
             static_cast<uint8_t>(curr.extruder_id), static_cast<uint8_t>(curr.cp_color_id), curr.time,
             /* ORCA: Add Pressure Advance visualization support */ 0.0f, curr.pressure_advance,
             /* ORCA: Add Acceleration visualization support */ curr.acceleration,
-            /* ORCA: Add Jerk visualization support */ curr.jerk };
+            /* ORCA: Add Jerk visualization support */ curr.jerk, curr.prepare_stage };
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
         ret.vertices.emplace_back(vertex);
     }

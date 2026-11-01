@@ -1065,17 +1065,25 @@ void ViewerImpl::load(GCodeInputData&& gcode_data)
 
         m_layers.update(v, static_cast<uint32_t>(i));
 
-        for (size_t j = 0; j < TIME_MODES_COUNT; ++j) {
-            m_total_time[j] += v.times[j];
-            if (v.type == EMoveType::Travel)
-                m_travels_time[j] += v.times[j];
+        // The start G-code's prepare stage is drawn but is not part of the print: its warm-up time
+        // belongs to no layer and to no printed extrusion, so it is left out of every total here.
+        // Its time reaches the user as the print statistics' prepare time. Layers::update keeps the
+        // vertex in its layer's range, which is what lets the preview draw it.
+        const bool counts_time = v.is_measured();
+
+        if (counts_time) {
+            for (size_t j = 0; j < TIME_MODES_COUNT; ++j) {
+                m_total_time[j] += v.times[j];
+                if (v.type == EMoveType::Travel)
+                    m_travels_time[j] += v.times[j];
+            }
         }
 
         const EOptionType option_type = move_type_to_option(v.type);
         if (option_type != EOptionType::COUNT)
             m_options.emplace_back(option_type);
 
-        if (v.type == EMoveType::Extrude) {
+        if (v.type == EMoveType::Extrude && counts_time) {
             m_extrusion_roles.add(v.role, v.times);
 
             auto estruder_it = m_used_extruders.find(v.extruder_id);
@@ -1135,7 +1143,7 @@ void ViewerImpl::load(GCodeInputData&& gcode_data)
                 for (size_t j = 0; j < TIME_MODES_COUNT; ++j)
                     m_layer_start_times[j][layer] = running[j];
             }
-            if (i < m_vertices.size()) {
+            if (i < m_vertices.size() && m_vertices[i].is_measured()) {
                 for (size_t j = 0; j < TIME_MODES_COUNT; ++j)
                     running[j] += m_vertices[i].times[j];
             }
@@ -1515,7 +1523,7 @@ std::vector<ETimeMode> ViewerImpl::get_time_modes() const
     std::vector<ETimeMode> ret;
     for (size_t i = 0; i < TIME_MODES_COUNT; ++i) {
         if (std::accumulate(m_vertices.begin(), m_vertices.end(), 0.0f,
-            [i](float a, const PathVertex& v) { return a + v.times[i]; }) > 0.0f)
+            [i](float a, const PathVertex& v) { return a + (v.is_measured() ? v.times[i] : 0.0f); }) > 0.0f)
             ret.push_back(static_cast<ETimeMode>(i));
     }
     return ret;
@@ -1629,8 +1637,10 @@ float ViewerImpl::get_estimated_time_at(size_t id) const
         first = m_layer_first_vertex[layer];
         time = m_layer_start_times[mode][layer];
     }
-    for (size_t i = first; i <= id; ++i)
-        time += m_vertices[i].times[mode];
+    for (size_t i = first; i <= id; ++i) {
+        if (m_vertices[i].is_measured())
+            time += m_vertices[i].times[mode];
+    }
     return time;
 }
 
@@ -2027,6 +2037,11 @@ void ViewerImpl::update_color_ranges()
 
     for (size_t i = 0; i < m_vertices.size(); i++) {
         const PathVertex& v = m_vertices[i];
+        // The start G-code's prepare stage is drawn but is not part of the printed model: its bead
+        // (a 5.8 mm "layer" on the prime line), its start-up speed and its fan/temperature would
+        // stretch every legend. See PathVertex::prepare_stage.
+        if (!v.is_measured())
+            continue;
         if (v.is_extrusion()) {
             m_height_range.update(round_to_bin(v.height));
             if (!v.is_custom_gcode() || m_settings.extrusion_roles_visibility[size_t(EGCodeExtrusionRole::Custom)]) {
