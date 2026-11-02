@@ -288,7 +288,7 @@ static std::vector<double> get_nozzle_diameters_by_nozzle_id(const MultiNozzleUt
         auto nozzle = group_result->get_nozzle_from_id(id);
         if (!nozzle)
             break;
-        diameters.push_back(std::stod(nozzle->diameter));
+        diameters.push_back(string_to_double_decimal_point(nozzle->diameter));
     }
     return diameters;
 }
@@ -9833,6 +9833,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                 fan_overlap_threshold = overhang_fan_overlap_threshold(FILAMENT_CONFIG(overhang_fan_threshold));
 
             if (NOZZLE_CONFIG(slowdown_for_curled_perimeters)){
+                const FloatOrPercent fully_unsupported_speed = path.role() == erBridgeInfill ?
+                    FloatOrPercent{NOZZLE_CONFIG(bridge_speed) * 100 / ref_speed, true} :
+                    (NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) < 0.5 ?
+                         FloatOrPercent{100, true} :
+                         FloatOrPercent{NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) * 100 / ref_speed, true});
                 ConfigOptionFloatsOrPercents dynamic_overhang_speeds(
                     {FloatOrPercent{100, true},
                      (NOZZLE_CONFIG(overhang_1_4_speed).get_abs_value(ref_speed) < 0.5) ?
@@ -9847,9 +9852,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, const std::string &path_d
                      (NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) < 0.5) ?
                          FloatOrPercent{100, true} :
                          FloatOrPercent{NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) * 100 / ref_speed, true},
-                     (NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) < 0.5) ?
-                         FloatOrPercent{100, true} :
-                         FloatOrPercent{NOZZLE_CONFIG(overhang_4_4_speed).get_abs_value(ref_speed) * 100 / ref_speed, true}});
+                     fully_unsupported_speed});
 
                 new_points = m_extrusion_quality_estimator.estimate_extrusion_quality(path, overhang_overlap_levels, dynamic_overhang_speeds,
                                                                               ref_speed, speed, NOZZLE_CONFIG(slowdown_for_curled_perimeters),
@@ -10671,7 +10674,7 @@ std::string GCode::travel_to(const Point& point, ExtrusionRole role, std::string
             jerk_to_set = initial_layer_travel_jerk;
         }
     } else { // ORCA: Handle short-travel acceleration and jerk for outer perimeters (if applicable)
-        const bool is_short_travel = travel.length() < scale_(EXTRUDER_CONFIG(retraction_minimum_travel));
+        const bool is_short_travel = travel.length() < scale_(FILAMENT_CONFIG(retraction_minimum_travel));
 
         if (NOZZLE_CONFIG(default_acceleration) > 0) {
             if (role == erOverhangPerimeter && is_short_travel) {
@@ -11004,7 +11007,7 @@ std::string GCode::retract(bool toolchange, bool is_last_retraction, LiftType li
 
     gcode += m_writer.reset_e();
     // Orca: check if should + can lift (roughly from SuperSlicer)
-    RetractLiftEnforceType retract_lift_type = RetractLiftEnforceType(EXTRUDER_CONFIG(retract_lift_enforce));
+    RetractLiftEnforceType retract_lift_type = RetractLiftEnforceType(FILAMENT_CONFIG(retract_lift_enforce));
 
     bool needs_lift = toolchange
         || m_writer.filament()->retraction_length() > 0
