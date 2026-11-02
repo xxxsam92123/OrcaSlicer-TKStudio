@@ -85,15 +85,18 @@ bool SlicingProcessCompletedEvent::critical_error() const
 
 bool SlicingProcessCompletedEvent::invalidate_plater() const
 {
-    if (critical_error()) {
-        try {
-            this->rethrow_exception();
-        } catch (const Slic3r::ExportError&) {
-            // Exception thrown by copying file does not ivalidate plater
-            return false;
-        } catch (...) {}
+    return error() && critical_error() && !export_failed();
+}
+
+bool SlicingProcessCompletedEvent::export_failed() const
+{
+    if (!error())
+        return false;
+    try {
+        this->rethrow_exception();
+    } catch (const Slic3r::ExportError&) {
         return true;
-    }
+    } catch (...) {}
     return false;
 }
 
@@ -319,11 +322,18 @@ void BackgroundSlicingProcess::process_fff()
         // including nozzle_group_result (consumed by the H2C print-dispatch nozzle mapping), is kept.
         if (m_fff_print->is_BBL_printer()) {
             m_stage = "post_process_gcode";
-            if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config())) {
-                m_fff_print->reload_gcode_moves(m_gcode_result);
-                // The post-processing scripts may have changed the file the export cached the
-                // statistics of, so the document is summed again from the moves as they are now.
-                m_gcode_result->cache_statistics_json();
+            try {
+                if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config())) {
+                    m_fff_print->reload_gcode_moves(m_gcode_result);
+                    // The post-processing scripts may have changed the file the export cached the
+                    // statistics of, so the document is summed again from the moves as they are now.
+                    m_gcode_result->cache_statistics_json();
+                }
+            } catch (...) {
+                // A failed script or plugin may have left the G-code half edited, so the next run exports
+                // it again instead of reusing it.
+                m_fff_print->invalidate_gcode_export_from_worker();
+                throw;
             }
         }
 
@@ -879,6 +889,10 @@ void BackgroundSlicingProcess::reset_export()
     if (!this->running()) {
         m_export_path.clear();
         m_export_path_on_removable_media = false;
+        // A scheduled upload only leaves m_upload_job when prepare_upload() hands it to the print host
+        // job queue. If the run ended before that (a post-processing script or plugin failure, or a
+        // cancel), the job must not survive into the next plain slice, which would upload again.
+        m_upload_job = PrintHostJob();
         // invalidate_step expects the mutex to be locked.
         std::scoped_lock<std::mutex> lock(m_print->state_mutex());
         this->invalidate_step(bspsGCodeFinalize);
@@ -1059,7 +1073,7 @@ void BackgroundSlicingProcess::prepare_upload()
             m_print->set_status(95, _utf8(L("Running post-processing scripts")));
             std::string error_message;
             if (copy_file(m_temp_output_path, source_path.string(), error_message) != SUCCESS)
-                throw Slic3r::RuntimeError(_utf8(L("Copying of the temporary G-code to the output G-code failed.")));
+                throw Slic3r::ExportError(_utf8(L("Copying of the temporary G-code to the output G-code failed.")));
             m_upload_job.upload_data.upload_path = m_fff_print->print_statistics().finalize_output_path(
                 m_upload_job.upload_data.upload_path.string());
             // Orca: skip post-processing scripts for BBL printers as we have run them already in finalize_gcode()
