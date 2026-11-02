@@ -24,6 +24,10 @@ static bool is_colorprint_option(const PathVertex& v)
 
 void Layers::update(const PathVertex& vertex, uint32_t vertex_id)
 {
+    // The start G-code's prepare stage is drawn as part of the first layer, so it extends the
+    // layer's vertex range, but its warm-up time belongs to no layer: it is left out of the times
+    // below and reaches the user as the print statistics' prepare time instead.
+    const bool counts_time = vertex.is_measured();
     if (m_items.empty() || vertex.layer_id == m_items.size()) {
         // this code assumes that gcode paths are sent sequentially, one layer after the other
         assert(vertex.layer_id == static_cast<uint32_t>(m_items.size()));
@@ -31,7 +35,8 @@ void Layers::update(const PathVertex& vertex, uint32_t vertex_id)
         if (vertex.type == EMoveType::Extrude && vertex.role != EGCodeExtrusionRole::Custom)
             item.z = vertex.position[2];
         item.range.set(vertex_id, vertex_id);
-        item.times = vertex.times;
+        if (counts_time)
+            item.times = vertex.times;
         item.contains_colorprint_options |= is_colorprint_option(vertex);
     }
     else {
@@ -39,8 +44,10 @@ void Layers::update(const PathVertex& vertex, uint32_t vertex_id)
         if (vertex.type == EMoveType::Extrude && vertex.role != EGCodeExtrusionRole::Custom && item.z != vertex.position[2])
             item.z = vertex.position[2];
         item.range.set_max(vertex_id);
-        for (size_t i = 0; i < TIME_MODES_COUNT; ++i) {
-            item.times[i] += vertex.times[i];
+        if (counts_time) {
+            for (size_t i = 0; i < TIME_MODES_COUNT; ++i) {
+                item.times[i] += vertex.times[i];
+            }
         }
         item.contains_colorprint_options |= is_colorprint_option(vertex);
     }
