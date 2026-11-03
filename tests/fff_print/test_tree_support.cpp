@@ -762,10 +762,13 @@ std::multiset<double> object_layer_heights(const PrintObject &po)
     return heights;
 }
 
-// The object layer organic places a top contact on below `face_z`: the highest one whose top keeps at
-// least `gap` of air under the face, or nullptr when every layer is too close to it. This is the grid side
-// of the placement (TreeSupportLayerGrid::place_top_contact()) restated on the object layers a test can
-// see, so an expectation never has to hard-code a layer Z.
+// The object layer these tests expect the top contact on, below `face_z`: the highest one whose top keeps
+// at least `gap` of air under the face, or nullptr when every layer is too close to it. It applies the
+// same rule as TreeSupportLayerGrid::place_top_contact() to the object layers a test can see, so an
+// expectation never has to hard-code a layer Z - but only as this scenario's expected-layer lookup: these
+// tests print no raft and their face-gap sits above the first layer's top. It does not restate the grid's
+// raft exclusion (the grid's lowest candidate is above the raft layers) nor its -1 when no layer is left
+// to carry the contact; the object layer list a test sees has neither of those cases.
 const Layer *top_contact_layer(const PrintObject &po, double face_z, double gap)
 {
     const Layer *contact = nullptr;
@@ -795,9 +798,13 @@ const SupportLayer *support_layer_at(const PrintObject &po, double print_z)
     return nullptr;
 }
 
-// Every support layer prints one of the object layer's Zs and heights, and every extrusion path it prints
+// Every support layer prints one of the object layers' Zs and heights, and every extrusion path it prints
 // is as thick as one of those layers - a gap remainder written into a layer height shows up in both.
 // Returns the number of paths checked, so a caller can tell that the assertions were not vacuous.
+//
+// Scoped to what these tests print: an organic stack with no raft, where every support layer Z is an
+// object layer Z one to one. It is not a general layer grid check - a raft puts support layers below the
+// object's first layer, which have no object layer to match.
 size_t check_support_layers_on_object_grid(const PrintObject &po)
 {
     const std::multiset<double> profile_heights = object_layer_heights(po);
@@ -1170,10 +1177,20 @@ TEST_CASE("An organic top gap follows a variable layer height below the nominal 
 // keeps the object's own 0.2 mm.
 //
 // independent_support_layer_height is set here because a project that had it on carries it in its config.
-// It does not give organic independent support layers: organic's grid is the object's layers regardless, the
-// setting is only read by the Cura derived support planner, and the GUI does not offer it for organic
-// ("Independent support layer height is unavailable for organic tree supports"). What this case pins is that
-// the setting reaches the config and does not move the grid - not that the support layers are independent.
+// It does not give organic independent support layers: organic's grid is the object's layers regardless.
+// Slicing's layer synchronized gap processing reads it (it decides whether the top, bottom and raft gaps
+// are rounded to whole object layers, and the Cura derived support planner plans on those gaps), and none
+// of that moves the organic grid; the GUI does not offer the setting for organic ("Independent support
+// layer height is unavailable for organic tree supports"). What this case pins is that the setting reaches
+// the config and does not move the grid - not that the support layers are independent.
+//
+// What this case covers: the raw millimetre in the config, the style routing to the organic generator, and
+// the safe degradation of a gap below the layer height. It does not on its own catch a regression in the
+// quantisation rule: on a uniform 0.2 mm stack any rule that rounds the gap up to a whole layer picks the
+// same layer, so the numbers here stay the same. The two variable layer height cases ("... follows a
+// variable layer height below the nominal layer height" and "... takes its contact from the layers a mixed
+// profile produced") are the ones that separate the rules - a fix that scales the gap by the nominal layer
+// height instead of following the actual stack lands on a different layer there.
 //
 // The numbers are this test's own mesh and config. A real project's slice depends on its geometry and its
 // profile and is not reproducible from this repository.
