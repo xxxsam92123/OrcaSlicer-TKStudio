@@ -24,6 +24,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
+#include "libslic3r/Support/SupportParameters.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -761,6 +762,64 @@ std::multiset<double> object_layer_heights(const PrintObject &po)
     return heights;
 }
 
+// The object layer organic places a top contact on below `face_z`: the highest one whose top keeps at
+// least `gap` of air under the face, or nullptr when every layer is too close to it. This is the grid side
+// of the placement (TreeSupportLayerGrid::place_top_contact()) restated on the object layers a test can
+// see, so an expectation never has to hard-code a layer Z.
+const Layer *top_contact_layer(const PrintObject &po, double face_z, double gap)
+{
+    const Layer *contact = nullptr;
+    for (const Layer *layer : po.layers())
+        if (layer->print_z <= face_z - gap + TreeSupport3D::TreeSupportLayerGrid::z_roundoff)
+            contact = layer;
+    return contact;
+}
+
+// The layer directly above `layer` in the object's stack, or nullptr at the top of it.
+const Layer *layer_above(const PrintObject &po, const Layer &layer)
+{
+    const Layer *above = nullptr;
+    for (const Layer *candidate : po.layers())
+        if (candidate->print_z > layer.print_z + 1e-9 && (above == nullptr || candidate->print_z < above->print_z))
+            above = candidate;
+    return above;
+}
+
+// The support layer that prints at `print_z`, or nullptr. A contact is looked up by Z instead of taken
+// from the end of the stack: the object layers above it are in the grid too, they just print nothing.
+const SupportLayer *support_layer_at(const PrintObject &po, double print_z)
+{
+    for (const SupportLayer *layer : po.support_layers())
+        if (std::abs(layer->print_z - print_z) < 1e-9)
+            return layer;
+    return nullptr;
+}
+
+// Every support layer prints one of the object layer's Zs and heights, and every extrusion path it prints
+// is as thick as one of those layers - a gap remainder written into a layer height shows up in both.
+// Returns the number of paths checked, so a caller can tell that the assertions were not vacuous.
+size_t check_support_layers_on_object_grid(const PrintObject &po)
+{
+    const std::multiset<double> profile_heights = object_layer_heights(po);
+    std::vector<const Layer *>  object_layers;
+    for (const Layer *layer : po.layers())
+        object_layers.emplace_back(layer);
+    size_t paths_checked = 0;
+    for (const SupportLayer *layer : po.support_layers()) {
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
+        const auto it = std::find_if(object_layers.begin(), object_layers.end(),
+            [layer](const Layer *object_layer) { return std::abs(object_layer->print_z - layer->print_z) < 1e-9; });
+        REQUIRE(it != object_layers.end());
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
+        for (const SupportPathRole &path : support_path_roles(*layer)) {
+            INFO("support path role " << int(path.role) << " height " << path.height);
+            CHECK(profile_heights.find(path.height) != profile_heights.end());
+            ++paths_checked;
+        }
+    }
+    return paths_checked;
+}
+
 // A 0.2 mm profile with a gap the user did not round to it. support_top_z_distance is a distance in
 // millimetres, but the support has no layer stack of its own: the contact goes onto the highest support
 // layer that keeps at least that much air under the overhang, so the gap is quantised upwards and every
@@ -986,6 +1045,226 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
         REQUIRE(! heights_plain.empty());
         CHECK(heights == heights_plain);
     }
+}
+
+// Slices two_tier_mesh() with `profile` as the object's layer height profile and the settings a tree print
+// of a 0.2 mm profile carries. `with_support` false slices the same profile with support off: the reference
+// for the object's own stack.
+void slice_with_layer_height_profile(Slic3r::Print &print, const std::vector<double> &profile, double gap,
+                                     bool with_support = true)
+{
+    Slic3r::Model  model;
+    ModelObject   *object = model.add_object();
+    object->name          = "tshape.stl";
+    object->add_volume(two_tier_mesh());
+    object->add_instance();
+    object->layer_height_profile.set(profile);
+    object->ensure_on_bed();
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "layer_height",                     0.2 },
+        { "enable_support",                   with_support ? 1 : 0 },
+        { "support_type",                     "tree(auto)" },
+        // tree(auto) resolves the default style to organic, which is what an unset project gets.
+        { "support_style",                    "default" },
+        { "support_threshold_angle",          30 },
+        // Carried in the config, as a project that had it on does. Organic's layer grid is the object's
+        // layers either way; the 0.2 mm profile case below says what that means for the gap.
+        { "independent_support_layer_height", 1 },
+        { "support_top_z_distance",           gap },
+        { "support_interface_top_layers",     2 },
+        // Relative extruder addressing needs a reset at each layer, as validate() points out.
+        { "before_layer_change_gcode",        "G92 E0" },
+    });
+    print.apply(model, config);
+    REQUIRE(print.validate().string.empty());
+    print.process();
+}
+
+// A gap narrower than the nominal layer height is reachable only because the layers there are thinner: the
+// contact is the highest object layer whose top still leaves the requested distance under the face, and on a
+// 0.1 mm section that layer is one 0.1 mm step down, so the air gap itself comes out below the nominal
+// 0.2 mm. Quantising the gap to `layer_height` instead puts every request below 0.2 on the same 0.2 mm
+// layer - the "0.12 comes out as 0.2" shape - and the assertions below fail for it.
+//
+// What this adds over "An organic top gap keeps a variable layer height profile's support layers on its
+// heights": that case keeps the requested gap at or above the nominal layer height and asserts the layer
+// heights are not bent to reach it. This one requests a gap below the nominal, so the contact has to be
+// placed on a sub-nominal layer and the air gap has to come out thinner than `layer_height`.
+TEST_CASE("An organic top gap follows a variable layer height below the nominal layer height", "[TreeSupportOrganicGap]")
+{
+    // 0.2 mm up to z = 15 and 0.1 mm above it, so the layers under the overhang are thinner than the
+    // nominal layer height. The upper plate of two_tier_mesh() starts at z = 16.0, its underside being the
+    // overhang face. The profile is resampled, so the layer Zs are not 15.1 / 15.2 / ...: every expectation
+    // below is derived from the stack the slice actually produced.
+    const std::vector<double> profile { 0., 0.2, 15.0, 0.1, 19.0, 0.1 };
+    const double              gap     = GENERATE(0.05, 0.15);
+    INFO("support_top_z_distance=" << gap);
+
+    Slic3r::Print supported;
+    Slic3r::Print unsupported;
+    slice_with_layer_height_profile(supported, profile, gap);
+    slice_with_layer_height_profile(unsupported, profile, gap, false);
+
+    const PrintObject &po       = *supported.objects().front();
+    const PrintObject &po_plain = *unsupported.objects().front();
+    REQUIRE(po.layer_count() == po_plain.layer_count());
+
+    // The support left the object's stack - Z, height and slice plane - exactly as the same print without
+    // support had it.
+    for (size_t i = 0; i < po.layer_count(); ++ i) {
+        const Layer &layer = *po.get_layer(i);
+        const Layer &plain = *po_plain.get_layer(i);
+        INFO("object layer " << i);
+        CHECK_THAT(layer.print_z, Catch::Matchers::WithinAbs(plain.print_z, 1e-12));
+        CHECK_THAT(layer.height, Catch::Matchers::WithinAbs(plain.height, 1e-12));
+        CHECK_THAT(layer.slice_z, Catch::Matchers::WithinAbs(plain.slice_z, 1e-12));
+    }
+
+    const Layer *expected = top_contact_layer(po, 16.0, gap);
+    REQUIRE(expected != nullptr);
+
+    // The premise this case rests on: the layer the gap has to clear is thinner than the nominal layer
+    // height, so the contact can sit closer to the face than one nominal layer. If the resampling stopped
+    // producing such a layer, the case would only prove that a 0.2 mm grid quantises to 0.2 - fail here
+    // instead of passing on that.
+    const Layer *above = layer_above(po, *expected);
+    REQUIRE(above != nullptr);
+    REQUIRE(above->height < 0.2 - 1e-6);
+
+    const SupportLayer *contact = support_layer_at(po, expected->print_z);
+    REQUIRE(contact != nullptr);
+    REQUIRE(contact->has_extrusions());
+    // Nothing is printed above the contact: it is the top of the support stack under this face, not just
+    // the last layer of a list.
+    for (const SupportLayer *layer : po.support_layers())
+        if (layer->has_extrusions()) {
+            INFO("support layer print_z " << layer->print_z << " above the contact " << contact->print_z);
+            CHECK(layer->print_z <= contact->print_z + 1e-9);
+        }
+
+    const double actual_gap = 16.0 - contact->print_z;
+    INFO("contact print_z " << contact->print_z << " expected " << expected->print_z << " = gap " << actual_gap
+         << " contact layer height " << expected->height);
+    CHECK_THAT(contact->print_z, Catch::Matchers::WithinAbs(expected->print_z, 1e-9));
+    // At least the requested distance, and less than one grid step more: the overshoot is bounded by the
+    // step to the next layer that is there, not by the nominal layer height.
+    CHECK(actual_gap >= gap - 1e-9);
+    CHECK(actual_gap < gap + (above->print_z - contact->print_z) + 1e-9);
+    // The quantisation follows the stack. A request below 0.2 gives less than 0.2 of air, on a layer thinner
+    // than 0.2 - quantising to the nominal layer height would give 0.2 of air on a 0.2 mm layer for both.
+    CHECK(actual_gap < 0.2 - 1e-6);
+    CHECK(expected->height < 0.2 - 1e-6);
+
+    // The 0.1 mm layers are printed as 0.1, not as a gap remainder, base paths and interface alike.
+    const size_t paths_checked = check_support_layers_on_object_grid(po);
+    REQUIRE(paths_checked > 0);
+}
+
+// The settings of a reported project in the small: support_top_z_distance 0.12 on a 0.2 mm profile,
+// tree(auto) with the default style - organic - and independent_support_layer_height on. Organic builds its
+// support layers on the object's own layer grid (raft included), and the top contact is placed on one of
+// those whole layers, so 0.12 mm of air is not a layer this pipeline can print from a 0.2 mm stack: the
+// contact takes the highest layer that still leaves at least 0.12, one whole 0.2 mm layer down. That is a
+// safe degradation of the request on this profile, not a lost setting and not a rewritten layer - the layer
+// keeps the object's own 0.2 mm.
+//
+// independent_support_layer_height is set here because a project that had it on carries it in its config.
+// It does not give organic independent support layers: organic's grid is the object's layers regardless, the
+// setting is only read by the Cura derived support planner, and the GUI does not offer it for organic
+// ("Independent support layer height is unavailable for organic tree supports"). What this case pins is that
+// the setting reaches the config and does not move the grid - not that the support layers are independent.
+//
+// The numbers are this test's own mesh and config. A real project's slice depends on its geometry and its
+// profile and is not reproducible from this repository.
+TEST_CASE("A gap below the layer height leaves one whole layer of air on a 0.2 mm profile", "[TreeSupportOrganicGap]")
+{
+    Slic3r::Print print;
+    slice_with_tree_support(two_tier_mesh(), print, "default", 30, 0, 0, {
+        { "independent_support_layer_height", 1 },
+        { "support_top_z_distance",           0.12 },
+        { "support_interface_top_layers",     3 },
+    });
+    const PrintObject &po = *print.objects().front();
+
+    // default + tree(auto) is the organic generator, the one that places the contact on the object's grid.
+    Slic3r::SupportParameters support_params(po);
+    CHECK(support_params.support_style == smsTreeOrganic);
+
+    // The raw millimetre reaches the organic settings: it is not the round-to-whole-layers value the Cura
+    // derived engines read from the same struct.
+    Slic3r::TreeSupport3D::TreeSupportMeshGroupSettings mesh_settings(po);
+    CHECK_THAT(mesh_settings.support_top_z_distance_mm, Catch::Matchers::WithinAbs(0.12, 1e-9));
+
+    const Layer *expected = top_contact_layer(po, 16.0, 0.12);
+    REQUIRE(expected != nullptr);
+    REQUIRE(expected->height >= 0.2 - 1e-6);
+
+    const SupportLayer *contact = support_layer_at(po, expected->print_z);
+    REQUIRE(contact != nullptr);
+    REQUIRE(contact->has_extrusions());
+    INFO("contact print_z " << contact->print_z << " = gap " << 16.0 - contact->print_z);
+    // At least the requested distance ...
+    CHECK(contact->print_z <= 16.0 - 0.12 + 1e-9);
+    // ... quantised up to the next whole layer, and no further.
+    CHECK(16.0 - contact->print_z < 0.12 + expected->height + 1e-9);
+    CHECK_THAT(16.0 - contact->print_z, Catch::Matchers::WithinAbs(0.2, 1e-9));
+
+    // Nothing was bent to reach that gap: the contact still prints the object layer's own 0.2 mm.
+    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(expected->height, 1e-12));
+    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(0.2, 1e-12));
+}
+
+// The same question on a profile that is not one uniform thin section under the face: 0.2 mm layers up to
+// z = 15, a thin dip towards 0.1 mm, and back towards 0.2 mm at the face. The resampling spreads both
+// transitions, so the grid under the face is a graded set of heights rather than a 0.1 or a 0.2 step, and
+// the contact has to be the highest of those layers that keeps the gap - neither a copy of a nominal 0.2 mm
+// grid nor a fixed 0.1 mm one.
+TEST_CASE("An organic top gap takes its contact from the layers a mixed profile produced", "[TreeSupportOrganicGap]")
+{
+    const std::vector<double> profile { 0., 0.2, 15.0, 0.1, 15.9, 0.2, 19.0, 0.2 };
+    const double              gap     = GENERATE(0.05, 0.15);
+    INFO("support_top_z_distance=" << gap);
+
+    Slic3r::Print print;
+    slice_with_layer_height_profile(print, profile, gap);
+    const PrintObject &po = *print.objects().front();
+
+    const Layer *expected = top_contact_layer(po, 16.0, gap);
+    REQUIRE(expected != nullptr);
+
+    // The premise: the layer spanning the face is a nominal one, the contact layer under it is thinner, and
+    // it is not the 0.1 mm of the dip either. Without all three this case could pass on a uniform grid.
+    const Layer *below_face = top_contact_layer(po, 16.0, 0.);
+    REQUIRE(below_face != nullptr);
+    const Layer *face_layer = layer_above(po, *below_face);
+    REQUIRE(face_layer != nullptr);
+    CHECK(face_layer->height > 0.195);
+    REQUIRE(expected->height < 0.195);
+    CHECK(expected->height > 0.1 + 1e-6);
+
+    const Layer *above = layer_above(po, *expected);
+    REQUIRE(above != nullptr);
+
+    const SupportLayer *contact = support_layer_at(po, expected->print_z);
+    REQUIRE(contact != nullptr);
+    REQUIRE(contact->has_extrusions());
+    for (const SupportLayer *layer : po.support_layers())
+        if (layer->has_extrusions()) {
+            INFO("support layer print_z " << layer->print_z << " above the contact " << contact->print_z);
+            CHECK(layer->print_z <= contact->print_z + 1e-9);
+        }
+
+    const double actual_gap = 16.0 - contact->print_z;
+    INFO("contact print_z " << contact->print_z << " expected " << expected->print_z << " = gap " << actual_gap
+         << " contact layer height " << expected->height);
+    CHECK_THAT(contact->print_z, Catch::Matchers::WithinAbs(expected->print_z, 1e-9));
+    // At least the requested distance, and less than the step to the next layer that is actually there more.
+    CHECK(actual_gap >= gap - 1e-9);
+    CHECK(actual_gap < gap + (above->print_z - contact->print_z) + 1e-9);
+
+    const size_t paths_checked = check_support_layers_on_object_grid(po);
+    REQUIRE(paths_checked > 0);
 }
 
 // tree_slim does not go through the organic grid - generate_tree_support_3D() runs for smsTreeOrganic
