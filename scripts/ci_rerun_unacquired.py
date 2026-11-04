@@ -191,9 +191,11 @@ def describe(error):
         parts.append(f"rate limit left {headers.get('X-RateLimit-Remaining', '?')}")
         parts.append(f"retry-after {headers.get('Retry-After', 'none')}")
     try:
-        message = json.loads(error.read() or b"{}").get("message")
-    except ValueError:
-        message = None
+        payload = json.loads(error.read() or b"{}")
+    except (ValueError, OSError, http.client.HTTPException):
+        # A body cut short, or none at all, on top of the failure itself.
+        payload = None
+    message = payload.get("message") if isinstance(payload, dict) else None
     if message:
         parts.append(message)
     return ", ".join(parts)
