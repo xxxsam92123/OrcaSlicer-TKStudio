@@ -42,13 +42,14 @@ jobs:
         with:
           lfs: 'false'
 
-      # Restore-only cache. The matching save step at the end of this job runs only on the
-      # default and release branches, because actions/cache would otherwise auto-save on
-      # every run: a cache saved during a pull_request run is scoped to
-      # refs/pull/<N>/merge and can only ever be reused by a re-run of that same PR,
-      # never by main or another PR.
-      # Saving on release/* is worth it: a PR based on a release/x branch reads that
-      # branch's caches, and build_all.yml also triggers on pushes to release/*.
+      # Restore-only lookup; the matching save step at the end of this job runs on every
+      # ref that actually rebuilt deps (success() + cache-miss guard).
+      # This cache is the hand-off from build_deps to build_orca inside one run:
+      # build_orca restores the same key with `fail-on-cache-miss: true`, so a run that
+      # rebuilds deps and then skips the save fails its own downstream build.
+      # Scope: an entry saved by a pull_request run is bound to refs/pull/<N>/merge and
+      # only that PR's re-runs can read it -- main never reads it. main and each PR keep
+      # their own copy; neither shares with the other.
       - name: load cached deps
         id: deps_restore
         uses: actions/cache/restore@v6
@@ -161,17 +162,28 @@ jobs:
             cd deps/build
             tar -czvf OrcaSlicer_dep_ubuntu_$(date +"%Y%m%d").tar.gz destdir
 
-      # Save the deps cache from the default and release branches only. PR runs restore
-      # but never save: their cache entry would be scoped to refs/pull/<N>/merge, which
-      # main and every other PR cannot read, so a PR-side save only burns build minutes.
+      # Save the deps cache whenever this job actually rebuilt it, on any ref.
       # The gate is success(), not !cancelled(): actions/cache/save tars the directory as
       # it stands, so a failed build would publish a truncated deps tree under a key that
       # hashFiles('deps/**') makes immutable, and build_orca.yml restores that key with
       # fail-on-cache-miss: true -- every later run would then "hit" a broken cache and
       # fail at compile time. Same reasoning as the ccache save in build_all.yml.
-      - name: save cached deps (default and release branches)
+      # The cache-hit guard skips the save when the entry already exists (saving over an
+      # existing key fails).
+      #
+      # This cannot be limited to the default/release branches: deps reach build_orca only
+      # through this cache. build_orca restores the same key with
+      # fail-on-cache-miss: true, so a pull request that rebuilt deps and skipped the save
+      # fails its own build_orca -- and the build minutes are already spent by then.
+      # Scoping facts behind that: an entry saved on a pull_request run is bound to
+      # refs/pull/<N>/merge and can be read only by that PR's own re-runs, so main never
+      # sees it -- no cross-ref leakage, and the save is not wasted. Conversely the default
+      # branch must keep saving for anything else to hit it: a pull request's restore falls
+      # back to the default branch's entry, which is how the macOS legs of the PR #81 run
+      # reused an existing deps entry (Build Deps skipped, Build OrcaSlicer ran).
+      - name: save cached deps
         id: deps_save
-        if: ${{ success() && steps.deps_restore.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+        if: ${{ success() && steps.deps_restore.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/${{ inputs.cache-path }}
