@@ -8,18 +8,26 @@ name: Re-run builds that lost a runner
 # Nothing can be fixed in the build for it, and a rerun costs a few minutes of
 # machine time, so this passes over the recent runs and asks GitHub to rerun the
 # failed jobs of those whose every failed job carries the check-run annotation
-# naming that cause. A rerun is bounded four ways, none of which needs state held
-# between passes: a run is left alone once its run_attempt reaches the limit the
-# script holds, the run is read again before the POST and must still be completed,
-# failed and at the attempt count this pass saw, the run is read once more after
-# the POST and the attempt count must have grown, and a run is only asked for once
-# its updated_at is an hour old -- three times this schedule's beat. Those are what
-# keep a run that failed for a real reason, or a rerun GitHub accepts and does not
-# run, from being asked for every twenty minutes. A cache ledger was tried and
-# dropped: its entries keyed by this workflow's own run id are invisible to
-# prune_ci_caches.yml, so they would accumulate for ever. The script's header says
-# more, and says why a refused or unhonoured POST is an annotation rather than a
-# failed job.
+# naming that cause. No state is held between passes, so every bound is recomputed
+# from GitHub: a run is left alone once its run_attempt reaches the limit the
+# script holds (--max-attempts, default 2), the run is read again before the POST
+# and must still be completed, failed and at the attempt count this pass saw, the
+# run is read once more after the POST so the attempt count is seen to have grown,
+# and a run is skipped while its updated_at is younger than --min-age-minutes
+# (default 60, three times this beat) -- which only bites when GitHub does move
+# updated_at. So: an accepted rerun is asked for once in a run's life, because
+# run_attempt=2 is over --max-attempts on the next pass; a run whose POST is
+# refused, or answered 201 with updated_at unchanged, is asked again on every pass
+# -- one POST per twenty minutes, three an hour, eighteen in the six-hour window,
+# seventy-two a day -- and it does not settle, because nothing counts per run.
+# --max-reruns-per-pass (default 3) is the only ceiling on that: nine asks an hour,
+# fifty-four per window, two hundred and sixteen a day.
+#
+# A cache ledger was tried and dropped: its entries keyed by this workflow's own
+# run id are invisible to prune_ci_caches.yml, so they would accumulate for ever.
+# A pass keeping no state between passes is what keeps the pool clear. The script's
+# header says more, and says why a refused or unhonoured POST is an annotation
+# rather than a failed job.
 #
 # The schedule only fires on the default branch, so this does nothing until the
 # branch carrying it is merged: a workflow file on a side branch is not on a
