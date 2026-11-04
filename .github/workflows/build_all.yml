@@ -376,7 +376,11 @@ jobs:
         grep -q '^        CMAKE_CXX_COMPILER_LAUNCHER: ccache$' scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
         mkdir -p .flatpak-builder/ccache
         export CCACHE_DIR=$PWD/.flatpak-builder/ccache
-        ccache --set-config=max_size=3G
+        # This leg measured 1.9-2.0 GB uncapped, and it shares one 10 GB pool
+        # with the deps and flatpak-builder caches, which it was evicting. The
+        # cap used to be 3G here and 1G at the trim below; one number now, so
+        # the limit ccache reports mid-build is the one that gets saved.
+        ccache --set-config=max_size=800M
         # The compiler is reinstalled every run, so its mtime means nothing.
         ccache --set-config=compiler_check=content
         # Headers a fresh checkout has just written, the few files that use
@@ -431,19 +435,23 @@ jobs:
     # The build has just touched everything it can use, so an object untouched
     # for a week is dead, usually orphaned by a flag change. The 10 GB pool also
     # filled up with compiler caches and evicted the deps caches the builds
-    # cannot start without, so a Flatpak entry is capped at 1G before it is
-    # saved. ccache only applies max_size during its cleanup pass (--max-size
-    # alone just records the limit), hence the -c that does the trim.
+    # cannot start without, so a Flatpak entry is capped at 800M before it is
+    # saved. The cap is set again here (cheap, and the step above could have
+    # failed) and the -c does the trim, so the saved entry is inside the budget.
     - name: Compiler cache statistics
       if: always()
       run: |
         export CCACHE_DIR=$PWD/.flatpak-builder/ccache
         # A failed trim costs cache, not correctness, so it must not redden a
         # build that already succeeded.
-        ccache --max-size 1G || true
+        ccache --max-size 800M || true
         ccache -c || true
         ccache --evict-older-than 7d
         ccache -s -v || ccache -s
+        echo "--- ccache limits (guardrail) ---"
+        ccache --show-config | grep -E 'max_size|max_files' || true
+        used_kib=$(ccache --print-stats | awk -F'\t' '$1=="cache_size_kibibyte"{print $2; exit} $1=="cache_size"{printf "%d\n", $2/1024; exit}')
+        echo "ccache size: ${used_kib:-unknown} KiB of 819200 KiB cap (800M) - leg ${CCACHE_LEG}"
       shell: bash
     # Save the new entry first, then drop the older ones for this leg on this
     # ref, so a failed save leaves the previous entry in place. A cancelled or
