@@ -55,10 +55,13 @@ fifty-four per six-hour window and two hundred and sixteen a day, however many
 runs are in that state. A pass keeps no state between passes, so nothing
 accumulates in the cache pool.
 
-A transport-layer failure -- a connection that drops, or a read that times out --
-is caught where it happens and lowered to a warning at the per-run and per-job
-level, so it does not turn the job red; only a pass that cannot list the runs at
-all exits non-zero.
+A transport-layer failure -- a connection that drops, a read that times out, a
+chunked body that stops early -- is caught where it happens, and what happens
+next depends on what was being read. Reading one job's annotations, or listing
+one run's jobs, is lowered to a warning and the run is left alone this pass. A
+re-read of the run itself, before the POST and again after it, is lowered to an
+error annotation on that run and does not fail the pass. Only a pass that cannot
+list the runs at all, or that crashes, exits non-zero.
 
 A POST is verified, not believed: the run is read once more afterwards and the
 attempt count must have grown. GitHub answering 201 without rerunning anything, or
@@ -67,8 +70,9 @@ the log of a job that went red for an API answer that looked fine. Neither fails
 the job, though: only a pass that could not list the runs at all, or that crashed,
 exits non-zero. A twenty-minute schedule that went red on a transient 5xx would be
 the same red this workflow exists to remove; the annotation is what a reader sees,
-and the next pass, twenty minutes later, asks again. A connection that drops while
-a run or a job is being read is a warning for the same reason.
+and the next pass, twenty minutes later, asks again. A transport failure while a
+job's annotations or a run's job list are being read is a warning for the same
+reason, and that run is left alone for the rest of the pass.
 
 The window bounds the work a scheduled pass does, and the API is read newest
 first, so a pass stops at the first run created well before the window -- a run
@@ -80,8 +84,10 @@ same reason ci_macos_admission.py reads them -- so this also works on GHES.
 
 import argparse
 import datetime
+import http.client
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -96,10 +102,14 @@ FAILED = ("failure", "cancelled")
 # What a read can fail with, and is worth warning about rather than crashing on.
 # urlopen's read timeout raises the builtin TimeoutError -- socket.timeout has
 # been an alias of it since 3.10 -- and not urllib.error.URLError, which only
-# wraps errors raised while the request is being made. Both are transport-layer
-# failures and both have to be classified as one, or a slow read ends the pass
-# with a crash and turns a twenty-minute schedule red.
-TRANSIENT = (urllib.error.URLError, TimeoutError, ConnectionError)
+# wraps errors raised while the request is being made. A chunked body cut short
+# raises http.client.IncompleteRead, which is an HTTPException and not an
+# OSError at all; a TLS connection closed mid-read raises ssl.SSLEOFError, which
+# is an OSError but not a ConnectionError. Every one of them is a transport-layer
+# failure and has to be classified as one, or a slow or truncated read ends the
+# pass with a crash and turns a twenty-minute schedule red.
+TRANSIENT = (urllib.error.URLError, TimeoutError, ConnectionError,
+             http.client.HTTPException, ssl.SSLError)
 
 # The run list is read a page at a time. A pass that reaches this many pages
 # without crossing its window is reading a different repository than expected,
@@ -146,7 +156,14 @@ class Api:
             with urllib.request.urlopen(request, timeout=30) as response:
                 self.note_rate_limit(response.headers)
                 body = response.read()
-                return response.status, (json.loads(body) if body.strip() else None)
+                # A body the transport cut short is no JSON at all; that is the
+                # same failure as the read that produced it, so it is raised as
+                # one and handled wherever reads are.
+                try:
+                    return response.status, (json.loads(body) if body.strip() else None)
+                except ValueError as exc:
+                    raise urllib.error.URLError(
+                        f"unparsable body from {path}: {type(exc).__name__}: {exc}") from exc
         except urllib.error.HTTPError as error:
             # A rate-limited request fails, and its headers say so.
             self.note_rate_limit(error.headers)
@@ -405,9 +422,21 @@ def main(argv=None):
             print("    no runner-acquisition annotation; left alone", flush=True)
             continue
         if len(names) != failed:
-            print(f"    {len(names)} of {failed} failed jobs lost a runner; the other"
-                  f" {failed - len(names)} failed for a reason of their own, so a rerun"
-                  " would carry them along; left alone", flush=True)
+            # A failed job whose annotations could not be read is counted as
+            # failed and not as a runner problem, so the remainder is not one
+            # reason: it is unread jobs plus jobs that failed on their own.
+            other = failed - len(names)
+            unread = sum(1 for w in warnings
+                         if w.get("run_id") == run["id"] and "job_id" in w)
+            if unread:
+                print(f"    {len(names)} of {failed} failed jobs lost a runner;"
+                      f" of the other {other}, {unread} could not be read, so a"
+                      " rerun might carry an unrelated failure along; left alone",
+                      flush=True)
+            else:
+                print(f"    {len(names)} of {failed} failed jobs lost a runner; the other"
+                      f" {other} failed for a reason of their own, so a rerun"
+                      " would carry them along; left alone", flush=True)
             continue
         candidates.append({"run_id": run["id"], "attempt": attempt, "jobs": names})
 
@@ -488,9 +517,10 @@ def main(argv=None):
         "api_calls": api.calls,
         "rate_limit_remaining": api.remaining,
     }, indent=2))
-    # Only the scan itself can fail the pass. A job whose annotations could not be
-    # read is a warning, and a POST that was refused or not honoured is an
-    # annotation on the run; neither is a reason for the schedule to go red.
+    # Only a scan that could not list the runs makes main return non-zero. A job
+    # whose annotations could not be read is a warning, and a POST that was
+    # refused or not honoured is an annotation on the run; neither is a reason
+    # for the schedule to go red. (A crash still exits 1, at the top level.)
     return 1 if scan_failed else 0
 
 
