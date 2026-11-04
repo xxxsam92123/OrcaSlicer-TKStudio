@@ -429,11 +429,19 @@ jobs:
         upload-artifact: false
         keep-build-dirs: true
     # The build has just touched everything it can use, so an object untouched
-    # for a week is dead, usually orphaned by a flag change.
+    # for a week is dead, usually orphaned by a flag change. The 10 GB pool also
+    # filled up with compiler caches and evicted the deps caches the builds
+    # cannot start without, so a Flatpak entry is capped at 1G before it is
+    # saved. ccache only applies max_size during its cleanup pass (--max-size
+    # alone just records the limit), hence the -c that does the trim.
     - name: Compiler cache statistics
       if: always()
       run: |
         export CCACHE_DIR=$PWD/.flatpak-builder/ccache
+        # A failed trim costs cache, not correctness, so it must not redden a
+        # build that already succeeded.
+        ccache --max-size 1G || true
+        ccache -c || true
         ccache --evict-older-than 7d
         ccache -s -v || ccache -s
       shell: bash

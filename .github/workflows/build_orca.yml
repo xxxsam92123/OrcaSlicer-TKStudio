@@ -79,7 +79,10 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: ${{ env.CCACHE_LEG }}
-          max-size: 3G
+          # The 10 GB pool ran full of compiler caches and evicted the deps
+          # caches builds need; 1.5G still holds a leg's working set (largest
+          # measured leg: 911 MB).
+          max-size: 1.5G
           restore: false
           save: false
           # ccache -s runs as its own step; no summary table per job.
@@ -755,10 +758,15 @@ jobs:
 
       # The build has just touched everything it can use, so an object
       # untouched for a week is dead, usually orphaned by a flag change.
+      # ccache applies max_size only during its cleanup pass, so trim here --
+      # before the entry is saved -- or the 1.5G cap would not bind at all.
+      # A trim that fails costs cache, not correctness, so it may not redden
+      # a build that already succeeded.
       - name: Compiler cache statistics
         if: ${{ always() && steps.ccache.outcome == 'success' }}
         shell: bash
         run: |
+          ccache -c || true
           ccache --evict-older-than 7d
           ccache -s -v || ccache -s
 
