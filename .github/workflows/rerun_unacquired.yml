@@ -1,0 +1,52 @@
+name: Re-run builds that lost a runner
+
+# GitHub accepts a job, cannot find a hosted runner for it within its queue limit
+# (fifteen minutes), and cancels it. The whole Build all run then goes red with
+# nothing in the repository broken: seven of the sixteen failed or cancelled runs
+# in the last sixty were exactly this, on macOS arm64.
+#
+# Nothing can be fixed in the build for it, and a rerun costs a few minutes of
+# machine time, so this passes over the recent runs and asks GitHub to rerun the
+# failed jobs of those whose check-run annotations name the cause. Runs already
+# attempted twice are left alone, which is what keeps a run that failed for a
+# real reason from being rerun for ever.
+
+on:
+  schedule:
+    # Every twenty minutes. A pass covers the last six hours, so a run left red
+    # by a queue timeout is picked up on the next pass rather than on the next hour.
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Only list the runs that would be rerun'
+        type: boolean
+        default: false
+
+permissions:
+  # rerun-failed-jobs needs actions: write.
+  actions: write
+  contents: read
+
+concurrency:
+  group: rerun-unacquired
+  cancel-in-progress: false
+
+jobs:
+  rerun:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci_rerun_unacquired.py
+          sparse-checkout-cone-mode: false
+
+      - name: Rerun runs no runner was found for
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          flag=""
+          if [ "$DRY_RUN" = "true" ]; then flag="--dry-run"; fi
+          python3 -u scripts/ci_rerun_unacquired.py $flag
