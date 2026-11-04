@@ -37,11 +37,23 @@ GitHub on every pass, and a rerun is bounded four ways:
     saw -- a run that moved on while the pass was reading jobs is not touched;
   * it is skipped unless its updated_at is at least --min-age-minutes old, which
     defaults to sixty, three times the twenty-minute beat. A rerun moves
-    updated_at, so this is the backoff that stands in where the ledger stood: a
-    run asked for -- accepted, or refused by a gateway that may still have
-    forwarded it -- waits an hour instead of coming back on the next pass;
+    updated_at, so an accepted rerun is not asked for again on age alone -- but
+    age is not what stops the asking; the attempt counter above is, and only
+    when the rerun was actually accepted;
   * at most --max-reruns-per-pass POSTs are made in one pass, which bounds the
     damage of a wide outage that cancels many runs at once.
+
+What those bounds cost, in numbers, since nothing is remembered per run: a run
+whose rerun was accepted and whose run_attempt grew is asked for once in its
+life -- the next pass reads run_attempt=2, and the --max-attempts 2 default skips
+it. A run GitHub refuses, or answers 201 for without moving updated_at, is asked
+again on the very next pass: one POST every twenty minutes, three an hour,
+eighteen across the six-hour window, seventy-two a day, and it does not settle,
+because nothing counts the asking. The only ceiling on that is the per-pass cap:
+--max-reruns-per-pass 3 bounds the whole schedule at nine asks an hour,
+fifty-four per six-hour window and two hundred and sixteen a day, however many
+runs are in that state. A pass keeps no state between passes, so nothing
+accumulates in the cache pool.
 
 A POST is verified, not believed: the run is read once more afterwards and the
 attempt count must have grown. GitHub answering 201 without rerunning anything, or
@@ -50,8 +62,8 @@ the log of a job that went red for an API answer that looked fine. Neither fails
 the job, though: only a pass that could not list the runs at all, or that crashed,
 exits non-zero. A twenty-minute schedule that went red on a transient 5xx would be
 the same red this workflow exists to remove; the annotation is what a reader sees,
-and the next pass, an hour later, asks again. A connection that drops while a run
-or a job is being read is a warning for the same reason.
+and the next pass, twenty minutes later, asks again. A connection that drops while
+a run or a job is being read is a warning for the same reason.
 
 The window bounds the work a scheduled pass does, and the API is read newest
 first, so a pass stops at the first run created well before the window -- a run
@@ -333,6 +345,10 @@ def main(argv=None):
     cutoff = now - datetime.timedelta(hours=args.window_hours)
 
     warnings, errors, candidates, rerun, held = [], [], [], [], []
+    # A 201 whose attempt count did not move is not a rerun, so it is kept out of
+    # `rerun`: a reader of the summary who sees a run there has seen it asked for
+    # successfully, and this pass's own limits read differently for the two.
+    unverified = []
     scan_failed = False
     try:
         runs = dedupe(list_runs(api, args.repo, args.workflow, cutoff))
@@ -410,9 +426,15 @@ def main(argv=None):
                 print(f"  skip {candidate['run_id']}: {problem}", flush=True)
                 continue
             asked += 1
-            if outcome in ("verified", "unverified"):
+            if outcome == "verified":
                 rerun.append({"run_id": candidate["run_id"],
                               "attempt": candidate["attempt"], "attempt_after": attempt_after})
+            elif outcome == "unverified":
+                # Asked for, and not seen to happen: the next pass asks again,
+                # since nothing counts the asking.
+                unverified.append({"run_id": candidate["run_id"],
+                                   "attempt": candidate["attempt"],
+                                   "attempt_after": attempt_after})
             if problem:
                 errors.append({"run_id": candidate["run_id"], "error": problem})
                 print(f"  rerun {candidate['run_id']}: {problem}", flush=True)
@@ -423,10 +445,30 @@ def main(argv=None):
                 print(f"::error title=rerun-unacquired::run {candidate['run_id']}:"
                       f" {problem}", flush=True)
 
+    # One line a reader can scan, and it is the only signal that survives a pass
+    # which finds nothing because it can no longer read anything: a `checks: read`
+    # that was dropped makes every annotations call a 403, every run "left alone",
+    # and the job green with nothing done. candidates=0, warnings=0 and errors=0
+    # on every pass is what makes that visible in the UI instead of silent.
+    if args.dry_run:
+        would = min(len(candidates), args.max_reruns_per_pass)
+        print(f"::notice title=rerun-unacquired::dry-run scanned={len(runs)}"
+              f" candidates={len(candidates)} would-rerun={would}"
+              f" held={len(candidates) - would} warnings={len(warnings)}"
+              f" errors={len(errors)}", flush=True)
+    else:
+        print(f"::notice title=rerun-unacquired::scanned={len(runs)}"
+              f" candidates={len(candidates)} rerun={len(rerun)} held={len(held)}"
+              f" warnings={len(warnings)} errors={len(errors)}", flush=True)
+    if warnings:
+        print(f"::warning title=rerun-unacquired::{len(warnings)} warning(s) this pass,"
+              " see the lines above", flush=True)
+
     print(json.dumps({
         "scanned": len(runs),
         "candidates": candidates,
         "rerun": rerun,
+        "unverified": unverified,
         "held": held,
         "warnings": warnings,
         "errors": errors,
