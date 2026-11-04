@@ -55,6 +55,11 @@ fifty-four per six-hour window and two hundred and sixteen a day, however many
 runs are in that state. A pass keeps no state between passes, so nothing
 accumulates in the cache pool.
 
+A transport-layer failure -- a connection that drops, or a read that times out --
+is caught where it happens and lowered to a warning at the per-run and per-job
+level, so it does not turn the job red; only a pass that cannot list the runs at
+all exits non-zero.
+
 A POST is verified, not believed: the run is read once more afterwards and the
 attempt count must have grown. GitHub answering 201 without rerunning anything, or
 refusing the POST, is reported as an error annotation on the run -- nobody reads
@@ -87,6 +92,14 @@ import urllib.request
 NOT_ACQUIRED = "not acquired by Runner of type hosted"
 
 FAILED = ("failure", "cancelled")
+
+# What a read can fail with, and is worth warning about rather than crashing on.
+# urlopen's read timeout raises the builtin TimeoutError -- socket.timeout has
+# been an alias of it since 3.10 -- and not urllib.error.URLError, which only
+# wraps errors raised while the request is being made. Both are transport-layer
+# failures and both have to be classified as one, or a slow read ends the pass
+# with a crash and turns a twenty-minute schedule red.
+TRANSIENT = (urllib.error.URLError, TimeoutError, ConnectionError)
 
 # The run list is read a page at a time. A pass that reaches this many pages
 # without crossing its window is reading a different repository than expected,
@@ -250,7 +263,7 @@ def unacquired(run, api, repo, warnings):
         failed += 1
         try:
             notes = annotations(api, repo, job["id"])
-        except urllib.error.URLError as error:
+        except TRANSIENT as error:
             message = (f"reading annotations of job {job['id']} in run {run['id']}:"
                        f" {describe(error)}")
             warnings.append({"run_id": run["id"], "job_id": job["id"], "warning": message})
@@ -278,7 +291,7 @@ def rerun_candidate(api, repo, candidate, args, now):
     # was reading the annotations of fifty jobs.
     try:
         fresh = api.get(f"repos/{repo}/actions/runs/{run_id}")
-    except urllib.error.URLError as error:
+    except TRANSIENT as error:
         return "rejected", None, f"re-reading the run: {describe(error)}"
     if fresh.get("status") != "completed" or fresh.get("conclusion") not in FAILED:
         return "skipped", None, (f"now {fresh.get('status')}/{fresh.get('conclusion')},"
@@ -294,14 +307,14 @@ def rerun_candidate(api, repo, candidate, args, now):
                                     f" under --min-age-minutes {args.min_age_minutes}")
     try:
         status = api.post(f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs")
-    except urllib.error.URLError as error:
+    except TRANSIENT as error:
         return "rejected", None, f"rerun: {describe(error)}"
     # GitHub answering 201 is not the rerun happening. If the attempt count did
     # not move, say so on the run instead of asking again next pass as though
     # nothing had been sent.
     try:
         after = api.get(f"repos/{repo}/actions/runs/{run_id}")
-    except urllib.error.URLError as error:
+    except TRANSIENT as error:
         return "unverified", None, f"HTTP {status}, but verifying it failed: {describe(error)}"
     attempt_after = after.get("run_attempt")
     if not isinstance(attempt_after, int) or attempt_after <= attempt:
@@ -352,7 +365,7 @@ def main(argv=None):
     scan_failed = False
     try:
         runs = dedupe(list_runs(api, args.repo, args.workflow, cutoff))
-    except urllib.error.URLError as error:
+    except TRANSIENT as error:
         runs = []
         scan_failed = True
         print(f"::error title=rerun-unacquired::listing runs: {describe(error)}", flush=True)
@@ -379,7 +392,7 @@ def main(argv=None):
               f" {run.get('head_branch')})", flush=True)
         try:
             names, failed = unacquired(run, api, args.repo, warnings)
-        except urllib.error.URLError as error:
+        except TRANSIENT as error:
             message = f"listing jobs of run {run['id']}: {describe(error)}"
             warnings.append({"run_id": run["id"], "warning": message})
             print(f"::warning title=rerun-unacquired::{message}; run left alone this pass",
