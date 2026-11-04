@@ -42,8 +42,16 @@ jobs:
         with:
           lfs: 'false'
 
+      # Restore-only cache. The matching save step at the end of this job runs only on the
+      # default and release branches, because actions/cache would otherwise auto-save on
+      # every run: a cache saved during a pull_request run is scoped to
+      # refs/pull/<N>/merge and can only ever be reused by a re-run of that same PR,
+      # never by main or another PR.
+      # Saving on release/* is worth it: a PR based on a release/x branch reads that
+      # branch's caches, and build_all.yml also triggers on pushes to release/*.
       - name: load cached deps
-        uses: actions/cache@v6
+        id: deps_restore
+        uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/${{ inputs.cache-path }}
           key: ${{ inputs.cache-key }}
@@ -153,6 +161,21 @@ jobs:
             cd deps/build
             tar -czvf OrcaSlicer_dep_ubuntu_$(date +"%Y%m%d").tar.gz destdir
 
+      # Save the deps cache from the default and release branches only. PR runs restore
+      # but never save: their cache entry would be scoped to refs/pull/<N>/merge, which
+      # main and every other PR cannot read, so a PR-side save only burns build minutes.
+      # The gate is success(), not !cancelled(): actions/cache/save tars the directory as
+      # it stands, so a failed build would publish a truncated deps tree under a key that
+      # hashFiles('deps/**') makes immutable, and build_orca.yml restores that key with
+      # fail-on-cache-miss: true -- every later run would then "hit" a broken cache and
+      # fail at compile time. Same reasoning as the ccache save in build_all.yml.
+      - name: save cached deps (default and release branches)
+        id: deps_save
+        if: ${{ success() && steps.deps_restore.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/${{ inputs.cache-path }}
+          key: ${{ inputs.cache-key }}
 
       # Upload Artifacts
       # - name: Upload Mac ${{ inputs.arch }} artifacts
