@@ -22,27 +22,36 @@ one, so the default of two leaves one rerun per run. A run at that count is left
 alone, which is what stops a run whose failure has nothing to do with capacity
 from being rerun for ever.
 
-A pass is a separate job every twenty minutes, so it cannot remember the last one
-unless it writes it down: what it asked for goes in the small ledger named by
---state-file, which the workflow carries from pass to pass in the actions cache.
-Every rerun is then bounded four ways, so the same run cannot be POSTed to on
-every pass:
+A pass runs every twenty minutes and carries nothing between passes. A small
+ledger in the actions cache was tried and dropped: an entry keyed by this
+workflow's own run id is invisible to every cleanup the repository has --
+prune_ci_caches.yml keeps only the build cache prefixes, and its run-tail pattern
+does not match a bare run id, so an entry is kept for ever -- so one entry per pass
+accumulates until the pool is full, and the prune's ten-page scan stops seeing the
+old ones without saying so. The state a pass needs is instead recomputed from
+GitHub on every pass, and a rerun is bounded four ways:
 
   * run_attempt is the durable counter, checked before anything else;
   * the run is read again immediately before the POST, and is skipped unless it
-    is still completed and still at the attempt count this pass saw -- a run that
-    moved on while the pass was reading jobs is not touched;
-  * it is skipped unless its updated_at is at least --min-age-minutes old, and
-    unless the ledger's entry for that attempt is older than that too, so the
-    same run is not asked for twice inside the interval;
+    is still completed, still failed, and still at the attempt count this pass
+    saw -- a run that moved on while the pass was reading jobs is not touched;
+  * it is skipped unless its updated_at is at least --min-age-minutes old, which
+    defaults to sixty, three times the twenty-minute beat. A rerun moves
+    updated_at, so this is the backoff that stands in where the ledger stood: a
+    run asked for -- accepted, or refused by a gateway that may still have
+    forwarded it -- waits an hour instead of coming back on the next pass;
   * at most --max-reruns-per-pass POSTs are made in one pass, which bounds the
     damage of a wide outage that cancels many runs at once.
 
 A POST is verified, not believed: the run is read once more afterwards and the
-attempt count must have grown. GitHub answering 201 without rerunning anything,
-or refusing the POST, is written to the ledger against that attempt and reported
-as an error annotation on the job, so the run is asked for once and not again on
-every pass while the API stays broken.
+attempt count must have grown. GitHub answering 201 without rerunning anything, or
+refusing the POST, is reported as an error annotation on the run -- nobody reads
+the log of a job that went red for an API answer that looked fine. Neither fails
+the job, though: only a pass that could not list the runs at all, or that crashed,
+exits non-zero. A twenty-minute schedule that went red on a transient 5xx would be
+the same red this workflow exists to remove; the annotation is what a reader sees,
+and the next pass, an hour later, asks again. A connection that drops while a run
+or a job is being read is a warning for the same reason.
 
 The window bounds the work a scheduled pass does, and the API is read newest
 first, so a pass stops at the first run created well before the window -- a run
@@ -80,22 +89,13 @@ PER_PAGE = 100
 # inside it is not seen.
 SCAN_MARGIN = datetime.timedelta(minutes=30)
 
-# Ledger entries older than this are dropped when the file is written; a run
-# still red after a week is somebody's to look at, not a schedule's.
-STATE_MAX_AGE = datetime.timedelta(days=7)
-
-# A run asked for and not rerun: 201 without the attempt count moving, or the
-# POST itself refused. Both are written down so the next pass stays quiet about
-# that run instead of asking again every twenty minutes.
-NOT_HONOURED = ("unverified", "rejected")
-
 
 def parse_time(value):
     return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def stamp(moment):
-    return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def age_minutes(now, timestamp):
+    return int((now - parse_time(timestamp)).total_seconds() // 60)
 
 
 class Api:
@@ -140,6 +140,9 @@ class Api:
 
 def describe(error):
     """One line for an HTTPError, with what a rate limit leaves behind."""
+    if not isinstance(error, urllib.error.HTTPError):
+        # A timeout or a dropped connection: no status, no headers to read.
+        return f"{type(error).__name__}: {error}"
     parts = [f"HTTP {error.code}"]
     if error.code in (403, 429):
         headers = error.headers or {}
@@ -152,53 +155,6 @@ def describe(error):
     if message:
         parts.append(message)
     return ", ".join(parts)
-
-
-def load_state(path):
-    """The ledger, or an empty one. Unreadable is a warning, not a failure."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            body = json.load(handle)
-    except FileNotFoundError:
-        return {"runs": {}}
-    except (OSError, ValueError) as error:
-        print(f"::warning title=rerun-unacquired::Ignoring unreadable ledger {path}:"
-              f" {error}", flush=True)
-        return {"runs": {}}
-    if not isinstance(body, dict) or not isinstance(body.get("runs"), dict):
-        return {"runs": {}}
-    return body
-
-
-def save_state(path, state, now):
-    """Write the ledger, dropping what is too old to matter."""
-    kept = {}
-    for run_id, entry in state["runs"].items():
-        posted = entry.get("posted_at")
-        try:
-            if posted and now - parse_time(posted) > STATE_MAX_AGE:
-                continue
-        except ValueError:
-            continue
-        kept[run_id] = entry
-    state["runs"] = kept
-    try:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        temporary = f"{path}.tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2, sort_keys=True)
-        os.replace(temporary, path)
-    except OSError as error:
-        print(f"::warning title=rerun-unacquired::Could not write ledger {path}:"
-              f" {error}", flush=True)
-
-
-def ledger_entry(state, run_id, attempt):
-    """The entry for this run at this attempt, if the last pass wrote one."""
-    entry = state["runs"].get(str(run_id)) or {}
-    return entry if entry.get("attempt") == attempt else {}
 
 
 def in_window(run, cutoff):
@@ -225,7 +181,8 @@ def list_runs(api, repo, workflow, cutoff):
             break
         page += 1
     else:
-        print(f"::warning title=rerun-unacquired::Stopped after {MAX_PAGES} pages of runs.", flush=True)
+        print(f"::warning title=rerun-unacquired::Stopped after {MAX_PAGES} pages of runs.",
+              flush=True)
     return runs
 
 
@@ -265,13 +222,14 @@ def annotations(api, repo, job_id):
     return body or []
 
 
-def unacquired(run, api, repo, errors):
+def unacquired(run, api, repo, warnings):
     """(names of failed jobs the runner never picked up, number of failed jobs).
 
     Both halves are needed: a rerun takes every failed job with it, so a run is
     only innocent when the two counts are equal. A job whose annotations cannot
     be read counts as failed but not as a runner problem, which leaves the run
-    alone and lets the next pass look again.
+    alone and lets the next pass look again. That read failing is a warning on
+    the job, not a failure of the pass.
     """
     names, failed = [], 0
     for job in list_jobs(api, repo, run["id"]):
@@ -280,8 +238,12 @@ def unacquired(run, api, repo, errors):
         failed += 1
         try:
             notes = annotations(api, repo, job["id"])
-        except urllib.error.HTTPError as error:
-            errors.append({"run_id": run["id"], "job_id": job["id"], "error": describe(error)})
+        except urllib.error.URLError as error:
+            message = (f"reading annotations of job {job['id']} in run {run['id']}:"
+                       f" {describe(error)}")
+            warnings.append({"run_id": run["id"], "job_id": job["id"], "warning": message})
+            print(f"::warning title=rerun-unacquired::{message}; run left alone this pass",
+                  flush=True)
             continue
         for note in notes:
             message = note.get("message") or ""
@@ -304,7 +266,7 @@ def rerun_candidate(api, repo, candidate, args, now):
     # was reading the annotations of fifty jobs.
     try:
         fresh = api.get(f"repos/{repo}/actions/runs/{run_id}")
-    except urllib.error.HTTPError as error:
+    except urllib.error.URLError as error:
         return "rejected", None, f"re-reading the run: {describe(error)}"
     if fresh.get("status") != "completed" or fresh.get("conclusion") not in FAILED:
         return "skipped", None, (f"now {fresh.get('status')}/{fresh.get('conclusion')},"
@@ -314,20 +276,20 @@ def rerun_candidate(api, repo, candidate, args, now):
                                  f" since it was read as {attempt}")
     updated = fresh.get("updated_at")
     if updated:
-        age = now - parse_time(updated)
-        if age < datetime.timedelta(minutes=args.min_age_minutes):
-            return "skipped", None, (f"updated {int(age.total_seconds() // 60)} min ago,"
+        age = age_minutes(now, updated)
+        if age < args.min_age_minutes:
+            return "skipped", None, (f"updated {age} min ago,"
                                     f" under --min-age-minutes {args.min_age_minutes}")
     try:
         status = api.post(f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs")
-    except urllib.error.HTTPError as error:
+    except urllib.error.URLError as error:
         return "rejected", None, f"rerun: {describe(error)}"
     # GitHub answering 201 is not the rerun happening. If the attempt count did
     # not move, say so on the run instead of asking again next pass as though
     # nothing had been sent.
     try:
         after = api.get(f"repos/{repo}/actions/runs/{run_id}")
-    except urllib.error.HTTPError as error:
+    except urllib.error.URLError as error:
         return "unverified", None, f"HTTP {status}, but verifying it failed: {describe(error)}"
     attempt_after = after.get("run_attempt")
     if not isinstance(attempt_after, int) or attempt_after <= attempt:
@@ -349,17 +311,13 @@ def main(argv=None):
     parser.add_argument("--max-attempts", type=int, default=2,
                         help="attempts a run may have; run_attempt starts at one, so the"
                              " default of two allows one rerun (default: 2)")
-    parser.add_argument("--min-age-minutes", type=int, default=20,
-                        help="how long a run must have been untouched before it is asked"
-                             " for, so no run is asked for twice inside this window"
-                             " (default: 20)")
+    parser.add_argument("--min-age-minutes", type=int, default=60,
+                        help="how long a run must have gone untouched -- updated_at older"
+                             " than this -- before it is asked for; three times the */20"
+                             " cron beat, and, the passes sharing no state, the only"
+                             " backoff there is (default: 60)")
     parser.add_argument("--max-reruns-per-pass", type=int, default=3,
                         help="most reruns one pass will ask for (default: 3)")
-    parser.add_argument("--state-file",
-                        default=os.environ.get("RERUN_STATE_FILE", ".rerun-unacquired.json"),
-                        help="what previous passes asked for, so this one does not ask"
-                             " again; carried between passes by the workflow's cache"
-                             " (default: .rerun-unacquired.json)")
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be rerun and rerun nothing")
     args = parser.parse_args(argv)
@@ -373,14 +331,15 @@ def main(argv=None):
     api = Api(token, os.environ.get("GITHUB_API_URL", "https://api.github.com"))
     now = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(hours=args.window_hours)
-    state = load_state(args.state_file)
 
-    errors, candidates, rerun, held = [], [], [], []
+    warnings, errors, candidates, rerun, held = [], [], [], [], []
+    scan_failed = False
     try:
         runs = dedupe(list_runs(api, args.repo, args.workflow, cutoff))
-    except urllib.error.HTTPError as error:
+    except urllib.error.URLError as error:
         runs = []
-        errors.append({"error": f"listing runs: {describe(error)}"})
+        scan_failed = True
+        print(f"::error title=rerun-unacquired::listing runs: {describe(error)}", flush=True)
 
     print(f"{len(runs)} {args.workflow} run(s) since {cutoff:%Y-%m-%dT%H:%M:%SZ}"
           f"{', dry run' if args.dry_run else ''}", flush=True)
@@ -393,25 +352,22 @@ def main(argv=None):
             print(f"  skip {run['id']}: attempt {attempt} has reached {args.max_attempts}",
                   flush=True)
             continue
-        entry = ledger_entry(state, run["id"], attempt)
-        if entry.get("state") in NOT_HONOURED:
-            print(f"  skip {run['id']}: attempt {attempt} was asked for at"
-                  f" {entry.get('posted_at')} and not rerun ({entry['state']});"
-                  " not asking again", flush=True)
-            continue
-        if entry.get("posted_at"):
-            age = now - parse_time(entry["posted_at"])
-            if age < datetime.timedelta(minutes=args.min_age_minutes):
-                print(f"  skip {run['id']}: asked for"
-                      f" {int(age.total_seconds() // 60)} min ago, under"
+        updated = run.get("updated_at")
+        if updated:
+            age = age_minutes(now, updated)
+            if age < args.min_age_minutes:
+                print(f"  skip {run['id']}: updated {age} min ago, under"
                       f" --min-age-minutes {args.min_age_minutes}", flush=True)
                 continue
         print(f"  run {run['id']} (attempt {attempt}, {run['conclusion']},"
               f" {run.get('head_branch')})", flush=True)
         try:
-            names, failed = unacquired(run, api, args.repo, errors)
-        except urllib.error.HTTPError as error:
-            errors.append({"run_id": run["id"], "error": f"listing jobs: {describe(error)}"})
+            names, failed = unacquired(run, api, args.repo, warnings)
+        except urllib.error.URLError as error:
+            message = f"listing jobs of run {run['id']}: {describe(error)}"
+            warnings.append({"run_id": run["id"], "warning": message})
+            print(f"::warning title=rerun-unacquired::{message}; run left alone this pass",
+                  flush=True)
             continue
         if not failed:
             print("    no failed job; left alone", flush=True)
@@ -454,11 +410,6 @@ def main(argv=None):
                 print(f"  skip {candidate['run_id']}: {problem}", flush=True)
                 continue
             asked += 1
-            state["runs"][str(candidate["run_id"])] = {
-                "attempt": candidate["attempt"],
-                "posted_at": stamp(now),
-                "state": outcome,
-            }
             if outcome in ("verified", "unverified"):
                 rerun.append({"run_id": candidate["run_id"],
                               "attempt": candidate["attempt"], "attempt_after": attempt_after})
@@ -466,23 +417,32 @@ def main(argv=None):
                 errors.append({"run_id": candidate["run_id"], "error": problem})
                 print(f"  rerun {candidate['run_id']}: {problem}", flush=True)
                 # A note on the run, because nobody reads the log of a job that
-                # went red for an API answer that looked fine.
+                # went red for an API answer that looked fine. It does not fail
+                # the job: a transient 5xx on a twenty-minute schedule must not
+                # turn this workflow into the red it exists to clear.
                 print(f"::error title=rerun-unacquired::run {candidate['run_id']}:"
                       f" {problem}", flush=True)
-        save_state(args.state_file, state, now)
 
     print(json.dumps({
         "scanned": len(runs),
         "candidates": candidates,
         "rerun": rerun,
         "held": held,
+        "warnings": warnings,
         "errors": errors,
         "api_calls": api.calls,
         "rate_limit_remaining": api.remaining,
-        "ledger": args.state_file if not args.dry_run else None,
     }, indent=2))
-    return 1 if errors else 0
+    # Only the scan itself can fail the pass. A job whose annotations could not be
+    # read is a warning, and a POST that was refused or not honoured is an
+    # annotation on the run; neither is a reason for the schedule to go red.
+    return 1 if scan_failed else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:  # noqa: BLE001 - a crash is the other way to fail
+        print(f"::error title=rerun-unacquired::crashed: {type(error).__name__}: {error}",
+              flush=True)
+        sys.exit(1)

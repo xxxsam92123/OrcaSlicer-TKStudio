@@ -8,11 +8,18 @@ name: Re-run builds that lost a runner
 # Nothing can be fixed in the build for it, and a rerun costs a few minutes of
 # machine time, so this passes over the recent runs and asks GitHub to rerun the
 # failed jobs of those whose every failed job carries the check-run annotation
-# naming that cause. A run is left alone once its run_attempt reaches the limit
-# the script holds; the script reads the run again before and after asking, and
-# writes down what it asked for so the next pass can see it. Those together are
-# what keeps a run that failed for a real reason -- or a rerun GitHub accepts and
-# does not run -- from being asked for every twenty minutes.
+# naming that cause. A rerun is bounded four ways, none of which needs state held
+# between passes: a run is left alone once its run_attempt reaches the limit the
+# script holds, the run is read again before the POST and must still be completed,
+# failed and at the attempt count this pass saw, the run is read once more after
+# the POST and the attempt count must have grown, and a run is only asked for once
+# its updated_at is an hour old -- three times this schedule's beat. Those are what
+# keep a run that failed for a real reason, or a rerun GitHub accepts and does not
+# run, from being asked for every twenty minutes. A cache ledger was tried and
+# dropped: its entries keyed by this workflow's own run id are invisible to
+# prune_ci_caches.yml, so they would accumulate for ever. The script's header says
+# more, and says why a refused or unhonoured POST is an annotation rather than a
+# failed job.
 #
 # The schedule only fires on the default branch, so this does nothing until the
 # branch carrying it is merged: a workflow file on a side branch is not on a
@@ -53,32 +60,11 @@ jobs:
           sparse-checkout: scripts/ci_rerun_unacquired.py
           sparse-checkout-cone-mode: false
 
-      - name: Restore what the last pass asked for
-        uses: actions/cache/restore@v4
-        with:
-          path: .rerun-unacquired.json
-          key: rerun-unacquired-${{ github.run_id }}
-          restore-keys: |
-            rerun-unacquired-
-
       - name: Rerun runs no runner was found for
         env:
           GH_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ inputs.dry-run }}
-          RERUN_STATE_FILE: .rerun-unacquired.json
         run: |
           flag=""
           if [ "$DRY_RUN" = "true" ]; then flag="--dry-run"; fi
           python3 -u scripts/ci_rerun_unacquired.py $flag
-
-      # What this pass asked GitHub for, so the next one does not ask the same
-      # run again. The cache is the only thing a schedule can hand to its next
-      # run; an entry is keyed by the run id of this pass, so a new one is saved
-      # every time and the newest is the one restored.
-      - name: Keep what this pass asked for
-        if: always()
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: .rerun-unacquired.json
-          key: rerun-unacquired-${{ github.run_id }}
