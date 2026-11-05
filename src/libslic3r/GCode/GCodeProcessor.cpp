@@ -1336,6 +1336,10 @@ void GCodeProcessor::run_post_process()
 
     m_result.lines_ends.clear();
     // m_result.lines_ends.emplace_back(std::vector<size_t>());
+    // The first pass counted the lines this export writes (m_line_id), and the rewrite emits at
+    // least one line per input line and a few more for a placeholder, so this is an upper bound:
+    // reserving it keeps the map from reallocating while it holds the whole file.
+    m_result.reserve_preview_payload(0, m_line_id + m_line_id / 4 + 1024);
     GCodeFileWriter writer(out, out_path, m_result.lines_ends, "GCode processor post process export failed.\nIs the disk full?");
     ExportLines export_line(m_result.backtrace_enabled ? ExportLines::EWriteType::ByTime : ExportLines::EWriteType::BySize,
         m_time_processor.machines, writer);
@@ -2872,6 +2876,29 @@ void GCodeProcessorResult::reset() {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: this=%2% reset finished")%__LINE__%this;
 }
 
+void GCodeProcessorResult::reserve_preview_payload(size_t moves_count, size_t lines_count)
+{
+    lock();
+    if (moves_count > 0 && moves.capacity() < moves_count)
+        moves.reserve(moves_count);
+    if (lines_count > 0 && lines_ends.capacity() < lines_count)
+        lines_ends.reserve(lines_count);
+    unlock();
+}
+
+void GCodeProcessorResult::ensure_move_capacity(size_t needed)
+{
+    if (needed <= moves.capacity())
+        return;
+    // Half a step, not a doubling: the payload of a large plate is measured in gigabytes and the
+    // reallocation holds both blocks at once, so this keeps the overlap at 1.5x instead of 2x.
+    const size_t grown = moves.capacity() + moves.capacity() / 2;
+    const size_t wanted = std::max(needed, grown);
+    BOOST_LOG_TRIVIAL(warning) << boost::format("preview move payload outgrew its reservation (%1% reserved), "
+                                                "growing to %2% moves") % moves.capacity() % wanted;
+    moves.reserve(wanted);
+}
+
 void GCodeProcessorResult::release_preview_payload()
 {
     lock();
@@ -4075,17 +4102,50 @@ bool GCodeProcessor::process_file(const std::string& filename, std::function<voi
     m_result.filename = filename;
     m_result.id = ++s_result_id;
     initialize_result_moves();
+    // The file being read is the only size hint available before the moves are built, so reserve
+    // the payload from it: a std::vector that reaches its capacity while it already holds gigabytes
+    // keeps the old and the new block alive at once, which is what a large plate runs out of commit
+    // charge on. The divisors are deliberate under-estimates of bytes per line / per move, and the
+    // callback below re-reserves from the ratio the parse actually observes.
+    size_t file_bytes = 0;
+    {
+        boost::system::error_code ec;
+        const boost::uintmax_t size = boost::filesystem::file_size(filename, ec);
+        if (! ec)
+            file_bytes = static_cast<size_t>(size);
+    }
+    m_result.reserve_preview_payload(std::min<size_t>(file_bytes / 32, size_t(16) << 20),
+                                     std::min<size_t>(file_bytes / 24, size_t(32) << 20));
+    // A G-code of a large plate stores far more moves than bytes/32 (an arc line is discretized
+    // into several moves), so the reservation above is only a floor. The parse knows how many bytes
+    // it has consumed (the last recorded line end) and how many moves it has stored, and that ratio
+    // is stable within one file: extrapolating it to the whole file gives the count the pass will
+    // end at, early enough that the vector never reallocates at full size.
+    auto reserve_payload_from_progress = [this, file_bytes]() {
+        const size_t consumed = m_result.lines_ends.empty() ? 0 : m_result.lines_ends.back();
+        if (consumed == 0 || consumed >= file_bytes)
+            return;
+        const size_t moves = m_result.moves.size();
+        if (moves * 4 < m_result.moves.capacity() * 3)
+            return;
+        const size_t estimated = size_t(double(moves) * double(file_bytes) / double(consumed));
+        // Only when the extrapolation is clearly above what is already reserved: a value that keeps
+        // landing just above the capacity would otherwise reallocate over and over.
+        if (estimated > m_result.moves.capacity() + m_result.moves.capacity() / 8)
+            m_result.reserve_preview_payload(estimated + estimated / 8, 0);
+    };
     size_t parse_line_callback_cntr = 10000;
     // GCodeReader reports a file it cannot open, or one whose read fails, as false - and it does so
     // without calling the callback, so the dummy move seeded above is all this result gets. That
     // failure is kept and handed back: the move list cannot carry it, because the dummy move makes
     // every result at least one move long whether the file was readable or not.
-    const bool read_ok = m_parser.parse_file(filename, [this, cancel_callback, &parse_line_callback_cntr](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
+    const bool read_ok = m_parser.parse_file(filename, [this, cancel_callback, &parse_line_callback_cntr, &reserve_payload_from_progress](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
         if (-- parse_line_callback_cntr == 0) {
             // Don't call the cancel_callback() too often, do it at every 10000'th line.
             parse_line_callback_cntr = 10000;
             if (cancel_callback)
                 cancel_callback();
+            reserve_payload_from_progress();
         }
         this->process_gcode_line(line, true);
     }, m_result.lines_ends);
@@ -7750,6 +7810,7 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         ? m_first_layer_height
         : m_end_position[Z] - m_z_offset;
 
+    m_result.ensure_move_capacity(m_result.moves.size() + 1);
     m_result.moves.push_back({
         m_last_line_id,
         type,
@@ -8319,6 +8380,7 @@ void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_la
 
     // Walks the blocks back to front, so each shifted move is moved once, into its final slot.
     size_t read  = moves.size(); // one past the last move not yet placed
+    result.ensure_move_capacity(moves.size() + inserted_actual_speed_moves_count);
     moves.resize(moves.size() + inserted_actual_speed_moves_count);
     size_t write = moves.size(); // one past the last free slot
     m_actual_speed_id_map.clear();
