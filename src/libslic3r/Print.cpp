@@ -7,6 +7,7 @@
 #include "PrintBase.hpp"
 #include <utility>
 #include <string>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "libslic3r.h"
@@ -27,6 +28,7 @@
 #include "TriangleSelector.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
 #include <exception>
+#include <stdexcept>
 #include <ostream>
 #include "ExPolygon.hpp"
 #include "Layer.hpp"
@@ -37,6 +39,7 @@
 #include <chrono>
 #include <optional>
 #include "GCode/GCodeProcessor.hpp"
+#include "GCode/GCodeStatistics.hpp"
 #include "GCode/ThumbnailData.hpp"
 #include "ExtrusionEntity.hpp"
 #include <math.h>
@@ -237,17 +240,170 @@ struct FilamentType {
 
 void Print::clear()
 {
-	std::scoped_lock<std::mutex> lock(this->state_mutex());
-    // The following call should stop background processing if it is running.
+    // clear() keeps the contract it always had: it may stop the background processing that owns
+    // this print. The cancelling invalidation is called before the state lock is taken, unlike in
+    // the code this replaces, because the callback it reaches stops that processing and waits for
+    // the worker thread, which takes this same lock to publish its steps. The step state itself is
+    // still changed under the lock below, by drop_slicing_state_locked()'s caller-side contract.
     this->invalidate_all_steps();
+    std::scoped_lock<std::mutex> lock(this->state_mutex());
+    this->drop_slicing_state_locked();
+    m_model.clear_objects();
+    m_statistics_by_extruder_count.clear();
+    // clear() drops the model snapshot as well, so there is nothing left for apply() to rebuild
+    // from: the print starts over as an empty one, not as a released one.
+    m_slicing_state_released = false;
+    m_sliced_model_object_ids.clear();
+}
+
+bool Print::release_slicing_state()
+{
+	std::scoped_lock<std::mutex> lock(this->state_mutex());
+    // The PrintObjects below are the worker thread's input: deleting them while it is inside
+    // process() is a use-after-free. Every caller stops that processing first - the CLI run loop,
+    // and Plater::priv::on_process_completed(), which calls BackgroundSlicingProcess::stop() before
+    // it releases anything - and a started step is exactly a worker thread inside this print, so
+    // the requirement is checked here instead of being documented and hoped for.
+    for (size_t step = 0; step < size_t(psCount); ++step)
+        if (this->is_step_started_unguarded(static_cast<PrintStep>(step))) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": refusing to release %1%, step %2% is still running") % this % step;
+            return false;
+        }
+    // No cancellation callback for this invalidation: the callback belongs to whoever started the
+    // print (BackgroundSlicingProcess::start() installs one that stops that process), not to the
+    // print, and calling it from here would reach into whichever print that process runs now.
+    this->invalidate_all_steps_without_cancel();
+    this->drop_slicing_state_locked();
+    // Set last: apply() reads this flag and then the object IDs the call above recorded, so it must
+    // not be visible before they are in place. The slicing state is gone from here on, and the next
+    // apply() rebuilds it; that rebuild is not a change the caller has to slice for - it is this
+    // call coming back.
+    m_slicing_state_released = true;
+    return true;
+}
+
+// The caller holds state_mutex and has already invalidated the steps: what is left is giving the
+// objects back together with everything keyed by their pointers.
+void Print::drop_slicing_state_locked()
+{
+    // Which ModelObjects this print's result was produced from, recorded before the objects that
+    // know it are deleted: apply() compares these against the shared model, so that another
+    // plate's changes are not taken for this plate's.
+    m_sliced_model_object_ids.clear();
+    for (const PrintObject *object : m_objects) {
+        const ObjectID id = object->model_object()->id();
+        if (std::find(m_sliced_model_object_ids.begin(), m_sliced_model_object_ids.end(), id) == m_sliced_model_object_ids.end())
+            m_sliced_model_object_ids.push_back(id);
+    }
+    // The inputs apply() normalizes the incoming config with, recorded for the same reason and at
+    // the same point: both are derived from the PrintObjects and the regions about to go, and the
+    // apply() that rebuilds this print has to reproduce the normalization that produced the config
+    // it keeps. See used_filaments_for_normalize().
+    {
+        // Under m_sliced_inputs_mutex as well as state_mutex: the readers take that one alone, on
+        // whatever thread is applying the print.
+        std::scoped_lock<std::mutex> inputs_lock(m_sliced_inputs_mutex);
+        m_sliced_used_filaments = this->extruders(true);
+        m_sliced_object_count   = m_objects.size();
+    }
+    // Caches keyed by PrintObject have to go before the objects their keys point at, and the
+    // first-layer geometry goes with the objects it was measured on. Everything below is rebuilt
+    // by the next process(); nothing here is read back after the plate's G-code has been exported.
+    m_sequential_dynamic_orderings.clear();
+    m_brimMap.clear();
+    m_brimFilamentMap.clear();
+    m_brimMapByInstance.clear();
+    m_objectBrimAreasByInstance.clear();
+    m_skirt_brim_groups.clear();
+    m_skirt.clear();
+    m_first_layer_convex_hull.points.clear();
+    m_skirt_convex_hull.clear();
+    // Same for the tool ordering: its layer tools and gradient bookkeeping are keyed by the
+    // PrintObject pointers about to be deleted. first_extruder() and all_extruders() stay, because
+    // the 3MF metadata (OrcaSlicer.cpp) and the plate bounding box (Plater.cpp) read them from a
+    // plate that is already released.
+    m_tool_ordering.release_object_references();
 	for (PrintObject *object : m_objects)
 		delete object;
 	m_objects.clear();
     m_print_regions.clear();
-    m_model.clear_objects();
-    m_statistics_by_extruder_count.clear();
     m_same_shrinkage_compensations = false;
     m_shrinkage_compensation = Vec3d::Ones();
+    // m_model deliberately stays: it is the snapshot the next apply() compares its argument
+    // against, which is what tells a release-only rebuild apart from a changed model, and the
+    // objects rebuilt from it point their ModelObject back into it. It is a copy of the model
+    // apply() was handed - the whole project's, not only this plate's, which is why the comparisons
+    // are filtered by m_sliced_model_object_ids - so it stays resident per plate. Smaller than the
+    // layers, supports and fill this call gives back, but not free. clear() drops it right after
+    // this call.
+}
+
+// The two inputs DynamicPrintConfig::normalize_fdm_2() derives config values from. While the
+// slicing state is released there is no PrintObject to derive them from, and an empty answer is
+// not the neutral one: it leaves the derived values (enable_prime_tower on a single filament,
+// independent_support_layer_height under a tower) as the incoming config has them, while the
+// config this print keeps has them normalized. apply() would take that difference for a change and
+// invalidate a finished plate whose G-code is still on disk. The release records both; see
+// drop_slicing_state_locked().
+//
+// The recorded pair is read under m_sliced_inputs_mutex. The release writes it while holding
+// state_mutex too, and apply() - the only reader that matters - does not hold that lock when it
+// asks for these, so without the second lock the reader would race the release instead of
+// serialising against it. The lock order is always state_mutex then m_sliced_inputs_mutex; no
+// caller takes them the other way round.
+std::vector<unsigned int> Print::used_filaments_for_normalize() const
+{
+    if (m_slicing_state_released.load(std::memory_order_acquire)) {
+        std::scoped_lock<std::mutex> lock(m_sliced_inputs_mutex);
+        return m_sliced_used_filaments;
+    }
+    return this->extruders(true);
+}
+
+size_t Print::object_count_for_normalize() const
+{
+    if (m_slicing_state_released.load(std::memory_order_acquire)) {
+        std::scoped_lock<std::mutex> lock(m_sliced_inputs_mutex);
+        return m_sliced_object_count;
+    }
+    return m_objects.size();
+}
+
+std::string Print::gcode_statistics_from_file(GCodeProcessorResult &result) const
+{
+    // The document is derived from the file alone, so a cached one needs no parse at all. It is
+    // cleared by GCodeProcessorResult::reset(), i.e. whenever the result stops describing a
+    // single completed export, and it is filled from the project the result was loaded from when
+    // the project carried it.
+    if (!result.statistics_json.empty())
+        return result.statistics_json;
+    GCodeProcessor processor;
+    // Process-wide, so this is a write from the calling thread - the UI thread, for every export -
+    // while the background slicing worker writes it too. It has to be set before the parse below
+    // picks its reserved tags, so the parse runs while no slicing step is running.
+    GCodeProcessor::s_IsBBLPrinter = is_BBL_printer();
+    const Vec3d origin = this->get_plate_origin();
+    processor.set_xy_offset(origin(0), origin(1));
+    // The nozzle-grouping context the export used, or the per-layer times of the document would
+    // not be the ones the plate reports.
+    if (result.nozzle_group_result)
+        processor.initialize_from_context(result.nozzle_group_result);
+    processor.process_file(result.filename);
+    // A file that never moved parses to a well formed document that reports nothing - and the
+    // processor always comes back with its dummy first move, so the move list cannot tell. That
+    // document is not the statistics of a plate: an export that took it for one would write it and
+    // report success, which is what the command line's --export-statistics must not do.
+    const std::string statistics = gcode_statistics_json(processor.result());
+    if (!statistics_json_has_data(statistics))
+        return {};
+    // Keep it on the result: parsing a full bed's G-code costs seconds, and every 3MF export of a
+    // project opened from a sliced 3MF would otherwise parse every plate again. Under the result's
+    // lock, as the other writers of the field do.
+    {
+        std::lock_guard<std::mutex> lock(result.result_mutex);
+        result.statistics_json = statistics;
+    }
+    return statistics;
 }
 
 bool Print::has_tpu_filament() const
@@ -911,6 +1067,64 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         Polygon        hull_polygon;
         int                  object_index;
         double               height;
+        // Whether the instance reaches above extruder_clearance_height_to_rod, and the Y extent of it
+        // the rod can hit while a later instance prints (see above_rod_y_range).
+        bool                 has_above_rod = false;
+        coord_t              rod_min_y     = 0;
+        coord_t              rod_max_y     = 0;
+    };
+    // ORCA: Y extent of an instance's geometry above the rod height, in the same coordinates as the
+    // bounding boxes below. Conservative: any triangle with a vertex above the rod contributes all
+    // three of its vertices. Modifiers, blockers and negative volumes are not printed and are skipped.
+    const double rod_height = print.config().extruder_clearance_height_to_rod.value;
+    // A skirt is a wall around the whole footprint: a draft shield as tall as the object, otherwise
+    // skirt_height layers tall. Once it can reach the rod, the rod can hit the whole footprint, not just
+    // the geometry above the rod. A max_layer_height of 0 means 0.75 x nozzle diameter, as in Slicing.cpp.
+    double max_layer_height = 0.;
+    for (size_t i = 0; i < print.config().nozzle_diameter.size(); ++i) {
+        const double h = print.config().max_layer_height.get_at(i);
+        max_layer_height = std::max(max_layer_height, h > 0. ? h : 0.75 * print.config().nozzle_diameter.get_at(i));
+    }
+    const bool skirt_reaches_rod = print.has_infinite_skirt() ||
+        (print.config().skirt_loops > 0 && print.config().skirt_height * max_layer_height > rod_height);
+    auto above_rod_y_range = [rod_height](const PrintInstance &instance, coord_t &min_y, coord_t &max_y) -> bool {
+        // A raft lifts the whole object by its thickness, so mesh Z this far below the rod prints above it.
+        const double rod_z = rod_height - instance.print_object->slicing_parameters().object_print_z_min;
+        // Skip the mesh walk for the common case of an object that doesn't reach the rod. Like the too-tall
+        // check below, this compares the top without the raft, so an object only its raft lifts above the
+        // rod keeps the footprint test.
+        if (instance.print_object->max_z() <= scale_(rod_height))
+            return false;
+        double ymin = std::numeric_limits<double>::max();
+        double ymax = std::numeric_limits<double>::lowest();
+        bool   any  = false;
+        const Transform3d inst_trafo = instance.model_instance->get_transformation().get_matrix();
+        for (const ModelVolume *volume : instance.print_object->model_object()->volumes) {
+            if (!volume->is_model_part())
+                continue;
+            const Transform3d           trafo = inst_trafo * volume->get_transformation().get_matrix();
+            const indexed_triangle_set &its   = volume->mesh().its;
+            std::vector<double> ys(its.vertices.size()), zs(its.vertices.size());
+            for (size_t i = 0; i < its.vertices.size(); ++i) {
+                const Vec3d p = trafo * its.vertices[i].cast<double>();
+                ys[i] = p.y();
+                zs[i] = p.z();
+            }
+            for (const auto &f : its.indices) {
+                if (zs[f(0)] <= rod_z && zs[f(1)] <= rod_z && zs[f(2)] <= rod_z)
+                    continue;
+                for (int j = 0; j < 3; ++j) {
+                    ymin = std::min(ymin, ys[f(j)]);
+                    ymax = std::max(ymax, ys[f(j)]);
+                }
+                any = true;
+            }
+        }
+        if (any) {
+            min_y = scaled<coord_t>(ymin);
+            max_y = scaled<coord_t>(ymax);
+        }
+        return any;
     };
     auto find_object_index = [](const Model& model, const ModelObject* obj) {
         for (int index = 0; index < model.objects.size(); index++)
@@ -1004,6 +1218,23 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
                 struct print_instance_info print_info {&instance, convex_hull.bounding_box(), convex_hull};
                 print_info.height = instance.print_object->height();
                 print_info.object_index = find_object_index(print.model(), print_object->model_object());
+                print_info.has_above_rod = above_rod_y_range(instance, print_info.rod_min_y, print_info.rod_max_y);
+                const BoundingBox footprint = print_info.bounding_box.inflated(-scale_(0.5 * print.config().extruder_clearance_radius.value + object_skirt_offset));
+                if (print_info.has_above_rod && !skirt_reaches_rod) {
+                    // The other instance's footprint is grown by half of extruder_clearance_radius, but the rod
+                    // can reach as far as extruder_clearance_dist_to_rod: widen this range by the difference, then
+                    // shrink it by the same 0.1 mm tolerance the footprint test uses. Never past the footprint
+                    // itself, so plates that pass the footprint test still validate.
+                    const coord_t extra = scaled<coord_t>(std::max(0., print.config().extruder_clearance_dist_to_rod.value - 0.5 * print.config().extruder_clearance_radius.value));
+                    print_info.rod_min_y = std::max(print_info.rod_min_y + scaled<coord_t>(0.1) - extra, footprint.min.y());
+                    print_info.rod_max_y = std::min(print_info.rod_max_y - scaled<coord_t>(0.1) + extra, footprint.max.y());
+                } else {
+                    // Below the rod, or with a skirt that reaches it, test the footprint as before. On printers whose
+                    // lid clearance is lower than the rod's, overlapping a later instance is what lets an
+                    // object below the rod use the rod height instead of the lid height.
+                    print_info.rod_min_y = footprint.min.y();
+                    print_info.rod_max_y = footprint.max.y();
+                }
                 print_instance_with_bounding_box.push_back(std::move(print_info));
                 convex_hulls_other.emplace_back(std::move(convex_hull));
             }
@@ -1023,8 +1254,8 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
     double hc2              = scale_(print.config().extruder_clearance_height_to_rod); // height to rod
     double printable_height = scale_(print.config().printable_height);
 
-    // Print each instance taller than hc2 after every instance it overlaps in Y, keeping list order where possible.
-    // With no valid order, keep the list order so the check below reports the collision.
+    // Print each instance that reaches above hc2 after every instance that overlaps that part of it in Y, keeping list
+    // order where possible. With no valid order, keep the list order so the check below reports the collision.
     {
         const size_t n = print_instance_with_bounding_box.size();
 
@@ -1036,16 +1267,23 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         for (size_t i = 0; i < n; ++i) fallback_order[i] = i;
         std::stable_sort(fallback_order.begin(), fallback_order.end(), by_object_index);
 
-        // Mirrors the inflation the vertical-clearance check below applies: only the
-        // potentially-too-tall instance's footprint is shrunk before testing Y overlap.
-        // A structured binding can't be captured by a lambda before C++20, so copy it first.
-        const float skirt_offset = object_skirt_offset;
+        // Every instance of an object shares its object_index, so order by place in the list instead,
+        // which tells instances apart and keeps copies of one object in their list order.
+        std::vector<size_t> list_position(n);
+        for (size_t k = 0; k < n; ++k)
+            list_position[fallback_order[k]] = k;
+        auto by_list_position = [&list_position](size_t l, size_t r) { return list_position[l] < list_position[r]; };
+
+        // Mirrors the vertical-clearance check below: the part of the potentially-too-tall instance
+        // the rod can hit (see rod_min_y) is tested against the other instance's inflated footprint,
+        // i.e. everywhere the nozzle can be while that instance prints.
         auto overlaps_in_y = [&](size_t tall_idx, size_t other_idx) {
-            auto  bbA = print_instance_with_bounding_box[tall_idx].bounding_box.inflated(
-                -scale_(0.5 * print.config().extruder_clearance_radius.value + skirt_offset));
+            const auto &A = print_instance_with_bounding_box[tall_idx];
+            if (!A.has_above_rod)
+                return false;
             auto &bbB = print_instance_with_bounding_box[other_idx].bounding_box;
-            auto  inter_min = std::max(bbA.min.y(), bbB.min.y());
-            auto  inter_max = std::min(bbA.max.y(), bbB.max.y());
+            auto  inter_min = std::max(A.rod_min_y, bbB.min.y());
+            auto  inter_max = std::min(A.rod_max_y, bbB.max.y());
             return inter_max - inter_min > 0;
         };
 
@@ -1066,7 +1304,7 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
             bool infeasible = false;
             for (size_t a = 0; a < n && !infeasible; ++a) {
                 if (a == last_idx) continue;
-                if (print_instance_with_bounding_box[a].height <= hc2) continue; // short enough: no constraint
+                if (!print_instance_with_bounding_box[a].has_above_rod) continue; // nothing reaches the rod: no constraint
                 for (size_t b = 0; b < n; ++b) {
                     if (b == a) continue;
                     if (!overlaps_in_y(a, b)) continue;
@@ -1083,13 +1321,13 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
             }
 
             if (!infeasible) {
-                // Kahn's algorithm; ties are broken by original object_index so the result is
+                // Kahn's algorithm; ties are broken by place in the list so the result is
                 // the minimal perturbation of the incoming order, not an arbitrary one.
                 std::vector<size_t> ready;
                 for (size_t i = 0; i < n; ++i)
                     if (i != last_idx && indegree[i] == 0)
                         ready.push_back(i);
-                std::sort(ready.begin(), ready.end(), by_object_index);
+                std::sort(ready.begin(), ready.end(), by_list_position);
 
                 std::vector<size_t> order;
                 order.reserve(n);
@@ -1099,7 +1337,7 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
                     order.push_back(cur);
                     for (size_t nxt : adj[cur]) {
                         if (--indegree[nxt] == 0) {
-                            auto pos = std::upper_bound(ready.begin(), ready.end(), nxt, by_object_index);
+                            auto pos = std::upper_bound(ready.begin(), ready.end(), nxt, by_list_position);
                             ready.insert(pos, nxt);
                         }
                     }
@@ -1122,9 +1360,6 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         // differs from it, naming the instances held back to clear the rod: those printed later than
         // their place in the list. The first of them is the jump target.
         if (warning != nullptr && solved && solved_order != fallback_order) {
-            std::vector<size_t> list_position(n);
-            for (size_t k = 0; k < n; ++k)
-                list_position[fallback_order[k]] = k;
             for (size_t k = 0; k < n; ++k) {
                 if (k <= list_position[solved_order[k]])
                     continue;
@@ -1157,33 +1392,6 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
     }
     // sequential_print_vertical_clearance_valid
     {
-        // Ignore the last instance printed.
-        //print_instance_with_bounding_box.pop_back();
-        /*bool has_interlaced_objects = false;
-        for (int k = 0; k < print_instance_count; k++)
-        {
-            auto inst = print_instance_with_bounding_box[k].print_instance;
-            auto bbox = print_instance_with_bounding_box[k].bounding_box;
-            auto iy1 = bbox.min.y();
-            auto iy2 = bbox.max.y();
-
-            for (int i = 0; i < k; i++)
-            {
-                auto& p = print_instance_with_bounding_box[i].print_instance;
-                auto bbox2 = print_instance_with_bounding_box[i].bounding_box;
-                auto py1 = bbox2.min.y();
-                auto py2 = bbox2.max.y();
-                auto inter_min = std::max(iy1, py1); // min y of intersection
-                auto inter_max = std::min(iy2, py2); // max y of intersection. length=max_y-min_y>0 means intersection exists
-                if (inter_max - inter_min > 0) {
-                    has_interlaced_objects = true;
-                    break;
-                }
-            }
-            if (has_interlaced_objects)
-                break;
-        }*/
-
         // if objects are not overlapped on y-axis, they will not collide even if they are taller than extruder_clearance_height_to_rod
         int print_instance_count = print_instance_with_bounding_box.size();
         std::map<const PrintInstance*, std::pair<Polygon, float>> too_tall_instances;
@@ -1192,21 +1400,12 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
             auto inst = print_instance_with_bounding_box[k].print_instance;
             // 只需要考虑喷嘴到滑杆的偏移量，这个比整个工具头的碰撞半径要小得多
             // Only the offset from the nozzle to the slide bar needs to be considered, which is much smaller than the collision radius of the entire tool head.
-            auto bbox = print_instance_with_bounding_box[k].bounding_box.inflated(-scale_(0.5 * print.config().extruder_clearance_radius.value + object_skirt_offset));
-            auto iy1 = bbox.min.y();
-            auto iy2 = bbox.max.y();
+            // ORCA: test only the part of this instance the rod can hit (see rod_min_y).
+            const auto &info_k = print_instance_with_bounding_box[k];
+            const coord_t iy1 = info_k.rod_min_y;
+            const coord_t iy2 = info_k.rod_max_y;
             (const_cast<ModelInstance*>(inst->model_instance))->arrange_order = k+1;
             double height = (k == (print_instance_count - 1))?printable_height:hc1;
-            /*if (has_interlaced_objects) {
-                if ((k < (print_instance_count - 1)) && (inst->print_object->height() > hc2)) {
-                    too_tall_instances[inst] = std::make_pair(print_instance_with_bounding_box[k].hull_polygon, unscaled<double>(hc2));
-                }
-            }
-            else {
-                if ((k < (print_instance_count - 1)) && (inst->print_object->height() > hc1)) {
-                    too_tall_instances[inst] = std::make_pair(print_instance_with_bounding_box[k].hull_polygon, unscaled<double>(hc1));
-                }
-            }*/
 
             for (int i = k+1; i < print_instance_count; i++)
             {
@@ -2367,19 +2566,13 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         // A mixed (virtual) filament always resolves to multiple physical components, which
         // spiral vase cannot print.
         const auto &is_mixed = m_config.filament_is_mixed.values;
-        for (const PrintObject *object : m_objects)
-            for (unsigned int ext : object->object_extruders())
-                if (ext < is_mixed.size() && is_mixed[ext])
-                    return {L("Spiral (vase) mode does not work when an object contains more than one material."), nullptr, "spiral_mode"};
-        assert(m_objects.size() == 1);
-        const auto all_regions = m_objects.front()->all_regions();
-        if (all_regions.size() > 1) {
-            // Orca: make sure regions are not compatible
-            if (std::any_of(all_regions.begin() + 1, all_regions.end(), [this, ra = all_regions.front()](const auto rb) {
-                return !Layer::is_perimeter_compatible(*this, ra, rb);
-            })) {
+        for (const PrintObject *object : m_objects) {
+            const auto used_filament_ids = object->object_extruders();
+            if (used_filament_ids.size() > 1 ||
+                std::any_of(used_filament_ids.begin(), used_filament_ids.end(), [&is_mixed](unsigned int filament_id) {
+                    return filament_id < is_mixed.size() && is_mixed[filament_id];
+                }))
                 return {L("Spiral (vase) mode does not work when an object contains more than one material."), nullptr, "spiral_mode"};
-            }
         }
     }
 
@@ -2445,7 +2638,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 print_object.model_object(),
                 ""
             };
-        } else if (effective_max_z > this->config().printable_height + EPSILON) {
+        } else if (compensated_max_z > this->config().printable_height + EPSILON) {
             return StringObjectException{
                 last_layer_below_max ?
                 Slic3r::format(_u8L("While the object %1% itself fits the build volume, its last layer exceeds the maximum build volume height."), print_object.model_object()->name) +
@@ -3005,10 +3198,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                              "adaptive_pressure_advance_model");
                         break;
                     }
-                    if (!AdaptivePAProcessor::validate_adaptive_pa_model(pa_model).empty()) {
-                        warn(L("The Adaptive Pressure Advance model for one or more extruders may contain invalid values."),
+                    const std::string pa_error = AdaptivePAProcessor::validate_adaptive_pa_model(pa_model);
+                    if (!pa_error.empty()) {
+                        // TRN %1% is the filament number as shown in the filament list, starting from 1; %2% names the invalid line.
+                        // one warning per filament, the notifications stack
+                        warn(Slic3r::format(L("The Adaptive Pressure Advance model of filament %1% contains invalid values.\n%2%"), filament_id + 1, pa_error),
                              "adaptive_pressure_advance_model");
-                        break;
                     }
                 }
             }
@@ -5261,6 +5456,9 @@ bool Print::enable_timelapse_print() const
 
 void Print::_make_wipe_tower()
 {
+    // Use the printer's G-code tag format so the processor can classify wipe tower filament usage.
+    GCodeProcessor::s_IsBBLPrinter = is_BBL_printer();
+
     m_wipe_tower_data.clear();
 
     // BBS
@@ -5396,7 +5594,7 @@ void Print::_make_wipe_tower()
 
             if (!layer_tools.has_wipe_tower) continue;
             bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
-            wipe_tower.plan_toolchange((float)layer_tools.print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, current_filament_id);
+            wipe_tower.plan_toolchange((float)layer_tools.wipe_tower_print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, current_filament_id);
 
             used_filament_ids.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
 
@@ -5447,7 +5645,7 @@ void Print::_make_wipe_tower()
                     wipe_volume_nc = 15.f;
                 }
 
-                wipe_tower.plan_toolchange((float)layer_tools.print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, filament_id,
+                wipe_tower.plan_toolchange((float)layer_tools.wipe_tower_print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, filament_id,
                     wipe_volume_ec, wipe_volume_nc, volume_to_purge);
                 current_filament_id = filament_id;
             }
@@ -5554,7 +5752,7 @@ void Print::_make_wipe_tower()
                 if (!layer_tools.has_wipe_tower)
                     continue;
                 bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
-                wipe_tower.plan_toolchange((float) layer_tools.print_z, (float) layer_tools.wipe_tower_layer_height, current_extruder_id,
+                wipe_tower.plan_toolchange((float) layer_tools.wipe_tower_print_z, (float) layer_tools.wipe_tower_layer_height, current_extruder_id,
                                            current_extruder_id, false);
                 for (const auto extruder_id : layer_tools.extruders) {
                     if ((first_layer && extruder_id == m_wipe_tower_data.tool_ordering.all_extruders().back()) || extruder_id !=
@@ -5575,7 +5773,7 @@ void Print::_make_wipe_tower()
                         }
 
                         // request a toolchange at the wipe tower with at least volume_to_wipe purging amount
-                        wipe_tower.plan_toolchange((float) layer_tools.print_z, (float) layer_tools.wipe_tower_layer_height,
+                        wipe_tower.plan_toolchange((float) layer_tools.wipe_tower_print_z, (float) layer_tools.wipe_tower_layer_height,
                                                    current_extruder_id, extruder_id, volume_to_wipe);
                         current_extruder_id = extruder_id;
                     }
@@ -5684,7 +5882,11 @@ std::string Print::output_filename(const std::string &filename_base) const
     auto full_print_config = this->full_print_config();
     const ConfigOptionStrings* filament_settings_id = full_print_config.option<ConfigOptionStrings>("filament_settings_id");
     std::string filament_name = "";
-    auto extruders = this->extruders(true);
+    // Not extruders(true) directly: a released print has no PrintObject left to derive the used
+    // filaments from, and an empty list would leave the {filament_name} placeholder blank in the
+    // name of the G-code it exports next. used_filaments_for_normalize() is the same list, kept
+    // from before the release.
+    auto extruders = this->used_filaments_for_normalize();
     if(!extruders.empty()) {
         // first extruder is the default extruder
         int extruder_id = extruders.front();
@@ -5733,6 +5935,12 @@ void Print::set_gcode_file_invalidated()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ <<  boost::format(": done");
 }
 
+// Whether the G-code file `result` names may be re-read instead of slicing. See the declaration.
+bool Print::can_process_previous_gcode_file(const GCodeProcessorResult* result) const
+{
+    return this->finished() && result != nullptr && result->preview_payload_restorable();
+}
+
 //BBS: add gcode file preload logic
 void Print::export_gcode_from_previous_file(const std::string& file, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
@@ -5758,7 +5966,14 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
             processor.initialize_from_context(result->nozzle_group_result);
         processor.configure_exclusion_volume_path_check(this->config());
         //processor.enable_producers(true);
-        processor.process_file(file);
+        // GCodeProcessor::process_file() reports a file it could not open or read as false, and
+        // leaves the result with nothing but its dummy first move. That is not this print's G-code:
+        // taking it would make the plate present an empty preview as its own finished slice, and the
+        // caller marks the result as restored right after this returns. The move list cannot tell -
+        // the dummy move keeps it one move long either way - so ask the parse itself. Throw instead:
+        // the catch below turns it into the error the caller reports.
+        if (! processor.process_file(file))
+            throw std::runtime_error("the G-code file could not be read");
 
         // filament seq is loaded from file, processor result will override the value
         auto filament_seq_loaded = result->filament_change_sequence;
@@ -5766,6 +5981,10 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
         *result = std::move(processor.extract_result());
         result->filament_change_sequence = filament_seq_loaded;
         result->nozzle_change_sequence   = nozzle_seq_loaded;
+        // The moves this result now holds are what its statistics document is summed from; the
+        // export path caches it here too, so a plate read back from its file reports the same
+        // statistics after its payload is released.
+        result->cache_statistics_json();
     } catch (std::exception &ex) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<  boost::format(": found errors when process gcode file %1%") %file.c_str();
         {
@@ -5805,7 +6024,11 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
     if (result->nozzle_group_result)
         processor.initialize_from_context(result->nozzle_group_result);
     try {
-        processor.process_file(result->filename);
+        // process_file() reports a file it could not open or read as false instead of throwing, and
+        // leaves the result with its dummy first move only. Treat that like the parse failure it is,
+        // so the handler below runs for both: a dummy move is not this plate's payload.
+        if (! processor.process_file(result->filename))
+            throw std::runtime_error("the G-code file could not be read");
     } catch (const std::exception& ex) {
         // The edited file is what gets printed, so failing to preview it must not fail the slice.
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": cannot re-read the G-code file " << result->filename << ": " << ex.what();

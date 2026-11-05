@@ -621,6 +621,16 @@ protected:
         { return m_state.invalidate_multiple(il.begin(), il.end(), this->cancel_callback()); }
     bool            invalidate_all_steps()
         { return m_state.invalidate_all(this->cancel_callback()); }
+    // Invalidate every step without running the cancellation callback. For a caller that has
+    // already stopped the background processing itself, where the callback - which is owned by
+    // whoever started the print, not by the print - would reach into a state machine that is no
+    // longer this print's to control.
+    bool            invalidate_all_steps_without_cancel()
+        { return m_state.invalidate_all([](){}); }
+    // invalidate_step() for the background processing thread, about a step it finished itself. It skips the
+    // cancel callback, which stops the background processing and so would wait for this very thread.
+    bool            invalidate_step_from_worker(PrintStepEnum step)
+        { std::scoped_lock<std::mutex> lock(this->state_mutex()); return m_state.invalidate(step, []() {}); }
 
 	bool            is_step_started_unguarded(PrintStepEnum step) const { return m_state.is_started_unguarded(step); }
 	bool            is_step_done_unguarded(PrintStepEnum step) const { return m_state.is_done_unguarded(step); }

@@ -150,6 +150,17 @@ template<typename ParseLineCallback, typename LineEndCallback>
 bool GCodeReader::parse_file_raw_internal(const std::string &filename, ParseLineCallback parse_line_callback, LineEndCallback line_end_callback)
 {
     FilePtr in{ boost::nowide::fopen(filename.c_str(), "rb") };
+    // fopen() returns nullptr for a file that is gone, locked, or on a volume that went away, and
+    // libc does not hand back an error there: fread()/ferror() on a null stream report an invalid
+    // parameter through the CRT's invalid-parameter handler, which __fastfail()s the process
+    // (0xc0000409 in ucrtbase, FAST_FAIL_INVALID_ARG) instead of returning EOF. Reading a G-code
+    // file that is not readable must not be able to kill the application, whichever caller asked
+    // for it, so the failure is reported the same way a read error is: false, and the caller's own
+    // error path takes over.
+    if (in.f == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": cannot open %1%, the file is gone or not readable") % filename.c_str();
+        return false;
+    }
 
     // Read the input stream 64kB at a time, extract lines and process them.
     std::vector<char> buffer(65536 * 10, 0);

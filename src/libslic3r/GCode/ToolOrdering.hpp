@@ -187,6 +187,13 @@ public:
     // and to support the wipe tower partitions above this one.
     size_t                      wipe_tower_partitions = 0;
     coordf_t 					wipe_tower_layer_height = 0.;
+    // print_z of the wipe tower layer this layer's tool changes print on. A layer too thin to be
+    // its own tower layer joins the one below, keeping that layer's z and height.
+    coordf_t                    wipe_tower_print_z = 0.;
+    // Whether this layer finishes its wipe tower layer. Of a tower layer and the layers joined to
+    // it, that is the last one changing tools, or the last one when none does.
+    bool                        wipe_tower_layer_ends = true;
+    bool                        joins_wipe_tower_layer_below() const { return has_wipe_tower && wipe_tower_print_z != print_z; }
     // Custom G-code (color change, extruder switch, pause) to be performed before this layer starts to print.
     const CustomGCode::Item    *custom_gcode = nullptr;
 
@@ -288,6 +295,22 @@ public:
         m_stats_by_single_extruder.clear();
         m_stats_by_multi_extruder_best.clear();
         m_stats_by_multi_extruder_curr.clear();
+    }
+
+    // Drop everything that points into the print's objects, keeping the scalars a finished plate
+    // still reports. A print that gives its PrintObjects back (Print::release_slicing_state()) has
+    // to call this before deleting them: the layer tools carry the wiping maps keyed by PrintObject
+    // and ExtrusionEntity pointers, and the per-object gradient bookkeeping is keyed by PrintObject
+    // as well. first_extruder() / last_extruder() / all_extruders() stay valid, because the CLI 3MF
+    // metadata (OrcaSlicer.cpp) and the GUI plate bounding box (Plater.cpp) read them from a plate
+    // whose slicing state is already released. Everything cleared here is rebuilt by the next
+    // process().
+    void    release_object_references() {
+        clear();
+        m_mixed_object_layers.clear();
+        m_object_all_layer_indices.clear();
+        m_gradient_volume_layers.clear();
+        m_print_object_ptr = nullptr;
     }
 
     // Only valid for non-sequential print:

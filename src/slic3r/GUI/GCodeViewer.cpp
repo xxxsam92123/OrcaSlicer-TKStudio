@@ -1628,13 +1628,18 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     // on a tilted layer is wherever its last extrusion happened to end, and the layer
     // slider looks its labels and the colour-change ticks up in that list assuming it
     // increases.  Give it the layers' print Z instead (the slicer's layer Z, which
-    // increases along the belt), numbered the way libvgcode::convert() numbers the
-    // layers: consecutively over the moves that exist.
+    // increases along the belt), numbered the way libvgcode::convert() numbers them:
+    // consecutively over the moves that reach the preview.  The start G-code's
+    // prepare stage does reach the preview, drawn as part of the first layer, but its
+    // print Z is not a layer's, so it is skipped here: the first printed move of each
+    // layer supplies the entry.
     m_belt_layer_zs.clear();
     if (is_belt) {
         unsigned int src_layer_id = std::numeric_limits<unsigned int>::max();
         for (size_t i = 1; i < gcode_result.moves.size(); ++ i) {
             const GCodeProcessorResult::MoveVertex &mv = gcode_result.moves[i];
+            if (mv.prepare_stage)
+                continue;
             if (mv.layer_id != src_layer_id) {
                 src_layer_id = mv.layer_id;
                 m_belt_layer_zs.emplace_back(double(mv.print_z));
@@ -2171,7 +2176,7 @@ GCodeViewer::ImexMarkerPlan GCodeViewer::resolve_imex_marker_plan(const DynamicP
 void GCodeViewer::render_scene(int canvas_width, int canvas_height)
 {
     glsafe(::glEnable(GL_DEPTH_TEST));
-    render_shells(canvas_width, canvas_height);
+    render_shells();
 
     if (m_viewer.get_extrusion_roles_count() == 0)
         return;
@@ -3400,7 +3405,7 @@ void GCodeViewer::render_toolpaths()
 #endif // ENABLE_NEW_GCODE_VIEWER_DEBUG
 }
 
-void GCodeViewer::render_shells(int canvas_width, int canvas_height)
+void GCodeViewer::render_shells()
 {
     //BBS: add shell previewing logic
     if ((!m_shells.previewing && !m_shells.visible) || m_shells.volumes.empty())
@@ -3418,7 +3423,7 @@ void GCodeViewer::render_shells(int canvas_width, int canvas_height)
     const Camera& camera = wxGetApp().plater()->get_camera();
     shader->set_uniform("z_far", camera.get_far_z());
     shader->set_uniform("z_near", camera.get_near_z());
-    m_shells.volumes.render(GLVolumeCollection::ERenderType::Transparent, false, camera.get_view_matrix(), camera.get_projection_matrix(), {canvas_width, canvas_height});
+    m_shells.volumes.render(GLVolumeCollection::ERenderType::Transparent, false, camera.get_view_matrix(), camera.get_projection_matrix());
     shader->set_uniform("emission_factor", 0.0f);
     shader->stop_using();
 
@@ -3429,10 +3434,6 @@ void GCodeViewer::render_shells(int canvas_width, int canvas_height)
 void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessorResult*>& gcode_result_list, bool show /*= true*/) const {
     if (!show)
         return;
-    for (auto gcode_result : gcode_result_list) {
-        if (gcode_result->moves.size() == 0)
-            return;
-    }
     ImGuiWrapper& imgui = *wxGetApp().imgui();
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * m_scale); // ORCA add window rounding to modernize / match style

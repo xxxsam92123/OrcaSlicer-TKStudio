@@ -712,6 +712,36 @@ public:
     //return the slice result
     GCodeProcessorResult* get_slice_result() { return m_gcode_result; }
 
+    // Slice-all memory: the per-move preview payload is derived data, re-readable from the plate's
+    // own G-code file, so it does not have to stay resident for every plate of the project at once.
+    // Only the payload is dropped: filename, statistics, filament data and the valid flag stay, so
+    // the plate keeps reporting its slice result to the statistics, the 3MF export and the send path.
+    bool has_slice_payload() const;
+    // Drops the payload of a sliced plate whose G-code file is on disk. Returns false, and does
+    // nothing, when there is nothing to drop or the file it would have to be restored from is gone.
+    bool release_slice_payload();
+    // Brings the payload back from the G-code file through GCodeProcessor::process_file(). Returns
+    // true when the payload is resident afterwards, so callers can fall back to re-slicing.
+    bool restore_slice_payload();
+    // Slice-all memory: gives back everything this plate's slice round still holds after its G-code
+    // has been exported - the preview payload and the print's sliced objects, which is the larger
+    // half. Both are derived from the plate's own G-code file and its model, so neither has to stay
+    // resident for every plate of a project at once. Statistics, the valid flag, the G-code file
+    // name and the config stay, so the 3MF export, the statistics panel and the send path keep
+    // working. Returns false when the payload cannot be read back from the G-code file: nothing is
+    // given back then. It also returns false when the print refuses to let go of its objects because
+    // one of its steps is still running - the preview payload has already been given back at that
+    // point, and restore_slice_payload() reads it back, so the plate is left released but
+    // restorable, not changed. The caller must have stopped the background processing that owns
+    // this plate's print (Print::release_slicing_state() checks that and refuses otherwise).
+    bool release_finished_slice_resources();
+    // The statistics document of this plate's G-code, or an empty string when there is none to be
+    // had. Served from the cache the export filled, summed from the moves when they are still
+    // resident, and read back from the plate's own G-code file when both are gone - a project opened
+    // from a sliced 3MF has only the file. That last source is cached on the slice result, so the
+    // next export of the same project does not parse the file again.
+    std::string slice_statistics_json();
+
     std::string           get_tmp_gcode_path();
     std::string           get_temp_config_3mf_path();
     //this API should only be used for command line usage
@@ -950,6 +980,13 @@ public:
 
     //destroy print which has the index of print_index
     int destroy_print(int print_index);
+    // Slice all: give back every finished plate's slice resources except `keep_plate_index`, which
+    // is the plate the preview shows and therefore has to keep its payload and its sliced objects.
+    // Pass -1 to keep none (no caller does that today: the command line releases plate by plate
+    // through PartPlate::release_finished_slice_resources() as it exports each one, and the GUI
+    // goes through this list so that it cannot release the plate under the preview).
+    // Returns the number of plates released.
+    int release_finished_plate_resources(int keep_plate_index);
 
     //delete a plate by index
     int delete_plate(int index);
@@ -1131,7 +1168,7 @@ public:
     /* load/store releted functions, with_gcode = true and plate_idx = -1, export all gcode
     * if with_gcode = true and specify plate_idx, export plate_idx gcode only
     */
-    int store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool with_slice_info = true, int plate_idx = -1, bool with_statistics = false);
+    int store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool with_slice_info = true, int plate_idx = -1, bool with_statistics = false, bool statistics_required = false);
     int load_from_3mf_structure(PlateDataPtrs& plate_data_list, int filament_count = 1);
     //load gcode files
     int load_gcode_files();

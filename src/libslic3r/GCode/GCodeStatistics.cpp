@@ -18,6 +18,7 @@
 #include <map>
 #include <math.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Slic3r {
@@ -68,6 +69,12 @@ json features_json(const std::map<ExtrusionRole, Usage> &features)
 
 std::string gcode_statistics_json(const GCodeProcessorResult &result)
 {
+    // Served from the cache the export filled while the moves were still there: the per-layer
+    // document is summed from them, and a plate that released its preview payload to keep a
+    // slice-all run's footprint flat has none left to sum.
+    if (!result.statistics_json.empty())
+        return result.statistics_json;
+
     constexpr size_t normal = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal);
 
     struct Layer
@@ -180,6 +187,64 @@ std::string gcode_statistics_json(const GCodeProcessorResult &result)
                            { "layers", layers_json },
                            { "objects", objects_json } };
     return out.dump(2);
+}
+
+bool statistics_json_has_data(const std::string &statistics_json)
+{
+    if (statistics_json.empty())
+        return false;
+    // Written by this application, so an unparseable document means a damaged one - not statistics
+    // a caller can rely on.
+    const json document = json::parse(statistics_json, nullptr, /* allow_exceptions */ false);
+    if (document.is_discarded() || !document.is_object())
+        return false;
+    // Summed from a G-code that never moved, the document is well formed and reports nothing: no
+    // time, no material. The processor's move list cannot tell the two apart - a parse always comes
+    // back with its dummy first move (GCodeProcessor::initialize_result_moves()) - so the document
+    // is what is checked, for the one read out of a project as well as for the one summed here.
+    const auto summary = document.find("summary");
+    if (summary == document.end() || !summary->is_object())
+        return false;
+    // A plate that printed has layers, and the per-layer array is what the writer here stores and
+    // what survives the 3MF round trip. Numbers without a layer behind them do not describe a plate,
+    // whatever they say - a result that never sliced reports them out of an uninitialised mode
+    // (PrintEstimatedStatistics::reset()).
+    const auto layers = document.find("layers");
+    if (layers == document.end() || !layers->is_array() || layers->empty())
+        return false;
+    const auto reports_something = [&summary](const char *key) {
+        const auto value = summary->find(key);
+        return value != summary->end() && value->is_number() && value->get<double>() > 0.;
+    };
+    return reports_something("time") || reports_something("volume");
+}
+
+void GCodeProcessorResult::cache_statistics_json()
+{
+    // Under the result's lock, like the other writers of this field - reset() and
+    // release_preview_payload() - because the export thread that calls this can be running beside a
+    // reader of the document.
+    lock();
+    // Cleared first: gcode_statistics_json() serves a filled cache, and this call is the one that
+    // has to compute it (the post-processing scripts may have rewritten the file the moves came
+    // from).
+    statistics_json.clear();
+    if (!moves.empty()) {
+        std::string document = gcode_statistics_json(*this);
+        // A result that never moved sums to a document with no statistics in it, and keeping that
+        // would make the cache look filled while there is nothing in it; see
+        // statistics_json_has_data().
+        if (statistics_json_has_data(document))
+            statistics_json = std::move(document);
+    }
+    unlock();
+}
+
+bool has_gcode_statistics(const GCodeProcessorResult &result)
+{
+    // statistics_json is either empty or a document with statistics in it: cache_statistics_json()
+    // does not keep the empty one, and the project loader validates the one it reads back.
+    return !result.statistics_json.empty() || !result.moves.empty();
 }
 
 std::string gcode_statistics_path(const std::string &gcode_path)

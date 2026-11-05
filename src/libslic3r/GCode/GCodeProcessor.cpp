@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/constants.hpp>
@@ -35,6 +36,9 @@
 #include <boost/nowide/fstream.hpp>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/filesystem/path.hpp>
+// preview_payload_restorable() probes the result's G-code file without throwing.
+#include <boost/filesystem/operations.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -264,7 +268,7 @@ const std::string GCodeProcessor::Toolchange_Wipe_Tag          = " CP_TOOLCHANGE
 const float GCodeProcessor::Wipe_Width = 0.05f;
 const float GCodeProcessor::Wipe_Height = 0.05f;
 
-bool GCodeProcessor::s_IsBBLPrinter = true;
+std::atomic<bool> GCodeProcessor::s_IsBBLPrinter = true;
 
 static void set_option_value(ConfigOptionFloats& option, size_t id, float value)
 {
@@ -2797,6 +2801,12 @@ void GCodeProcessorResult::reset() {
     //BBS: add mutex for protection of gcode result
     lock();
 
+    // A new round starts here: whatever file `filename` still names belongs to an earlier round,
+    // so the payload must not be treated as restorable from it.
+    export_completed = false;
+    // And its statistics describe that earlier round's moves, which are dropped just below.
+    statistics_json.clear();
+
     // moves and lines_ends grow with the print: free them, as no reset result reuses the capacity.
     clear_and_shrink(moves);
     plate_mass = {};
@@ -2860,6 +2870,30 @@ void GCodeProcessorResult::reset() {
     unlock();
     //BBS: add logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: this=%2% reset finished")%__LINE__%this;
+}
+
+void GCodeProcessorResult::release_preview_payload()
+{
+    lock();
+    // clear_and_shrink, not clear, so the memory goes back to the heap: that is the whole point of
+    // releasing it, and nothing grows these arrays again but a fresh process_file().
+    clear_and_shrink(moves);
+    clear_and_shrink(lines_ends);
+    unlock();
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: this=%2% preview payload released") % __LINE__ % this;
+}
+
+bool GCodeProcessorResult::preview_payload_restorable() const
+{
+    if (!export_completed || filename.empty())
+        return false;
+    // exists() with an error_code: the probe must not throw where the payload is released or read
+    // back on the UI thread. A vanished network share or an unmounted device is "not readable",
+    // not an exception.
+    boost::system::error_code ec;
+    const boost::filesystem::path path(filename);
+    const bool                   found = boost::filesystem::is_regular_file(path, ec);
+    return !ec && found;
 }
 
 const std::vector<std::pair<GCodeProcessor::EProducer, std::string>> GCodeProcessor::Producers = {
@@ -3980,7 +4014,7 @@ DynamicConfig GCodeProcessor::export_config_for_render() const
 
 // Load a G-code into a stand-alone G-code viewer.
 // throws CanceledException through print->throw_if_canceled() (sent by the caller as callback).
-void GCodeProcessor::process_file(const std::string& filename, std::function<void()> cancel_callback)
+bool GCodeProcessor::process_file(const std::string& filename, std::function<void()> cancel_callback)
 {
     CNumericLocalesSetter locales_setter;
 
@@ -4042,9 +4076,13 @@ void GCodeProcessor::process_file(const std::string& filename, std::function<voi
     m_result.id = ++s_result_id;
     initialize_result_moves();
     size_t parse_line_callback_cntr = 10000;
-    m_parser.parse_file(filename, [this, cancel_callback, &parse_line_callback_cntr](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
+    // GCodeReader reports a file it cannot open, or one whose read fails, as false - and it does so
+    // without calling the callback, so the dummy move seeded above is all this result gets. That
+    // failure is kept and handed back: the move list cannot carry it, because the dummy move makes
+    // every result at least one move long whether the file was readable or not.
+    const bool read_ok = m_parser.parse_file(filename, [this, cancel_callback, &parse_line_callback_cntr](GCodeReader& reader, const GCodeReader::GCodeLine& line) {
         if (-- parse_line_callback_cntr == 0) {
-            // Don't call the cancel_callback() too often, do it every at every 10000'th line.
+            // Don't call the cancel_callback() too often, do it at every 10000'th line.
             parse_line_callback_cntr = 10000;
             if (cancel_callback)
                 cancel_callback();
@@ -4052,8 +4090,14 @@ void GCodeProcessor::process_file(const std::string& filename, std::function<voi
         this->process_gcode_line(line, true);
     }, m_result.lines_ends);
 
+    // Nothing was read, so there is nothing to finalize either: no times to sum and no statistics
+    // to document. The steps below would only put a slice's numbers on a file that has no slice.
+    if (! read_ok)
+        return false;
+
     // Don't post-process the G-code to update time stamps.
     this->finalize(false);
+    return true;
 }
 
 void GCodeProcessor::initialize(const std::string& filename)
@@ -5419,6 +5463,18 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
     EMoveType type = move_type(delta_pos);
     const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
+
+    // Arc fitting can leave a top-level G1 extrusion whose XY displacement is below EPSILON while
+    // its E is still positive. The extruded volume is then divided by a path the head never
+    // travelled, which reports a bead cross section of tens of mm2 for a move no nozzle made.
+    // This is the same analytic case as the "no displacement, return" test above, so it takes the
+    // same way out: no vertex, no time block, nothing to divide. It is deliberately not a Flow
+    // threshold - the value of m_mm3_per_mm plays no part here - and the origin gate keeps the
+    // G2/G3 discretization segments, which may be shorter than EPSILON by construction, on their
+    // existing path.
+    if (type == EMoveType::Extrude && origin == G1DiscretizationOrigin::G1 && delta_xyz < float(EPSILON))
+        return;
+
     m_travel_dist = delta_xyz;
 
     if (!m_processing_homing_move) {
@@ -7706,6 +7762,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         ? m_first_layer_height
         : m_end_position[Z] - m_z_offset;
 
+    // The trailing field is MoveVertex::prepare_stage: the same condition the time blocks are
+    // stamped with, so the preview can leave the start G-code's moves out of the printed layers.
     m_result.moves.push_back({
         m_last_line_id,
         type,
@@ -7734,7 +7792,8 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         std::max<unsigned int>(1, m_layer_id) - 1,
         internal_only,
         m_object_label_id,
-        m_print_z
+        m_print_z,
+        m_processing_start_custom_gcode
     });
 
     if (type == EMoveType::Seam) {
@@ -8289,6 +8348,8 @@ void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_la
         m_actual_speed_id_map.emplace_back(block_id, (unsigned int)write);
         for (; entry > 0 && actual_speed_moves[entry - 1].position.has_value(); --entry) {
             const TimeMachine::ActualSpeedMove& it = actual_speed_moves[entry - 1];
+            // Copied from the block's own move, so the inserted vertex keeps its prepare_stage tag and
+            // a prepare-stage block's split vertices are dropped from the preview along with it.
             GCodeProcessorResult::MoveVertex new_move = block_move;
             new_move.time = { 0.0f, 0.0f };
             new_move.position = *it.position;

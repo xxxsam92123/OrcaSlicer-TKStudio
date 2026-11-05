@@ -351,6 +351,7 @@ static constexpr const char* TRANSFORM_ATTR = "transform";
 static constexpr const char* OFFSET_ATTR = "offset";
 static constexpr const char* PRINTABLE_ATTR = "printable";
 static constexpr const char* AUTO_DROP_ATTR = "auto_drop";
+static constexpr const char* IMPORTED_PARTS_HIDDEN_KEY = "orca:imported_parts_hidden";
 static constexpr const char* INSTANCESCOUNT_ATTR = "instances_count";
 static constexpr const char* CUSTOM_SUPPORTS_ATTR = "paint_supports";
 static constexpr const char* CUSTOM_FUZZY_SKIN_ATTR  = "paint_fuzzy_skin";
@@ -1167,6 +1168,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool m_load_model = false;
         bool m_load_aux = false;
         bool m_load_config = false;
+        bool m_keep_original_names = false;
         // backup & restore
         bool m_load_restore = false;
         std::string m_backup_path;
@@ -1220,6 +1222,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         // are built only after the whole archive has been walked, so by the time a volume names its JSON
         // every file it could refer to is already in here, whatever order the archive happened to be in.
         std::map<std::string, std::string> m_texture_displacement_files;
+        // The per-plate statistics documents the archive carries, keyed by the 1-based plate number
+        // their name ends with (Metadata/plate_<N>.statistics.json, as the writer here stores
+        // them). Filled while the archive is walked, handed to the plates afterwards; a plate whose
+        // entry is absent simply has none, and its G-code is summed instead.
+        std::map<int, std::string> m_plate_statistics;
+        void _extract_plate_statistics_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat);
         void _apply_texture_displacement(ModelVolume &volume, const std::string &json_path);
         std::string m_curr_metadata_name;
         std::string m_curr_characters;
@@ -1492,6 +1500,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         m_load_aux = strategy & LoadStrategy::LoadAuxiliary;
         m_load_restore = strategy & LoadStrategy::Restore;
         m_load_config = strategy & LoadStrategy::LoadConfig;
+        // Project part metadata remains authoritative; the opt-in only fills missing CAD labels.
+        m_keep_original_names = (strategy & LoadStrategy::KeepOriginalNames) && !m_load_config;
         m_model = &model;
         m_unit_factor = 1.0f;
         m_curr_object = nullptr;
@@ -1513,6 +1523,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         m_curr_characters.clear();
         //BBS: plater data init
         m_plater_data.clear();
+        m_plate_statistics.clear();
         m_curr_instance.object_id = -1;
         m_curr_instance.instance_id = -1;
         m_curr_instance.identify_id = 0;
@@ -1704,6 +1715,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 else if (boost::algorithm::iequals(name, FILAMENT_SEQUENCE_FILE)) {
                     _extract_filament_sequence_from_archive(archive, stat);
                 }
+                else if (boost::algorithm::istarts_with(name, METADATA_DIR) && boost::algorithm::iends_with(name, ".statistics.json")) {
+                    // Same as in the project loader: a sliced .gcode.3mf carries the statistics of
+                    // its plates beside their G-code, and reading them here is what keeps a later
+                    // export from parsing that G-code again.
+                    _extract_plate_statistics_from_archive(archive, stat);
+                }
             }
         }
 
@@ -1755,6 +1772,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             plate->pick_file = it->second->pick_file;
             plate->pattern_bbox_file = it->second->pattern_bbox_file;
             plate->config = it->second->config;
+            if (const auto statistics = m_plate_statistics.find(it->first); statistics != m_plate_statistics.end())
+                plate->statistics = statistics->second;
 
             if (!plate->thumbnail_file.empty())
                 _extract_from_archive(archive, plate->thumbnail_file, [&pixels = plate_data_list[it->first - 1]->plate_thumbnail.pixels](auto &archive, auto const &stat) -> bool {
@@ -2121,6 +2140,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     //load gcode files
                     _extract_file_from_archive(archive, stat);
                 }
+                // Before the ".json" branch below, which would take these for calibration data: the
+                // statistics of a plate are read into the plate instead of to a file, because that
+                // is what makes an export of this project skip summing them from the G-code again.
+                else if (!dont_load_config && boost::algorithm::istarts_with(name, METADATA_DIR) && boost::algorithm::iends_with(name, ".statistics.json")) {
+                    _extract_plate_statistics_from_archive(archive, stat);
+                }
                 else if (!dont_load_config && boost::algorithm::istarts_with(name, METADATA_DIR) && boost::algorithm::iends_with(name, THUMBNAIL_EXTENSION)) {
                     //BBS parsing pattern thumbnail and plate thumbnails
                     _extract_file_from_archive(archive, stat);
@@ -2259,6 +2284,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
             ObjectMetadata::VolumeMetadataList volumes;
             ObjectMetadata::VolumeMetadataList* volumes_ptr = nullptr;
+            bool imported_parts_hidden = false;
 
             // 2.4.x stored auto_drop on build items, shared by all instances of an object; any "off" wins
             const bool legacy_auto_drop = !m_items_auto_drop_off.count(object.first.second);
@@ -2273,6 +2299,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 for (const Metadata& metadata : obj_metadata->second.metadata) {
                     if (metadata.key == "name")
                         model_object->name = metadata.value;
+                    // This is model presentation state, never a print configuration option.
+                    else if (metadata.key == IMPORTED_PARTS_HIDDEN_KEY)
+                        imported_parts_hidden = metadata.value == "1";
                     //BBS: add module name
                     else if (metadata.key == "module")
                         model_object->module_name = metadata.value;
@@ -2316,6 +2345,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
             if (!_generate_volumes_new(*model_object, object_id_list, *volumes_ptr, config_substitutions))
                 return false;
+            // add_volume reveals edited objects, so restore persisted presentation after creation.
+            model_object->imported_parts_hidden = imported_parts_hidden;
 
             // Apply cut information for object if any was loaded
             // m_cut_object_ids are indexed by a 1 based model object index.
@@ -2456,6 +2487,11 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             plate_data_list[it->first-1]->pick_file = (m_load_restore || it->second->pick_file.empty()) ? it->second->pick_file : m_backup_path + "/" + it->second->pick_file;
             plate_data_list[it->first-1]->pattern_bbox_file = (m_load_restore || it->second->pattern_bbox_file.empty()) ? it->second->pattern_bbox_file : m_backup_path + "/" + it->second->pattern_bbox_file;
             plate_data_list[it->first-1]->config = it->second->config;
+            // The document the archive carried for this plate, if it carried one. Read, not summed:
+            // a project saved with statistics has them here at ~1 MB per plate against the 100+ MB
+            // of G-code a plate would otherwise have to be parsed for.
+            if (const auto statistics = m_plate_statistics.find(it->first); statistics != m_plate_statistics.end())
+                plate_data_list[it->first-1]->statistics = statistics->second;
 
             current_plate_data = plate_data_list[it->first - 1];
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", plate %1%, thumbnail_file=%2%, no_light_thumbnail_file=%3%")%it->first %plate_data_list[it->first-1]->thumbnail_file %plate_data_list[it->first-1]->no_light_thumbnail_file;
@@ -2986,6 +3022,37 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             }
         }
         return;
+    }
+
+    void _BBS_3MF_Importer::_extract_plate_statistics_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat)
+    {
+        // Metadata/plate_<N>.statistics.json -> N. Only the file name is looked at: the writer here
+        // puts them under Metadata/, and a project from elsewhere may nest them differently.
+        static const std::string prefix = "plate_";
+        static const std::string suffix = ".statistics.json";
+        const std::string        name   = decode_path(stat.m_filename);
+        const size_t             slash  = name.find_last_of("/\\");
+        const std::string        base   = slash == std::string::npos ? name : name.substr(slash + 1);
+        int                      plate_number = 0;
+        if (base.size() > prefix.size() + suffix.size() && boost::algorithm::istarts_with(base, prefix) &&
+            boost::algorithm::iends_with(base, suffix)) {
+            const std::string digits = base.substr(prefix.size(), base.size() - prefix.size() - suffix.size());
+            if (std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                plate_number = std::atoi(digits.c_str());
+        }
+        if (plate_number <= 0) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", %1% does not name a plate, skipped") % stat.m_filename;
+            return;
+        }
+        std::string buffer((size_t) stat.m_uncomp_size, 0);
+        if (buffer.empty() ||
+            !mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, buffer.data(), buffer.size(), 0)) {
+            // Auxiliary data: a plate whose document cannot be read keeps none, is summed from its
+            // G-code instead, and fails the export only where the statistics were required.
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", cannot read the statistics of plate %1% from %2%") % plate_number % stat.m_filename;
+            return;
+        }
+        m_plate_statistics[plate_number] = std::move(buffer);
     }
 
     void _BBS_3MF_Importer::_extract_layer_heights_profile_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat)
@@ -4861,7 +4928,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::istringstream(used_for_object) >> std::boolalpha >> filament_info.used_for_object;
             std::istringstream(used_for_support) >> std::boolalpha >> filament_info.used_for_support;
             filament_info.group_id = parse_int_list(group_id);
-            filament_info.nozzle_diameter = atof(nozzle_diameter.c_str());
+            filament_info.nozzle_diameter = string_to_double_decimal_point(nozzle_diameter);
             filament_info.nozzle_volume_type = volume_type;
             m_curr_plater->slice_filaments_info.push_back(filament_info);
         }
@@ -5476,6 +5543,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             }
 
             // this may happen for 3mf saved by 3rd part softwares
+            if (volume->name.empty() && m_keep_original_names)
+                volume->name = sub_object->name;
             if (volume->name.empty()) {
                 volume->name = object.name;
                 if (renamed_volumes_count > 0)
@@ -8321,6 +8390,9 @@ bool _BBS_3MF_Exporter::_add_model_config_file_to_archive(mz_zip_archive& archiv
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"module\" " << VALUE_ATTR << "=\"" << xml_escape(obj->module_name) << "\"/>\n";
 
                 // stores object's config data
+                if (obj->imported_parts_hidden)
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << IMPORTED_PARTS_HIDDEN_KEY
+                           << "\" " << VALUE_ATTR << "=\"1\"/>\n";
                 for (const std::string& key : obj->config.keys()) {
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << key << "\" " << VALUE_ATTR << "=\"" << obj->config.opt_serialize(key) << "\"/>\n";
                 }

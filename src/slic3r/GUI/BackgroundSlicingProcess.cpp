@@ -3,6 +3,7 @@
 #include "GUI.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
+#include <atomic>
 
 #include <cstddef>
 #include <exception>
@@ -15,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <new>
+#include <typeinfo>
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Zipper.hpp"
@@ -83,15 +85,18 @@ bool SlicingProcessCompletedEvent::critical_error() const
 
 bool SlicingProcessCompletedEvent::invalidate_plater() const
 {
-    if (critical_error()) {
-        try {
-            this->rethrow_exception();
-        } catch (const Slic3r::ExportError&) {
-            // Exception thrown by copying file does not ivalidate plater
-            return false;
-        } catch (...) {}
+    return error() && critical_error() && !export_failed();
+}
+
+bool SlicingProcessCompletedEvent::export_failed() const
+{
+    if (!error())
+        return false;
+    try {
+        this->rethrow_exception();
+    } catch (const Slic3r::ExportError&) {
         return true;
-    }
+    } catch (...) {}
     return false;
 }
 
@@ -223,7 +228,15 @@ void BackgroundSlicingProcess::process_fff()
     PresetBundle& preset_bundle   = *GUI::wxGetApp().preset_bundle;
     m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
     // BBS: add the logic to process from an existed gcode file
-    if (m_print->finished()) {
+    // The export step being done is not enough: for a plate whose slicing state was released, apply()
+    // restores that step as "the rebuild was the release coming back" (PrintApply.cpp), which is only
+    // true while the plate's G-code file is still there to be read. When it is not - the file is a
+    // temp file, and a temp cleanup, an unmounted volume or another instance's cleanup can take it
+    // away between the release and this click - re-reading it is not a restore, and the plate has to
+    // be sliced for real instead. Ask both halves here (Print::can_process_previous_gcode_file) so
+    // that no path below can reach the re-read with nothing to read.
+    if (m_fff_print->can_process_previous_gcode_file(m_gcode_result)) {
+        m_stage = "export_from_previous_file";
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file") % __LINE__;
         m_fff_print->set_status(80, _utf8(L("Processing G-code from previous file\u2026" /* \u2026 -> ... */)));
         wxCommandEvent evt(m_event_slicing_completed_id);
@@ -242,12 +255,29 @@ void BackgroundSlicingProcess::process_fff()
                 m_fff_print->export_gcode_from_previous_file(m_temp_output_path, m_gcode_result, [this](const ThumbnailsParams& params) {
                     return this->render_thumbnails(params);
                 });
+                // The payload of this result was just re-read from that file: the file is what this
+                // round's result describes, so it is a source the payload may be dropped against and
+                // restored from later. export_gcode_from_previous_file() throws when it cannot
+                // process the file, and then nothing is marked.
+                m_gcode_result->mark_export_completed();
             }
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__
                                     << boost::format(" %1%: export_gcode_from_previous_file from %2% finished") % __LINE__ %
                                            m_temp_output_path;
         }
     } else {
+        if (m_print->finished()) {
+            // The export step was done, but the file it claims is not readable, so this round is not
+            // a re-read of anything. The step is not invalidated here: the print's cancel callback is
+            // what PrintBase::invalidate_step() fires, and on this thread that callback is
+            // BackgroundSlicingProcess::stop_internal() - the worker cannot cancel itself. What keeps
+            // the stale claim harmless is the result below: reset() drops the moves and the
+            // export-completed mark, so nothing downstream can take this result for a restorable
+            // export until the new export_gcode() marks it done again.
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+                                    << boost::format(" %1%: the previous gcode file of this plate is not readable (result %2%, file %3%), slicing again") % __LINE__
+                                           % m_gcode_result % (m_gcode_result != nullptr ? m_gcode_result->filename : std::string());
+        }
         // BBS: reset the gcode before reload_print in slicing_completed event processing
         // FIX the gcode rename failed issue
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__
@@ -255,6 +285,7 @@ void BackgroundSlicingProcess::process_fff()
         m_gcode_result->reset();
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: gcode_result reseted, will start print::process") % __LINE__;
+        m_stage = "print_process";
         m_print->process();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__
                                 << boost::format(" %1%: after print::process, send slicing complete event to gui...") % __LINE__;
@@ -283,26 +314,41 @@ void BackgroundSlicingProcess::process_fff()
 
         // BBS: add plate index into render params
         m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
+        m_stage = "export_gcode";
         m_fff_print->export_gcode(m_temp_output_path, m_gcode_result,
                                   [this](const ThumbnailsParams& params) { return this->render_thumbnails(params); });
         // Orca: BBL printers post-process the g-code in place here, in the file the G-code viewer maps, so
         // the preview re-reads its moves and line offsets from the edited file. The rest of m_gcode_result,
         // including nozzle_group_result (consumed by the H2C print-dispatch nozzle mapping), is kept.
         if (m_fff_print->is_BBL_printer()) {
-            if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config()))
-                m_fff_print->reload_gcode_moves(m_gcode_result);
+            m_stage = "post_process_gcode";
+            try {
+                if (run_post_process_scripts(m_temp_output_path, false, "File", m_temp_output_path, m_fff_print->full_print_config())) {
+                    m_fff_print->reload_gcode_moves(m_gcode_result);
+                    // The post-processing scripts may have changed the file the export cached the
+                    // statistics of, so the document is summed again from the moves as they are now.
+                    m_gcode_result->cache_statistics_json();
+                }
+            } catch (...) {
+                // A failed script or plugin may have left the G-code half edited, so the next run exports
+                // it again instead of reusing it.
+                m_fff_print->invalidate_gcode_export_from_worker();
+                throw;
+            }
         }
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": export gcode finished");
     }
     if (this->set_step_started(bspsGCodeFinalize)) {
         if (!m_export_path.empty()) {
+            m_stage = "finalize_gcode";
             wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new wxCommandEvent(m_event_export_began_id));
             if (!m_fff_print->is_BBL_printer())
                 finalize_gcode();
             else
                 export_gcode();
         } else if (!m_upload_job.empty()) {
+            m_stage = "prepare_upload";
             wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new wxCommandEvent(m_event_export_began_id));
             prepare_upload();
         } else {
@@ -327,6 +373,7 @@ static void write_thumbnail(Zipper& zipper, const ThumbnailData& data)
 void BackgroundSlicingProcess::process_sla()
 {
     assert(m_print == m_sla_print);
+    m_stage = "sla_process";
     m_print->process();
     if (this->set_step_started(bspsGCodeFinalize)) {
         if (!m_export_path.empty()) {
@@ -382,6 +429,7 @@ void BackgroundSlicingProcess::thread_proc()
         m_state = STATE_RUNNING;
         // BBS: internal cancel
         m_internal_cancelled = false;
+        m_last_process_error_bad_alloc.store(false, std::memory_order_relaxed);
         lck.unlock();
         std::exception_ptr exception;
 #ifdef _WIN32
@@ -389,7 +437,17 @@ void BackgroundSlicingProcess::thread_proc()
 #else
         this->call_process(exception);
 #endif
-        m_print->finalize();
+        m_stage = "finalize";
+        try {
+            m_print->finalize();
+        } catch (const std::bad_alloc&) {
+            // Same signal as call_process(): an allocation failure that happens while the print
+            // is finalized is still an allocation failure, and the caller ends the batch on it.
+            m_last_process_error_bad_alloc.store(true, std::memory_order_relaxed);
+            exception = std::current_exception();
+        } catch (...) {
+            exception = std::current_exception();
+        }
         lck.lock();
         m_state = m_print->canceled() ? STATE_CANCELED : STATE_FINISHED;
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
@@ -485,6 +543,7 @@ void BackgroundSlicingProcess::call_process_seh_throw(std::exception_ptr& ex) th
 
 void BackgroundSlicingProcess::call_process(std::exception_ptr& ex) throw()
 {
+    m_stage = "call_process";
     try {
         assert(m_print != nullptr);
         switch (m_print->technology()) {
@@ -497,10 +556,33 @@ void BackgroundSlicingProcess::call_process(std::exception_ptr& ex) throw()
         assert(m_print->canceled());
         ex = std::current_exception();
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":got cancelled exception" << std::endl;
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
+        // An exhausted address space: name it, so the log tells it apart from an algorithmic failure,
+        // and lets the caller end the batch instead of carrying on over a half-freed context.
         ex = std::current_exception();
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":got other exception" << std::endl;
+        // Read on the UI thread in Plater::priv::on_process_completed() to stop a slice-all run.
+        // thread_proc() clears it at the start of every task, so this only ever describes the task
+        // that just ended.
+        m_last_process_error_bad_alloc.store(true, std::memory_order_relaxed);
+        // Do not format or stream an exception message here: this handler runs exactly
+        // when another allocation may terminate the process. The atomic is consumed by
+        // the UI completion path, which is the only required recovery signal.
+    } catch (const std::exception& e) {
+        ex = std::current_exception();
+        this->log_process_exception(typeid(e).name(), e.what());
+    } catch (...) {
+        // A throw of something that is not a std::exception (Slic3r::HardCrash derives from it, the
+        // SEH wrappers rethrow it) has no type or message to report beyond this.
+        ex = std::current_exception();
+        this->log_process_exception("unknown", "");
     }
+}
+
+void BackgroundSlicingProcess::log_process_exception(const char *type, const char *what) const
+{
+    const int plate = m_current_plate != nullptr ? m_current_plate->get_index() : -1;
+    BOOST_LOG_TRIVIAL(error) << (boost::format("slice_exception plate=%1% stage=%2% type=%3% what=%4%")
+                                % plate % m_stage % type % what).str();
 }
 
 #ifdef _WIN32
@@ -807,6 +889,10 @@ void BackgroundSlicingProcess::reset_export()
     if (!this->running()) {
         m_export_path.clear();
         m_export_path_on_removable_media = false;
+        // A scheduled upload only leaves m_upload_job when prepare_upload() hands it to the print host
+        // job queue. If the run ended before that (a post-processing script or plugin failure, or a
+        // cancel), the job must not survive into the next plain slice, which would upload again.
+        m_upload_job = PrintHostJob();
         // invalidate_step expects the mutex to be locked.
         std::scoped_lock<std::mutex> lock(m_print->state_mutex());
         this->invalidate_step(bspsGCodeFinalize);
@@ -987,7 +1073,7 @@ void BackgroundSlicingProcess::prepare_upload()
             m_print->set_status(95, _utf8(L("Running post-processing scripts")));
             std::string error_message;
             if (copy_file(m_temp_output_path, source_path.string(), error_message) != SUCCESS)
-                throw Slic3r::RuntimeError(_utf8(L("Copying of the temporary G-code to the output G-code failed.")));
+                throw Slic3r::ExportError(_utf8(L("Copying of the temporary G-code to the output G-code failed.")));
             m_upload_job.upload_data.upload_path = m_fff_print->print_statistics().finalize_output_path(
                 m_upload_job.upload_data.upload_path.string());
             // Orca: skip post-processing scripts for BBL printers as we have run them already in finalize_gcode()

@@ -2,6 +2,7 @@
 #define slic3r_GUI_BackgroundSlicingProcess_hpp_
 
 #include <exception>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include "libslic3r/Config.hpp"
@@ -67,8 +68,12 @@ public:
 	bool		error() 	const { return m_status == Error; }
 	// Unhandled error produced by stdlib or a Win32 structured exception, or unhandled Slic3r's own critical exception.
 	bool 		critical_error() const;
-	// Critical errors does invalidate plater except CopyFileError.
+	// A critical error that leaves the sliced data unusable. A failed export (export_failed()) is critical too,
+	// but leaves the sliced data usable.
 	bool        invalidate_plater() const;
+	// Exporting or uploading the G-code failed (a copy, a post-processing script or plugin: an ExportError);
+	// the slice itself is intact.
+	bool        export_failed() const;
 	// Only valid if error()
 	void 		rethrow_exception() const { assert(this->error()); assert(m_exception); std::rethrow_exception(m_exception); }
 	// Produce a human readable message to be displayed by a notification or a message box.
@@ -108,6 +113,9 @@ public:
 	void set_current_plate(GUI::PartPlate* plate) { m_current_plate = plate; }
 	GUI::PartPlate* get_current_plate() { return m_current_plate; }
 	GCodeProcessorResult* get_current_gcode_result() { return m_gcode_result;}
+	// Whether the last background task ended by failing to allocate. An exhausted address space has
+	// to end a batch of plates: the state it leaves behind is not worth continuing from.
+	bool last_process_error_was_bad_alloc() const { return m_last_process_error_bad_alloc.load(std::memory_order_relaxed); }
 
 	// The following wxCommandEvent will be sent to the UI thread / Plater window, when the slicing is finished
 	// and the background processing will transition into G-code export.
@@ -166,7 +174,7 @@ public:
 	// Set print host upload job data to be enqueued to the PrintHostJobQueue
 	// after current print slicing is complete
 	void schedule_upload(Slic3r::PrintHostJob upload_job);
-	// Clear m_export_path.
+	// Clear m_export_path and drop a scheduled upload that was not handed to the print host job queue.
 	void reset_export();
 	// Once the G-code export is scheduled, the apply() methods will do nothing.
 	bool is_export_scheduled() const { return ! m_export_path.empty(); }
@@ -292,6 +300,13 @@ private:
 	GUI::PartPlate* m_current_plate;
 	PrinterTechnology m_printer_tech = ptUnknown;
 	bool m_internal_cancelled = false;
+	// Stage of the background task the worker thread is in, for the exception log line: the plate and
+	// the stage say which allocation failed, which a generic "got other exception" cannot.
+	const char *m_stage = "idle";
+	// Set when the last background task failed with std::bad_alloc. Read on the UI thread.
+	std::atomic<bool> m_last_process_error_bad_alloc{ false };
+	// Logs one machine-readable line for a failed background task.
+	void log_process_exception(const char *type, const char *what) const;
 
     PrintState<BackgroundSlicingProcessStep, bspsCount>   	m_step_state;
 	bool                set_step_started(BackgroundSlicingProcessStep step);
