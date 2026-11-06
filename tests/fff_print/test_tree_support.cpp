@@ -20,12 +20,16 @@
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Flow.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/Polyline.hpp"
 #include "libslic3r/Support/TreeSupport3D.hpp"
 #include "libslic3r/Support/TreeSupportContact.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Support/TreeSupportCommon.hpp"
 #include "libslic3r/Support/SupportParameters.hpp"
+#include "libslic3r/Support/SupportLayer.hpp"
+#include "libslic3r/Support/SupportCommon.hpp"
 
 #include <algorithm>
 #include <cmath>
