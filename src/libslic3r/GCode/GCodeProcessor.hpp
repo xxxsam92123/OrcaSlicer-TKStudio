@@ -1827,7 +1827,11 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             // as move 0) without keeping the vertex, so `move_id` means the same thing in both modes.
             // The pre-heat setting is not known yet at this point - apply_config() comes later - so
             // a pass that turns out to need the payload seeds the dummy lazily in store_move_vertex().
-            if (m_preview_payload_wanted)
+            // A caller may also have configured the processor before this call, and process_file()
+            // is reached that way: apply_config() seeds the dummy itself when it has to overrule the
+            // caller's skip request, and a second one here would leave a vertex-less move at index
+            // 1, pushing the start G-code's prepare stage off the head of the move list.
+            if (m_preview_payload_wanted && m_result.moves.empty())
                 m_result.moves.emplace_back(GCodeProcessorResult::MoveVertex());
             m_move_count = 1;
         }

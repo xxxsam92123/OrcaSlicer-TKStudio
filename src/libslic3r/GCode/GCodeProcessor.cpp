@@ -4192,6 +4192,10 @@ bool GCodeProcessor::process_file(const std::string& filename, std::function<voi
     // (Print::reload_gcode_moves()) and the one that sums statistics out of a file, and both need
     // the moves themselves. A batch export that skips the payload never comes through here.
     m_preview_payload_wanted = true;
+    // Forcing the payload overrules a caller that asked to skip it, so the record of that
+    // decision has to follow: the reservation below and the readers of the flag (PartPlate,
+    // GCode.cpp) test it, and a stale true would report a payload this pass does store as dropped.
+    m_result.preview_payload_skipped = false;
     initialize_result_moves();
     // The file being read is the only size hint available before the moves are built, so reserve
     // the payload from it: a std::vector that reaches its capacity while it already holds gigabytes
