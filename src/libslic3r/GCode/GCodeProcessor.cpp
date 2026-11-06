@@ -2893,8 +2893,11 @@ void GCodeProcessorResult::ensure_move_capacity(size_t needed)
 {
     if (needed <= moves.capacity())
         return;
-    // Half a step, not a doubling: the payload of a large plate is measured in gigabytes and the
-    // reallocation holds both blocks at once, so this keeps the overlap at 1.5x instead of 2x.
+    // Half a step rather than a doubling. Both hold the old and the new block while the copy runs,
+    // and both are quoted against the old block C: a doubling needs C + 2C = 3C at that moment, a
+    // half step C + 1.5C = 2.5C. The new block itself is 25% smaller (1.5C instead of 2C), which is
+    // the point - less address space and commit for the rest of the pass; the price is more copying
+    // over the whole run (about 3F against 2F for a payload that ends at F).
     const size_t grown = moves.capacity() + moves.capacity() / 2;
     const size_t wanted = std::max(needed, grown);
     BOOST_LOG_TRIVIAL(warning) << boost::format("preview move payload outgrew its reservation (%1% reserved), "
@@ -4108,8 +4111,11 @@ bool GCodeProcessor::process_file(const std::string& filename, std::function<voi
     // The file being read is the only size hint available before the moves are built, so reserve
     // the payload from it: a std::vector that reaches its capacity while it already holds gigabytes
     // keeps the old and the new block alive at once, which is what a large plate runs out of commit
-    // charge on. The divisors are deliberate under-estimates of bytes per line / per move, and the
-    // callback below re-reserves from the ratio the parse actually observes.
+    // charge on. The two divisors are not symmetric and neither one is a real ratio: this project's
+    // G-code measures 37.7 bytes per line, so /24 (lines_ends) is a 1.57x over-estimate, capped at
+    // 32M entries = 256 MiB of commit, while /32 (moves) is a 1/6 under-estimate on an arc-heavy
+    // file and a 1.18x over-estimate on a file the writer fitted no arcs into. Only the callback
+    // below tracks the bytes-per-move the parse actually observes; these two are a starting point.
     size_t file_bytes = 0;
     {
         boost::system::error_code ec;

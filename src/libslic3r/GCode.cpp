@@ -3681,8 +3681,27 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         // fitting (the figure counts travels, retractions and the machine G-code too, as it is total
         // moves over path points), so 2.9 keeps 7% over the worst measurement; 1.25 without arc
         // fitting, where a path point is one move and the quarter covers the moves that carry none.
+        // The 2.9 was calibrated on a plate where arcs are 74% of the motion lines. A plate the
+        // writer fits almost no arcs on turns out ~1.0-1.1 moves per point, so the same 2.9 would
+        // commit 2.6-2.9 times the payload it is there to protect; the cap below is what bounds that.
         const double moves_per_point = arc_fitting ? 2.9 : 1.25;
-        const size_t reserved = size_t(double(estimated_points) * moves_per_point) + 4096;
+        size_t reserved = size_t(double(estimated_points) * moves_per_point) + 4096;
+        // A ceiling on what one plate may pre-commit: half of the physical memory, and never more
+        // than 20 GiB. Half rather than a quarter because the largest plate measured here reserves
+        // 12.9 GB (129.2M moves x 100 B) on a 31.7 GiB machine: a quarter would clip it, and the
+        // clip would come straight back through ensure_move_capacity(), which holds the old and the
+        // new block at once (12.9 + 8.5 GB) and so would peak above the reservation it replaced.
+        // The absolute part is for machines with more memory, where half of it is not a figure a
+        // single plate's payload should hold. A reservation still short after the cap is handled by
+        // that same growth path, one half step and one warning at a time.
+        const size_t bytes_per_move = sizeof(GCodeProcessorResult::MoveVertex);
+        const size_t cap = std::min<size_t>(total_physical_memory() / 2 / bytes_per_move,
+                                            (size_t(20) << 30) / bytes_per_move);
+        if (reserved > cap) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reservation capped to %1% moves (the estimate asked for %2%)")
+                % cap % reserved;
+            reserved = cap;
+        }
         m_processor.reserve_preview_payload(reserved);
         BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reserved %1% moves for %2% extrusion points (arc fitting %3%)")
             % reserved % estimated_points % (arc_fitting ? "on" : "off");
