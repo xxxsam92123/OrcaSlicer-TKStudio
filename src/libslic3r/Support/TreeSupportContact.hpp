@@ -64,10 +64,12 @@ struct OverhangFacetZIndex
  * A layer's slices are taken at its mid-plane, so the material that first appears in layer `layer_idx`
  * starts below that layer, in the slab of the layers underneath: `[bottom_z(layer_idx - 1), z(layer_idx)]`
  * - closed, and with the round-off tolerance of overhang_face_z() - is the window the face is searched in,
- * and it is two layers tall on a uniform grid. The contact then goes on the highest whole layer whose top
- * keeps at least `top_z_distance` of air under that face, so the gap is quantised upwards and never
- * narrower than requested, and no layer height is written: the grid, the object layers,
- * `SupportLayer::height` and the extrusion heights stay the object's own.
+ * and it is two layers tall on a uniform grid. `contact_layer` is the highest whole layer whose top keeps
+ * at least `top_z_distance` of air under that face, and `contact_top_z` is where the support material
+ * may really end: the face minus the requested distance. The two differ by less than one layer height;
+ * the caller adds a support layer of exactly that remainder on top of `contact_layer` (its `height` is
+ * the remainder and its extrusions are built with that height), so the printed air gap is the requested
+ * one rather than the next whole object layer. The object layers, their Zs and heights are untouched.
  *
  * When no facet overlaps the window at all, the gap is measured from the bottom of that same window
  * instead. The face over an overhang area lies above the mid-plane slice of the layer below it - the
@@ -77,18 +79,24 @@ struct OverhangFacetZIndex
  * Also raises the object material start of `layer_idx` to the face, so the clearance of the contact
  * layer below is measured against the face rather than against a layer bottom that sits below it.
  *
- * `mesh` and `grid` are in one frame and no conversion happens between them: `mesh` is transformed by
- * `trafo_sliced()`, the frame the layers were sliced in, and `grid` holds those same Zs - its
- * `build_layer_grid()` copies each object layer's print_z minus the belt global Z offset, which is added
- * to `Layer::print_z` only after slicing.
+ * `mesh` and `grid` are in one frame and no conversion happens in here: the caller transforms `mesh` by
+ * `trafo_sliced()` and lifts it by `object_print_z_min` when the object stands on a raft (slicing itself
+ * uses `slice_z`, which does not include the raft, while `Layer::print_z` does). `grid` holds those same
+ * Zs: `build_layer_grid()` copies each object layer's print_z minus the belt global Z offset, which is
+ * added to `Layer::print_z` only after slicing.
  */
 struct OverhangContact
 {
     LayerIndex            contact_layer { -1 };  // -1 when no whole layer is left to carry it
     // The Z the air gap of this area is measured from, in the frame of the layer grid: the mesh as
-    // transformed by `trafo_sliced()`, which is also the grid's frame. It never becomes a layer Z, a layer
-    // height or an extrusion height; the only Z derived from it is the contact layer index.
+    // transformed by `trafo_sliced()` (lifted by `object_print_z_min` on a raft), which is the grid's frame.
     std::optional<double> face_z;
+    // Z the support material of this overhang may reach: `face_z - top_z_distance`, i.e. the exact air
+    // gap, and never below the top of `contact_layer`. When it lands between two grid layers the caller
+    // finishes the contact with a thin layer of its own on top of `contact_layer` (see
+    // ExactContactLayer in TreeSupport3D.cpp); when it lands on a grid layer top it changes nothing.
+    // `contact_layer` itself and every object layer keep their Z and height either way.
+    double                contact_top_z { 0. };
 };
 
 [[nodiscard]] OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, LayerIndex layer_idx,

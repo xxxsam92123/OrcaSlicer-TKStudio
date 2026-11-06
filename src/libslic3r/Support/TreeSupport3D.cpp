@@ -50,6 +50,7 @@
 #include <functional>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <memory>
 #include <math.h>
 #include <numeric>
@@ -515,12 +516,13 @@ OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIn
     // and a face exactly on either boundary counts - that is the case a uniform grid hits. A face further
     // down is a different overhang and would drop the contact by a whole layer for no reason.
     //
-    // No frame conversion happens here. `mesh` is passed already transformed by `trafo_sliced()`, the
-    // frame the layers were sliced in, and `grid` holds exactly those Zs: build_layer_grid() copies each
-    // object layer's print_z minus `belt_global_z_offset()`, which PrintObject::slice() adds to
-    // `Layer::print_z` only after the slicing. The mesh and the grid therefore share one frame, and the
-    // belt offset belongs to the layer stack only - feeding it into this search moves the window off the
-    // face (upwards for the negative offset a lifted belt mesh has) and can place the contact above it.
+    // No frame conversion happens here. `mesh` is passed already in the grid's frame: the caller applies
+    // `trafo_sliced()` and, on a raft, lifts it by `object_print_z_min`. The grid holds the print frame too
+    // - build_layer_grid() copies each object layer's print_z minus `belt_global_z_offset()`, which
+    // PrintObject::slice() adds to `Layer::print_z` only after the slicing. The belt offset therefore
+    // belongs to the layer stack only - feeding it into this search moves the window off the face (upwards
+    // for the negative offset a lifted belt mesh has) and can place the contact above it. A raft, on the
+    // other hand, does move the object's layers (print_z includes it) and has to move the face with them.
     const std::optional<double> face_z = overhang_face_z(mesh, facet_z, area,
         grid.bottom_z(layer_idx - 1), grid.z(layer_idx));
     // Z the air gap is measured from, in that same frame. Without a facet at all - a support enforcer
@@ -539,7 +541,14 @@ OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIn
     // up, so the lower bound of a facet that reaches into the window from below leaves it where it was.
     if (face_z)
         grid.set_obj_bottom_z(layer_idx, *face_z);
-    return { contact_layer, face_z };
+    OverhangContact contact{ contact_layer, face_z, 0. };
+    if (contact_layer >= 0) {
+        // Where the support may really end. Clamped to the top of the chosen layer so the caller never
+        // asks for a layer below the one that carries the contact; on a gap that already ends on a grid
+        // layer top this is that top and no extra layer is created.
+        contact.contact_top_z = std::max(grid.z(contact_layer), reference_z - top_z_distance);
+    }
+    return contact;
 }
 
 /*!
@@ -1089,6 +1098,9 @@ public:
         Polygons                     polygons;
         size_t                       layer_idx;
         size_t                       dtt_roof;
+        // Exact Z the support may end at under the overhang this roof belongs to, or 0 for a roof that is
+        // not a top contact (see OverhangContact::contact_top_z).
+        double                       contact_top_z { 0. };
     };
     struct PendingTip {
         std::pair<Point, LineStatus> point;
@@ -1252,6 +1264,76 @@ private:
 
     std::vector<std::unordered_set<Point, PointHash>>   m_already_inserted;
 };
+
+namespace {
+
+// A support layer whose top is not an object layer top: it finishes the top contact of an overhang whose
+// support_top_z_distance does not end on a layer boundary. It stands on the contact layer, which the
+// object's own grid already carries, so the stack stays continuous: `bottom_z` is that layer's top and
+// `height` the remainder up to the requested gap. Its polygons are the same top contact area, so it is
+// supported by the contact layer below instead of overhanging it. `height` is the only layer height the
+// layer has - it goes to SupportLayer::height, to Flow::with_height() and to ExtrusionPath::height - so
+// the extruded material is exactly as thick as the layer, and no report has to be bent to match it.
+//
+// Only the roof type of top contact gets this layer: the contact of an overhang that has a roof
+// (`placement.roofs` with `dtt_roof == 0`). A profile with `support_interface_top_layers == 0`, a thin
+// overhang that produced no roof, and the raft contact layer keep their whole-layer contact - none of them
+// has a top contact area whose Z could be finished exactly, so none of them is made exact here.
+struct ExactContactLayer
+{
+    double   bottom_z { 0. };
+    double   print_z  { 0. };
+    double   height   { 0. };
+    Polygons polygons;
+};
+
+// Adds one top contact area to the exact contact layer at `print_z`. Areas that ask for the same Z are
+// merged (micron resolution, far below what the printer can move), so one overhang layer never turns into
+// several support layers a few microns apart. Sharing a `print_z` means sharing the contact layer as
+// well: the contact layer is `idx_floor(print_z)` and consecutive grid layers are at least a minimum layer
+// height apart, far more than that rounding, so the first entry's `bottom_z` and `height` are the right
+// ones for every area merged into it. A remainder thinner than `min_height` is refused: such a layer
+// cannot be printed on this profile, and the contact then stays on the whole layer below, which leaves a
+// gap wider than requested rather than narrower. That is the only degradation of the exact gap this
+// feature has; the caller reports it instead of silently widening the gap.
+enum class ExactContactResult
+{
+    None,    // the gap already ends on a layer top; no extra layer is needed
+    Added,   // a thin contact layer finishes the requested Z
+    Refused  // the remainder is below the minimum layer height and cannot be printed
+};
+
+ExactContactResult add_exact_contact_area(std::map<double, ExactContactLayer> &layers, const double bottom_z,
+                                          const double contact_top_z, const double min_height, const Polygons &polygons)
+{
+    if (polygons.empty() || contact_top_z <= bottom_z + EPSILON)
+        return ExactContactResult::None;
+    // Round down to the micron: the air gap may grow by less than a micron, but it can never shrink. Rounding
+    // up is not harmless - a remainder that lies a fraction of a micron below a grid layer top would be
+    // lifted onto that top, which collides with a real top contact there (generate_support_layers() keeps at
+    // most one top contact per print_z, and generate_support_toolpaths() would then print only the first of
+    // the two areas). The bounds are re-checked on the rounded value: flooring may bring it down to (or
+    // below) the contact layer's top, and it may drop the remainder below the printable minimum.
+    const double print_z = std::floor(contact_top_z * 1e6) / 1e6;
+    if (print_z <= bottom_z + EPSILON)
+        return ExactContactResult::None;
+    const double height = print_z - bottom_z;
+    if (height < min_height - EPSILON)
+        return ExactContactResult::Refused;
+    auto it = layers.find(print_z);
+    if (it == layers.end()) {
+        ExactContactLayer layer;
+        layer.bottom_z = bottom_z;
+        layer.print_z  = print_z;
+        layer.height   = height;
+        layer.polygons = polygons;
+        layers.emplace(print_z, std::move(layer));
+    } else
+        it->second.polygons = union_(it->second.polygons, polygons);
+    return ExactContactResult::Added;
+}
+
+} // namespace
 
 int generate_raft_contact(
     const PrintObject               &print_object,
@@ -1493,8 +1575,14 @@ static void generate_initial_areas(
     const TreeSupportSettings       &config,
     const std::vector<Polygons>     &overhangs,
     const std::vector<LayerIndex>   &overhang_top_layer,
+    const std::vector<double>       &overhang_contact_top_z,
     std::vector<SupportElements>    &move_bounds,
     InterfacePlacer                 &interface_placer,
+    std::map<double, ExactContactLayer> &exact_contacts,
+    // Number of this mesh's top contact areas whose exact gap was refused, and the first such Z. The caller
+    // aggregates them over the whole mesh group and logs one warning.
+    size_t                          &refused_exact_contacts,
+    double                          &first_refused_contact_z,
     std::function<void()>            throw_on_cancel)
 {
     using                           AvoidanceType = TreeModelVolumes::AvoidanceType;
@@ -1546,27 +1634,34 @@ static void generate_initial_areas(
     int                                             raft_contact_layer_idx;
     // Layers with their overhang regions.
     std::vector<std::pair<size_t, const Polygons*>>  raw_overhangs;
+    // The exact contact Z of the same overhang (OverhangContact::contact_top_z, 0 when the contact has no
+    // exact Z to reach), parallel to raw_overhangs.
+    std::vector<double>                              raw_contact_top_z;
 
     {
         raft_contact_layer_idx = generate_raft_contact(print_object, config, interface_placer);
         // Every overhang contributes its tips on the contact layer computed for it, see place_top_contact().
         raw_overhangs.reserve(overhangs.size());
+        raw_contact_top_z.reserve(overhangs.size());
         for (size_t overhang_idx = 0; overhang_idx < overhangs.size(); ++ overhang_idx)
             if (const LayerIndex top_layer = overhang_top_layer[overhang_idx];
-                top_layer >= 0 && ! overhangs[overhang_idx].empty())
+                top_layer >= 0 && ! overhangs[overhang_idx].empty()) {
                 raw_overhangs.push_back({ size_t(top_layer), &overhangs[overhang_idx] });
+                raw_contact_top_z.push_back(overhang_contact_top_z[overhang_idx]);
+            }
     }
 
     RichInterfacePlacer rich_interface_placer{ interface_placer, volumes, force_tip_to_roof, size_t(move_bounds.size()), move_bounds };
     std::vector<RichInterfacePlacer::Placement> placements(raw_overhangs.size());
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, raw_overhangs.size()),
-        [&volumes, &config, &raw_overhangs, &mesh_group_settings,
+        [&volumes, &config, &raw_overhangs, &raw_contact_top_z, &mesh_group_settings,
          min_xy_dist, roof_enabled, num_support_roof_layers, extra_outset, circle_length_to_half_linewidth_change, connect_length,
          &rich_interface_placer, &placements, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
         for (size_t raw_overhang_idx = range.begin(); raw_overhang_idx < range.end(); ++ raw_overhang_idx) {
             size_t           layer_idx    = raw_overhangs[raw_overhang_idx].first;
             const Polygons  &overhang_raw = *raw_overhangs[raw_overhang_idx].second;
+            const double     exact_top_z  = raw_contact_top_z[raw_overhang_idx];
             RichInterfacePlacer::Placement &placement = placements[raw_overhang_idx];
 
             // take the least restrictive avoidance possible
@@ -1689,11 +1784,30 @@ static void generate_initial_areas(
                     mesh_group_settings, rich_interface_placer, placement);
                 throw_on_cancel();
             }
+
+            // The top contact (dtt_roof == 0) of this overhang is the area that finishes the air gap. When
+            // its exact Z does not land on the contact layer's top, commit() also copies it into a thin
+            // layer at that Z (ExactContactLayer). Everything below stays on the object's grid.
+            if (exact_top_z > 0.)
+                for (RichInterfacePlacer::PendingRoof &roof : placement.roofs)
+                    if (roof.dtt_roof == 0)
+                        roof.contact_top_z = exact_top_z;
         }
     });
 
-    for (RichInterfacePlacer::Placement &placement : placements)
+    for (RichInterfacePlacer::Placement &placement : placements) {
+        for (const RichInterfacePlacer::PendingRoof &roof : placement.roofs)
+            if (roof.dtt_roof == 0 && roof.contact_top_z > 0.)
+                if (add_exact_contact_area(exact_contacts,
+                        config.layer_grid.z(LayerIndex(roof.layer_idx)), roof.contact_top_z,
+                        print_object.slicing_parameters().min_layer_height, roof.polygons) == ExactContactResult::Refused) {
+                    // The gap cannot be printed on this profile. Count it and remember the first Z so the
+                    // caller can report the whole mesh group once instead of once per mesh.
+                    if (refused_exact_contacts ++ == 0)
+                        first_refused_contact_z = roof.contact_top_z;
+                }
         rich_interface_placer.commit(std::move(placement));
+    }
 
     finalize_raft_contact(print_object, raft_contact_layer_idx, interface_placer.top_contacts_mutable(), move_bounds);
 }
@@ -3765,11 +3879,14 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 #else
         std::vector<Polygons>        overhangs = generate_overhangs(config, *print.get_object(processing.second.front()), throw_on_cancel);
 #endif
-        // Map every overhang to the support layer that carries its top contact. The contact is placed on
-        // an existing support layer - the highest one whose top stays at least support_top_z_distance
-        // below the overhang - so every support layer keeps the object layer's Z and height and the air
-        // gap is quantised upwards, never closed. `config` refers to the copy owned by grouped_meshes.
+        // Map every overhang to the support layer that carries its top contact, and remember the exact Z
+        // the support may reach under it. The contact stays on an existing support layer - the highest one
+        // whose top stays at least support_top_z_distance below the overhang - so every object layer and
+        // every support layer keep the object's Z and height; when the requested gap ends between two of
+        // those layers, the top contact area is finished by one thin layer at the exact Z (see
+        // ExactContactLayer). `config` refers to the copy owned by grouped_meshes.
         std::vector<LayerIndex> overhang_top_layer(overhangs.size(), -1);
+        std::vector<double>     overhang_contact_top_z(overhangs.size(), 0.);
         {
             TreeSupportLayerGrid &grid   = processing.first.layer_grid;
             // Raw millimetres: the lowest Z a contact may reach under the overhang.
@@ -3783,14 +3900,26 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             if (std::any_of(overhangs.begin(), overhangs.end(), [](const Polygons &overhang) { return ! overhang.empty(); })) {
                 mesh = print_object.model_object()->raw_mesh();
                 mesh.transform(print_object.trafo_sliced());
+                // The grid holds the print frame: `Layer::print_z` of an object layer is its slice interval
+                // plus object_print_z_min, while the mesh is sliced in the object's own frame (slice_z does
+                // not carry the raft). A raft therefore moves the whole object up by object_print_z_min and
+                // the face has to move with it, or the search window misses the face by exactly the raft
+                // height and falls back to a window bottom that is a whole gap too close. Without a raft
+                // object_print_z_min is 0 and this is a no-op; a thicker first object layer is already in
+                // the layer Zs themselves and needs no shift here.
+                if (const double object_print_z_min = print_object.slicing_parameters().object_print_z_min;
+                    object_print_z_min != 0.)
+                    mesh.translate(0.f, 0.f, float(object_print_z_min));
                 // One pass over the facets for all the areas below, instead of one per area.
                 facet_index.build(mesh);
             }
             for (size_t overhang_idx = grid.raft_layers; overhang_idx < overhangs.size(); ++ overhang_idx)
-                if (! overhangs[overhang_idx].empty())
-                    overhang_top_layer[overhang_idx] =
-                        place_overhang_contact(grid, LayerIndex(overhang_idx), mesh, facet_index,
-                            overhangs[overhang_idx], top_z).contact_layer;
+                if (! overhangs[overhang_idx].empty()) {
+                    const OverhangContact contact = place_overhang_contact(grid, LayerIndex(overhang_idx), mesh,
+                        facet_index, overhangs[overhang_idx], top_z);
+                    overhang_top_layer[overhang_idx]     = contact.contact_layer;
+                    overhang_contact_top_z[overhang_idx] = contact.contact_top_z;
+                }
         }
 
         // Generator for model collision, avoidance and internal guide volumes.
@@ -3822,6 +3951,9 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
 
         SupportGeneratorLayerStorage layer_storage;
+        // Top contact areas whose exact gap Z does not land on an object layer top, keyed by that Z. Filled
+        // by generate_initial_areas(); installed as thin generator layers below, before toolpaths.
+        std::map<double, ExactContactLayer> exact_contacts;
         SupportGeneratorLayersPtr    top_contacts;
         SupportGeneratorLayersPtr    bottom_contacts;
         SupportGeneratorLayersPtr    interface_layers;
@@ -3859,9 +3991,25 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             std::vector<SupportElements> move_bounds(num_support_layers);
 
             // ### Place tips of the support tree
+            // One warning per mesh group, not one per mesh: a group can hold several objects and every
+            // overhang area of every one of them can hit the same unprintable remainder.
+            size_t exact_gap_refused       = 0;
+            double first_refused_contact_z = 0.;
             for (size_t mesh_idx : processing.second)
                 generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs, overhang_top_layer,
-                    move_bounds, interface_placer, throw_on_cancel);
+                    overhang_contact_top_z, move_bounds, interface_placer, exact_contacts,
+                    exact_gap_refused, first_refused_contact_z, throw_on_cancel);
+            if (exact_gap_refused > 0)
+                // Honest report instead of a silent degradation: the requested gap cannot be printed on this
+                // profile, the support really ends one whole layer lower rather than a layer being faked.
+                BOOST_LOG_TRIVIAL(warning)
+                    << "Organic support: support_top_z_distance " << processing.first.settings.support_top_z_distance_mm
+                    << " mm cannot be printed exactly under " << exact_gap_refused
+                    << " overhang area(s) of this group (the first one ends at Z " << first_refused_contact_z
+                    << "). The remainder above the contact layer is thinner than the profile's minimum layer "
+                    << "height (" << print.get_object(processing.second.front())->slicing_parameters().min_layer_height
+                    << " mm), so those areas end on the whole layer below and their air gap is wider than "
+                    << "requested, never narrower.";
             auto t_gen = std::chrono::high_resolution_clock::now();
 
 
@@ -3887,6 +4035,22 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
 
             std::tie(interface_layers, base_interface_layers) = generate_interface_layers(print_object.config(), support_params,
                 bottom_contacts, top_contacts, interface_layers, base_interface_layers, intermediate_layers, layer_storage);
+
+            // Install the thin layers that finish an exact air gap. They are top contacts, so they join the
+            // list the toolpath stage reads; sorting keeps the print_z order that stage walks monotonically.
+            // Their polygons are the same contact area the layer below already carries, so they stand on it
+            // instead of overhanging it, and their `height` is the remainder they really print over.
+            for (auto &exact_contact : exact_contacts) {
+                ExactContactLayer &source = exact_contact.second;
+                SupportGeneratorLayer &layer = layer_storage.allocate_unguarded(SupporLayerType::TopContact);
+                layer.print_z  = source.print_z;
+                layer.bottom_z = source.bottom_z;
+                layer.height   = source.height;
+                layer.polygons = std::move(source.polygons);
+                top_contacts.push_back(&layer);
+            }
+            std::sort(top_contacts.begin(), top_contacts.end(),
+                [](const SupportGeneratorLayer *l1, const SupportGeneratorLayer *l2) { return *l1 < *l2; });
 
             auto t_draw = std::chrono::high_resolution_clock::now();
             auto dur_pre_gen = 0.001 * std::chrono::duration_cast<std::chrono::microseconds>(t_precalc - t_start).count();

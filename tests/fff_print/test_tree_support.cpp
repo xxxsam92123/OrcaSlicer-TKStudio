@@ -18,6 +18,7 @@
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Support/TreeSupport3D.hpp"
 #include "libslic3r/Support/TreeSupportContact.hpp"
@@ -28,8 +29,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <utility>
 #include <math.h>
 #include <optional>
 #include <set>
@@ -74,6 +78,54 @@ TriangleMesh scaled(TestMesh id, float scale)
     TriangleMesh mesh = Slic3r::Test::mesh(id);
     mesh.scale(scale);
     return mesh;
+}
+
+// What the exact-gap contract says the printed support under `face_z` ends at. `grid_top` is the top of
+// the highest object layer that keeps the requested gap - the contact layer. When the requested Z lies
+// above that layer by at least the profile's minimum layer height, one thin contact layer finishes at
+// that Z (`top == target`, `exact`); otherwise the request cannot be printed on this profile and the
+// support really ends on the whole layer (`top == grid_top`), i.e. the air gap is wider than asked.
+struct ContactExpectation
+{
+    double grid_top { 0. };  // top of the object layer that carries the contact
+    double target   { 0. };  // face_z - gap
+    double top      { 0. };  // Z the printed support really ends at
+    bool   exact    { false };
+};
+
+ContactExpectation expected_contact(const PrintObject &po, const double face_z, const double gap)
+{
+    ContactExpectation expected;
+    expected.target = face_z - gap;
+    for (const Layer *layer : po.layers())
+        if (layer->print_z <= expected.target + TreeSupport3D::TreeSupportLayerGrid::z_roundoff)
+            expected.grid_top = layer->print_z;
+    const double remainder = expected.target - expected.grid_top;
+    // The same test add_exact_contact_area() applies: a layer thinner than the profile's minimum layer
+    // height is refused, and with it the exact gap.
+    expected.exact = remainder > EPSILON &&
+        remainder + EPSILON >= po.slicing_parameters().min_layer_height;
+    expected.top = expected.exact ? expected.target : expected.grid_top;
+    return expected;
+}
+
+// The object layer printed at `print_z`, or nullptr when no object layer is there.
+const Layer *object_layer_at(const PrintObject &po, const double print_z)
+{
+    for (const Layer *layer : po.layers())
+        if (std::abs(layer->print_z - print_z) < 1e-9)
+            return layer;
+    return nullptr;
+}
+
+// The object layer directly above `print_z`, or nullptr at the top of the stack.
+const Layer *object_layer_above(const PrintObject &po, const double print_z)
+{
+    const Layer *above = nullptr;
+    for (const Layer *layer : po.layers())
+        if (layer->print_z > print_z + 1e-9 && (above == nullptr || layer->print_z < above->print_z))
+            above = layer;
+    return above;
 }
 
 // `extra` is applied last, so a caller can add or override any key.
@@ -401,16 +453,29 @@ TEST_CASE("Organic support places its top contact at least the configured gap be
     const PrintObject &po = *print.objects().front();
     REQUIRE(! po.support_layers().empty());
     // The contact is the highest support layer, and its top is its own print_z: the support material
-    // ends there, so the air gap under the overhang is 16.0 - print_z.
-    const SupportLayer &contact = *po.support_layers().back();
-    INFO("contact layer print_z=" << contact.print_z << " height=" << contact.height);
-    // support_top_z_distance is a lower bound, not a layer height: the contact takes the highest layer
-    // that is at least `gap` below the face, so the gap is never narrower than requested ...
-    CHECK(contact.print_z <= 16.0 - gap + 1e-9);
-    // ... and at most one layer wider.
-    CHECK(contact.print_z > 16.0 - gap - 0.2 - 1e-9);
-    // The layer prints the object layer's own 0.2 mm: the gap remainder never becomes its height.
-    CHECK_THAT(contact.height, Catch::Matchers::WithinAbs(0.2, 1e-9));
+    // ends there, so the air gap under the overhang is 16.0 - print_z. The requested Z is printed by a
+    // thin contact layer on top of the whole object layer that carries it, unless that remainder is below
+    // the profile's minimum layer height.
+    const ContactExpectation expected = expected_contact(po, 16.0, gap);
+    const SupportLayer      &contact  = *po.support_layers().back();
+    INFO("contact layer print_z=" << contact.print_z << " height=" << contact.height
+                                  << " expected top=" << expected.top << " grid top=" << expected.grid_top
+                                  << " exact=" << expected.exact);
+    CHECK_THAT(contact.print_z, Catch::Matchers::WithinAbs(expected.top, 1e-9));
+    if (expected.exact) {
+        // The gap is the requested distance, not an upward quantisation of it ...
+        CHECK_THAT(16.0 - contact.print_z, Catch::Matchers::WithinAbs(gap, 1e-9));
+        // ... and the thin layer prints exactly the remainder it covers.
+        CHECK_THAT(contact.height, Catch::Matchers::WithinAbs(expected.top - expected.grid_top, 1e-6));
+    } else {
+        // The profile cannot print the remainder: the support stays on the whole layer, so the gap is a
+        // lower bound and at most one layer wider - never narrower.
+        CHECK(contact.print_z <= 16.0 - gap + 1e-9);
+        CHECK(contact.print_z > 16.0 - gap - 0.2 - 1e-9);
+        const Layer *object_layer = object_layer_at(po, contact.print_z);
+        REQUIRE(object_layer != nullptr);
+        CHECK_THAT(contact.height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
+    }
 }
 
 TEST_CASE("Support layer grid resolves Z and places the top contact on whole layers", "[TreeSupportOrganicGap]")
@@ -752,6 +817,26 @@ std::vector<SupportPathRole> support_path_roles(const SupportLayer &layer)
     return paths;
 }
 
+// A layer height at the micron resolution support_path_roles() reports path heights with.
+double micron_rounded(const double value) { return std::round(value * 1000.) / 1000.; }
+
+// Every height a support path of `layer` may legitimately carry: the layer's own height (what it lays down
+// where nothing else is in its slab), and - for a support layer whose print_z falls inside this layer's
+// slab - the thinner height the over-extrusion mitigation reduces that overlap to
+// (SupportCommon.cpp, modulate_extrusion_by_overlapping_layers(): this print_z - the overlapping print_z).
+// Anything else is a contract violation: a gap remainder may not leak into another layer's paths, and a
+// reduced height may not be invented either.
+bool is_allowed_support_path_height(const PrintObject &po, const SupportLayer &layer, const double height)
+{
+    if (std::abs(micron_rounded(layer.height) - height) < 1e-6)
+        return true;
+    for (const SupportLayer *other : po.support_layers())
+        if (other->print_z > layer.bottom_z() + 1e-6 && other->print_z < layer.print_z - 1e-6 &&
+            std::abs(micron_rounded(layer.print_z - other->print_z) - height) < 1e-6)
+            return true;
+    return false;
+}
+
 // Every height the object's layer stack has, rounded to a micron: a support path may only be as thick as
 // one of these. Anything else (0.1 / 0.14 / 0.23 on a 0.2 mm profile) is a gap remainder.
 std::multiset<double> object_layer_heights(const PrintObject &po)
@@ -798,42 +883,87 @@ const SupportLayer *support_layer_at(const PrintObject &po, double print_z)
     return nullptr;
 }
 
-// Every support layer prints one of the object layers' Zs and heights, and every extrusion path it prints
-// is as thick as one of those layers - a gap remainder written into a layer height shows up in both.
-// Returns the number of paths checked, so a caller can tell that the assertions were not vacuous.
+// Every support layer prints on an object layer at that layer's own height, except the one thin top
+// contact layer that finishes an exact gap: that layer prints exactly the Z span it stands over, and every
+// one of its paths carries that height (it is the number Flow is built from). Returns the number of paths
+// checked, so a caller can tell that the assertions were not vacuous.
 //
-// Scoped to what these tests print: an organic stack with no raft, where every support layer Z is an
-// object layer Z one to one. It is not a general layer grid check - a raft puts support layers below the
-// object's first layer, which have no object layer to match.
-size_t check_support_layers_on_object_grid(const PrintObject &po)
+// Scoped to what these tests print: an organic stack with no raft, where every support layer Z is either an
+// object layer Z or the exact contact Z above one of them. It is not a general layer grid check - a raft
+// puts support layers below the object's first layer, which have no object layer to match.
+size_t check_support_layers_on_object_grid(const PrintObject &po, const ContactExpectation &expected)
 {
-    const std::multiset<double> profile_heights = object_layer_heights(po);
-    std::vector<const Layer *>  object_layers;
-    for (const Layer *layer : po.layers())
-        object_layers.emplace_back(layer);
-    size_t paths_checked = 0;
+    size_t                      paths_checked   = 0;
+    size_t                      exact_layers    = 0;
     for (const SupportLayer *layer : po.support_layers()) {
-        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
-        const auto it = std::find_if(object_layers.begin(), object_layers.end(),
-            [layer](const Layer *object_layer) { return std::abs(object_layer->print_z - layer->print_z) < 1e-9; });
-        REQUIRE(it != object_layers.end());
-        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height
+                                      << " expected contact " << expected.top << " exact " << expected.exact);
+        const bool exact_contact = expected.exact && std::abs(layer->print_z - expected.top) < 1e-9;
+        if (exact_contact) {
+            ++ exact_layers;
+            CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(layer->print_z - expected.grid_top, 1e-6));
+            for (const SupportPathRole &path : support_path_roles(*layer)) {
+                INFO("exact contact path role " << int(path.role) << " height " << path.height);
+                CHECK_THAT(path.height, Catch::Matchers::WithinAbs(micron_rounded(layer->height), 1e-6));
+                ++ paths_checked;
+            }
+            continue;
+        }
+        const Layer *object_layer = object_layer_at(po, layer->print_z);
+        REQUIRE(object_layer != nullptr);
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
         for (const SupportPathRole &path : support_path_roles(*layer)) {
             INFO("support path role " << int(path.role) << " height " << path.height);
-            CHECK(profile_heights.find(path.height) != profile_heights.end());
-            ++paths_checked;
+            // Either the object layer's own height or - only where a support layer sits inside this
+            // layer's slab - the thinner overlap height. A gap remainder shows up as neither.
+            CHECK(is_allowed_support_path_height(po, *layer, path.height));
+            ++ paths_checked;
         }
     }
+    if (expected.exact)
+        CHECK(exact_layers == 1);
+    else
+        CHECK(exact_layers == 0);
     return paths_checked;
 }
 
-// A 0.2 mm profile with a gap the user did not round to it. support_top_z_distance is a distance in
-// millimetres, but the support has no layer stack of its own: the contact goes onto the highest support
-// layer that keeps at least that much air under the overhang, so the gap is quantised upwards and every
-// layer keeps the object's Z and height. The previous implementation pushed the remainder into the
-// contact layer's height (0.1 on this profile, 0.14 on a 0.4 mm one), which reached Flow and the layer
-// height report. The assertions below are the ones that fail for that implementation.
-TEST_CASE("An organic top gap keeps every support layer on the object's own layer heights", "[TreeSupportOrganicGap]")
+// The G-code layer-height report of a print whose exact contact layer exists differs from the same print
+// without support in exactly one place: the object layer above the contact is now reached in two advances,
+// the contact layer's height and the rest of that object layer. Every other height has to be identical, so
+// the report shows the split the machine really makes instead of a fabricated height.
+void check_gcode_heights_with_exact_contact(const std::string &supported, const std::string &plain,
+                                            const PrintObject &po, const ContactExpectation &expected)
+{
+    const std::multiset<double> heights       = gcode_layer_heights(supported);
+    std::multiset<double>       expected_heights = gcode_layer_heights(plain);
+    // Both sides parse the report; two empty sets would compare equal and prove nothing.
+    REQUIRE(! heights.empty());
+    REQUIRE(! expected_heights.empty());
+    if (! expected.exact) {
+        CHECK(heights == expected_heights);
+        return;
+    }
+    const Layer *above = object_layer_above(po, expected.top);
+    REQUIRE(above != nullptr);
+    const double object_height = micron_rounded(above->height);
+    const double contact_part  = micron_rounded(expected.top - expected.grid_top);
+    const double rest_part     = micron_rounded(above->print_z - expected.top);
+    const auto   it = expected_heights.find(object_height);
+    REQUIRE(it != expected_heights.end());
+    expected_heights.erase(it);
+    expected_heights.insert(contact_part);
+    expected_heights.insert(rest_part);
+    CHECK(heights == expected_heights);
+}
+
+// A 0.2 mm profile with a gap the user did not round to it. The object's layers are the slicing result and
+// are not touched. The contact stays on the highest object layer that keeps at least the requested air
+// under the overhang; when the requested Z lies above that layer's top, one thin support layer on top of
+// it finishes the exact gap. Only that thin layer is off the object grid and its height is the Z span it
+// really prints, so its Flow is the real material thickness. A remainder below the profile's minimum layer
+// height cannot be printed and the contact then stays on the whole layer (wider gap, never narrower).
+TEST_CASE("An organic top gap keeps the object's layers and only the exact contact off its grid",
+          "[TreeSupportOrganicGap]")
 {
     const double gap = GENERATE(0.1, 0.2, 0.3);
     INFO("gap " << gap);
@@ -873,46 +1003,58 @@ TEST_CASE("An organic top gap keeps every support layer on the object's own laye
         CHECK_THAT(layer.print_z, Catch::Matchers::WithinAbs(0.2 * double(i + 1), 1e-9));
     }
 
-    // SupportLayer::height: every support layer sits on an object layer Z and prints that object layer's
-    // own height. Not one of them may be the gap remainder.
+    const ContactExpectation expected = expected_contact(po, 16.0, gap);
+
+    // SupportLayer::height: every support layer is an object layer at that layer's height, except the one
+    // thin contact layer that finishes the gap. That one prints the remainder it really covers, and its
+    // paths - base and interface alike - are built with the same height.
     REQUIRE(! po.support_layers().empty());
-    const std::multiset<double> profile_heights = object_layer_heights(po);
     size_t                      base_paths      = 0;
     size_t                      interface_paths = 0;
+    size_t                      thin_layers     = 0;
     for (const SupportLayer *layer : po.support_layers()) {
-        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
-        CHECK_THAT(layer->print_z, Catch::Matchers::WithinAbs(std::round(layer->print_z / 0.2) * 0.2, 1e-9));
-        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(0.2, 1e-12));
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height
+                                      << " expected contact " << expected.top << " exact " << expected.exact);
+        const bool exact_contact = expected.exact && std::abs(layer->print_z - expected.top) < 1e-9;
+        if (exact_contact) {
+            ++ thin_layers;
+            CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(expected.top - expected.grid_top, 1e-6));
+        } else {
+            const Layer *object_layer = object_layer_at(po, layer->print_z);
+            REQUIRE(object_layer != nullptr);
+            CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
+        }
         // Flow / path height: what the extrusions of this layer are actually built with, base and
         // interface stack alike.
         for (const SupportPathRole &path : support_path_roles(*layer)) {
             INFO("support path role " << int(path.role) << " height " << path.height);
-            CHECK(profile_heights.find(path.height) != profile_heights.end());
+            if (exact_contact)
+                CHECK_THAT(path.height, Catch::Matchers::WithinAbs(micron_rounded(layer->height), 1e-6));
+            else
+                CHECK(is_allowed_support_path_height(po, *layer, path.height));
             (path.role == erSupportMaterialInterface ? interface_paths : base_paths) += 1;
         }
     }
+    CHECK(thin_layers == (expected.exact ? 1u : 0u));
     // The interface stack has a flow of its own, so both kinds have to have been looked at.
     REQUIRE(base_paths > 0);
     REQUIRE(interface_paths > 0);
 
     // The top contact is the highest support layer, and its top is that layer's own print_z. The air gap
-    // under the overhang at 16.0 is therefore never narrower than requested and at most one layer wider;
-    // 0.2 is a whole layer of this profile and comes out exact.
+    // under the overhang at 16.0 is the requested one when the thin layer exists, and at least the request
+    // (at most one layer wider) when the profile refuses the remainder.
     const SupportLayer &contact = *po.support_layers().back();
     INFO("contact print_z " << contact.print_z << " = gap " << 16.0 - contact.print_z);
+    CHECK_THAT(contact.print_z, Catch::Matchers::WithinAbs(expected.top, 1e-9));
     CHECK(contact.print_z <= 16.0 - gap + 1e-9);
     CHECK(contact.print_z > 16.0 - gap - 0.2 - 1e-9);
-    if (std::abs(gap - 0.2) < 1e-12)
+    if (expected.exact)
         CHECK_THAT(16.0 - contact.print_z, Catch::Matchers::WithinAbs(gap, 1e-9));
 
-    // The G-code reports the same set of layer heights as the same print without support: no 0.1, 0.14
-    // or 0.23 sneaks into the legend through a support layer.
-    const std::multiset<double> heights       = gcode_layer_heights(Slic3r::Test::gcode(supported));
-    const std::multiset<double> heights_plain = gcode_layer_heights(Slic3r::Test::gcode(unsupported));
-    // Both sides parse the report; two empty sets would compare equal and prove nothing.
-    REQUIRE(! heights.empty());
-    REQUIRE(! heights_plain.empty());
-    CHECK(heights == heights_plain);
+    // The G-code legend reports the machine's real layer changes: the object stack, and where the thin
+    // contact layer exists, the split of the object layer above it. No fabricated height appears.
+    check_gcode_heights_with_exact_contact(Slic3r::Test::gcode(supported), Slic3r::Test::gcode(unsupported),
+                                           po, expected);
 }
 
 // The zero the tests below assert is only meaningful if the capture reads the stream the generator
@@ -1000,7 +1142,6 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
         REQUIRE(po.layer_count() == po_plain.layer_count());
         REQUIRE(! po.support_layers().empty());
 
-        std::vector<const Layer *> object_layers;
         for (size_t i = 0; i < po.layer_count(); ++ i) {
             const Layer &layer = *po.get_layer(i);
             const Layer &plain = *po_plain.get_layer(i);
@@ -1009,48 +1150,59 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
             CHECK_THAT(layer.print_z, Catch::Matchers::WithinAbs(plain.print_z, 1e-12));
             CHECK_THAT(layer.height, Catch::Matchers::WithinAbs(plain.height, 1e-12));
             CHECK_THAT(layer.slice_z, Catch::Matchers::WithinAbs(plain.slice_z, 1e-12));
-            object_layers.emplace_back(&layer);
         }
 
-        // Every support layer sits on one of those Zs and prints *that* layer's height - the 0.4 mm
-        // section is printed as 0.4, never as the 0.14 a gap remainder would leave of it.
-        const std::multiset<double> profile_heights = object_layer_heights(po);
+        const ContactExpectation expected = expected_contact(po, 16.0, gap);
+
+        // Every support layer sits on one of those Zs and prints *that* layer's height, except the one thin
+        // contact layer that finishes the exact gap: it prints the remainder it really covers, at the same
+        // height in every path. A run the overlap mitigation thinned is allowed as well - here it has nothing
+        // to thin, so this stays the object's height.
         size_t                      base_paths      = 0;
         size_t                      interface_paths = 0;
-        double contact_print_z = 0.;
+        size_t                      thin_layers     = 0;
+        double                      contact_print_z = 0.;
         for (const SupportLayer *layer : po.support_layers()) {
-            INFO("support layer print_z " << layer->print_z << " height " << layer->height);
-            const auto it = std::find_if(object_layers.begin(), object_layers.end(),
-                [&layer](const Layer *object_layer) { return std::abs(object_layer->print_z - layer->print_z) < 1e-9; });
-            CHECK(it != object_layers.end());
-            if (it == object_layers.end())
-                continue;
-            CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
+            INFO("support layer print_z " << layer->print_z << " height " << layer->height
+                                          << " expected contact " << expected.top << " exact " << expected.exact);
+            const bool exact_contact = expected.exact && std::abs(layer->print_z - expected.top) < 1e-9;
+            if (exact_contact) {
+                ++ thin_layers;
+                CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(expected.top - expected.grid_top, 1e-6));
+            } else {
+                const Layer *object_layer = object_layer_at(po, layer->print_z);
+                REQUIRE(object_layer != nullptr);
+                CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
+            }
             // Base and interface / roof paths both take their height from the layer, so both are checked.
             for (const SupportPathRole &path : support_path_roles(*layer)) {
                 INFO("support path role " << int(path.role) << " height " << path.height);
-                CHECK(profile_heights.find(path.height) != profile_heights.end());
+                if (exact_contact)
+                    CHECK_THAT(path.height, Catch::Matchers::WithinAbs(micron_rounded(layer->height), 1e-6));
+                else
+                    CHECK(is_allowed_support_path_height(po, *layer, path.height));
                 (path.role == erSupportMaterialInterface ? interface_paths : base_paths) += 1;
             }
             contact_print_z = std::max(contact_print_z, layer->print_z);
         }
+        CHECK(thin_layers == (expected.exact ? 1u : 0u));
         REQUIRE(base_paths > 0);
         REQUIRE(interface_paths > 0);
 
-        // The gap is at least as wide as requested, and less than one layer wider. On a variable layer
-        // height a whole layer is what it is at that Z, so one 0.4 mm layer is the bound here.
-        INFO("contact print_z " << contact_print_z << " = gap " << 16.0 - contact_print_z);
+        // The gap is the requested one when the profile can print the remainder, and one whole layer wider
+        // when it cannot - never narrower.
+        INFO("contact print_z " << contact_print_z << " expected " << expected.top
+                                << " = gap " << 16.0 - contact_print_z);
+        CHECK_THAT(contact_print_z, Catch::Matchers::WithinAbs(expected.top, 1e-9));
         CHECK(contact_print_z <= 16.0 - gap + 1e-9);
         CHECK(contact_print_z > 16.0 - gap - 0.4 - 1e-9);
+        if (expected.exact)
+            CHECK_THAT(16.0 - contact_print_z, Catch::Matchers::WithinAbs(gap, 1e-9));
 
-        // The G-code reports the same layer heights as the same print without support: the support adds
-        // no 0.14 / 0.23 to the legend.
-        const std::multiset<double> heights       = gcode_layer_heights(Slic3r::Test::gcode(supported));
-        const std::multiset<double> heights_plain = gcode_layer_heights(Slic3r::Test::gcode(unsupported));
-        // Both sides parse the report; two empty sets would compare equal and prove nothing.
-        REQUIRE(! heights.empty());
-        REQUIRE(! heights_plain.empty());
-        CHECK(heights == heights_plain);
+        // The G-code legend reports the real machine layer changes: the profile's stack plus the split of
+        // the object layer above the thin contact layer, and nothing fabricated.
+        check_gcode_heights_with_exact_contact(Slic3r::Test::gcode(supported), Slic3r::Test::gcode(unsupported),
+                                               po, expected);
     }
 }
 
@@ -1128,18 +1280,20 @@ TEST_CASE("An organic top gap follows a variable layer height below the nominal 
         CHECK_THAT(layer.slice_z, Catch::Matchers::WithinAbs(plain.slice_z, 1e-12));
     }
 
-    const Layer *expected = top_contact_layer(po, 16.0, gap);
-    REQUIRE(expected != nullptr);
+    const ContactExpectation expected   = expected_contact(po, 16.0, gap);
+    const Layer            *grid_layer = top_contact_layer(po, 16.0, gap);
+    REQUIRE(grid_layer != nullptr);
+    CHECK_THAT(grid_layer->print_z, Catch::Matchers::WithinAbs(expected.grid_top, 1e-9));
 
     // The premise this case rests on: the layer the gap has to clear is thinner than the nominal layer
     // height, so the contact can sit closer to the face than one nominal layer. If the resampling stopped
     // producing such a layer, the case would only prove that a 0.2 mm grid quantises to 0.2 - fail here
     // instead of passing on that.
-    const Layer *above = layer_above(po, *expected);
+    const Layer *above = layer_above(po, *grid_layer);
     REQUIRE(above != nullptr);
     REQUIRE(above->height < 0.2 - 1e-6);
 
-    const SupportLayer *contact = support_layer_at(po, expected->print_z);
+    const SupportLayer *contact = support_layer_at(po, expected.top);
     REQUIRE(contact != nullptr);
     REQUIRE(contact->has_extrusions());
     // Nothing is printed above the contact: it is the top of the support stack under this face, not just
@@ -1151,30 +1305,36 @@ TEST_CASE("An organic top gap follows a variable layer height below the nominal 
         }
 
     const double actual_gap = 16.0 - contact->print_z;
-    INFO("contact print_z " << contact->print_z << " expected " << expected->print_z << " = gap " << actual_gap
-         << " contact layer height " << expected->height);
-    CHECK_THAT(contact->print_z, Catch::Matchers::WithinAbs(expected->print_z, 1e-9));
-    // At least the requested distance, and less than one grid step more: the overshoot is bounded by the
-    // step to the next layer that is there, not by the nominal layer height.
+    INFO("contact print_z " << contact->print_z << " expected " << expected.top << " = gap " << actual_gap
+         << " contact layer height " << contact->height << " grid top " << expected.grid_top
+         << " exact " << expected.exact);
+    CHECK_THAT(contact->print_z, Catch::Matchers::WithinAbs(expected.top, 1e-9));
+    // At least the requested distance. When the profile can print the remainder it is exactly the request;
+    // when it cannot, the overshoot is bounded by the step to the next object layer that is really there.
     CHECK(actual_gap >= gap - 1e-9);
-    CHECK(actual_gap < gap + (above->print_z - contact->print_z) + 1e-9);
-    // The quantisation follows the stack. A request below 0.2 gives less than 0.2 of air, on a layer thinner
-    // than 0.2 - quantising to the nominal layer height would give 0.2 of air on a 0.2 mm layer for both.
+    if (expected.exact) {
+        CHECK_THAT(actual_gap, Catch::Matchers::WithinAbs(gap, 1e-9));
+        CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(expected.top - expected.grid_top, 1e-6));
+    } else {
+        CHECK(actual_gap < gap + (above->print_z - contact->print_z) + 1e-9);
+    }
+    // A request below 0.2 still gives less than 0.2 of air, on a grid layer thinner than 0.2 - quantising
+    // to the nominal layer height would give 0.2 of air on a 0.2 mm layer for both.
     CHECK(actual_gap < 0.2 - 1e-6);
-    CHECK(expected->height < 0.2 - 1e-6);
+    CHECK(grid_layer->height < 0.2 - 1e-6);
 
-    // The 0.1 mm layers are printed as 0.1, not as a gap remainder, base paths and interface alike.
-    const size_t paths_checked = check_support_layers_on_object_grid(po);
+    // The 0.1 mm grid layers are printed as 0.1; the one thin contact layer, if any, as the remainder it
+    // covers - base paths and interface alike.
+    const size_t paths_checked = check_support_layers_on_object_grid(po, expected);
     REQUIRE(paths_checked > 0);
 }
 
 // The settings of a reported project in the small: support_top_z_distance 0.12 on a 0.2 mm profile,
-// tree(auto) with the default style - organic - and independent_support_layer_height on. Organic builds its
-// support layers on the object's own layer grid (raft included), and the top contact is placed on one of
-// those whole layers, so 0.12 mm of air is not a layer this pipeline can print from a 0.2 mm stack: the
-// contact takes the highest layer that still leaves at least 0.12, one whole 0.2 mm layer down. That is a
-// safe degradation of the request on this profile, not a lost setting and not a rewritten layer - the layer
-// keeps the object's own 0.2 mm.
+// tree(auto) with the default style - organic - and independent_support_layer_height on. The object's
+// 0.2 mm layers are untouched; the contact takes the highest object layer that keeps at least 0.12 and one
+// thin support layer finishes the remaining 0.08, so the printed air gap is the 0.12 the config asked for
+// rather than a whole object layer. The remainder is printable on this profile (it is at least the minimum
+// layer height); a smaller one would leave the contact on the whole layer and widen the gap.
 //
 // independent_support_layer_height is set here because a project that had it on carries it in its config.
 // It does not give organic independent support layers: organic's grid is the object's layers regardless.
@@ -1185,16 +1345,14 @@ TEST_CASE("An organic top gap follows a variable layer height below the nominal 
 // the config and does not move the grid - not that the support layers are independent.
 //
 // What this case covers: the raw millimetre in the config, the style routing to the organic generator, and
-// the safe degradation of a gap below the layer height. It does not on its own catch a regression in the
-// quantisation rule: on a uniform 0.2 mm stack any rule that rounds the gap up to a whole layer picks the
-// same layer, so the numbers here stay the same. The two variable layer height cases ("... follows a
-// variable layer height below the nominal layer height" and "... takes its contact from the layers a mixed
+// that the gap stays exact below the nominal layer height. The two variable layer height cases ("... follows
+// a variable layer height below the nominal layer height" and "... takes its contact from the layers a mixed
 // profile produced") are the ones that separate the rules - a fix that scales the gap by the nominal layer
 // height instead of following the actual stack lands on a different layer there.
 //
 // The numbers are this test's own mesh and config. A real project's slice depends on its geometry and its
 // profile and is not reproducible from this repository.
-TEST_CASE("A gap below the layer height leaves one whole layer of air on a 0.2 mm profile", "[TreeSupportOrganicGap]")
+TEST_CASE("A gap below the layer height is printed exactly on a 0.2 mm profile", "[TreeSupportOrganicGap]")
 {
     Slic3r::Print print;
     slice_with_tree_support(two_tier_mesh(), print, "default", 30, 0, 0, {
@@ -1213,23 +1371,20 @@ TEST_CASE("A gap below the layer height leaves one whole layer of air on a 0.2 m
     Slic3r::TreeSupport3D::TreeSupportMeshGroupSettings mesh_settings(po);
     CHECK_THAT(mesh_settings.support_top_z_distance_mm, Catch::Matchers::WithinAbs(0.12, 1e-9));
 
-    const Layer *expected = top_contact_layer(po, 16.0, 0.12);
-    REQUIRE(expected != nullptr);
-    REQUIRE(expected->height >= 0.2 - 1e-6);
+    const ContactExpectation expected = expected_contact(po, 16.0, 0.12);
+    INFO("expected contact " << expected.top << " grid top " << expected.grid_top << " exact " << expected.exact);
+    REQUIRE(expected.exact);
 
-    const SupportLayer *contact = support_layer_at(po, expected->print_z);
+    const SupportLayer *contact = support_layer_at(po, expected.top);
     REQUIRE(contact != nullptr);
     REQUIRE(contact->has_extrusions());
-    INFO("contact print_z " << contact->print_z << " = gap " << 16.0 - contact->print_z);
-    // At least the requested distance ...
-    CHECK(contact->print_z <= 16.0 - 0.12 + 1e-9);
-    // ... quantised up to the next whole layer, and no further.
-    CHECK(16.0 - contact->print_z < 0.12 + expected->height + 1e-9);
-    CHECK_THAT(16.0 - contact->print_z, Catch::Matchers::WithinAbs(0.2, 1e-9));
-
-    // Nothing was bent to reach that gap: the contact still prints the object layer's own 0.2 mm.
-    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(expected->height, 1e-12));
-    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(0.2, 1e-12));
+    INFO("contact print_z " << contact->print_z << " = gap " << 16.0 - contact->print_z
+                            << " height " << contact->height);
+    // The printed gap is the requested distance ...
+    CHECK_THAT(16.0 - contact->print_z, Catch::Matchers::WithinAbs(0.12, 1e-9));
+    // ... finished by a thin layer that prints the remainder it covers, not the object layer's 0.2 mm.
+    CHECK_THAT(contact->height, Catch::Matchers::WithinAbs(expected.top - expected.grid_top, 1e-6));
+    CHECK(contact->height < 0.2 - 1e-6);
 }
 
 // The same question on a profile that is not one uniform thin section under the face: 0.2 mm layers up to
@@ -1247,8 +1402,10 @@ TEST_CASE("An organic top gap takes its contact from the layers a mixed profile 
     slice_with_layer_height_profile(print, profile, gap);
     const PrintObject &po = *print.objects().front();
 
-    const Layer *expected = top_contact_layer(po, 16.0, gap);
-    REQUIRE(expected != nullptr);
+    const ContactExpectation expected   = expected_contact(po, 16.0, gap);
+    const Layer            *grid_layer = top_contact_layer(po, 16.0, gap);
+    REQUIRE(grid_layer != nullptr);
+    CHECK_THAT(grid_layer->print_z, Catch::Matchers::WithinAbs(expected.grid_top, 1e-9));
 
     // The premise: the layer spanning the face is a nominal one, the contact layer under it is thinner, and
     // it is not the 0.1 mm of the dip either. Without all three this case could pass on a uniform grid.
@@ -1257,13 +1414,13 @@ TEST_CASE("An organic top gap takes its contact from the layers a mixed profile 
     const Layer *face_layer = layer_above(po, *below_face);
     REQUIRE(face_layer != nullptr);
     CHECK(face_layer->height > 0.195);
-    REQUIRE(expected->height < 0.195);
-    CHECK(expected->height > 0.1 + 1e-6);
+    REQUIRE(grid_layer->height < 0.195);
+    CHECK(grid_layer->height > 0.1 + 1e-6);
 
-    const Layer *above = layer_above(po, *expected);
+    const Layer *above = layer_above(po, *grid_layer);
     REQUIRE(above != nullptr);
 
-    const SupportLayer *contact = support_layer_at(po, expected->print_z);
+    const SupportLayer *contact = support_layer_at(po, expected.top);
     REQUIRE(contact != nullptr);
     REQUIRE(contact->has_extrusions());
     for (const SupportLayer *layer : po.support_layers())
@@ -1273,14 +1430,18 @@ TEST_CASE("An organic top gap takes its contact from the layers a mixed profile 
         }
 
     const double actual_gap = 16.0 - contact->print_z;
-    INFO("contact print_z " << contact->print_z << " expected " << expected->print_z << " = gap " << actual_gap
-         << " contact layer height " << expected->height);
-    CHECK_THAT(contact->print_z, Catch::Matchers::WithinAbs(expected->print_z, 1e-9));
-    // At least the requested distance, and less than the step to the next layer that is actually there more.
+    INFO("contact print_z " << contact->print_z << " expected " << expected.top << " = gap " << actual_gap
+         << " contact layer height " << contact->height << " exact " << expected.exact);
+    CHECK_THAT(contact->print_z, Catch::Matchers::WithinAbs(expected.top, 1e-9));
+    // At least the requested distance; exactly it whenever the profile can print the remainder, and otherwise
+    // bounded by the step to the next object layer that is really there.
     CHECK(actual_gap >= gap - 1e-9);
-    CHECK(actual_gap < gap + (above->print_z - contact->print_z) + 1e-9);
+    if (expected.exact)
+        CHECK_THAT(actual_gap, Catch::Matchers::WithinAbs(gap, 1e-9));
+    else
+        CHECK(actual_gap < gap + (above->print_z - contact->print_z) + 1e-9);
 
-    const size_t paths_checked = check_support_layers_on_object_grid(po);
+    const size_t paths_checked = check_support_layers_on_object_grid(po, expected);
     REQUIRE(paths_checked > 0);
 }
 
@@ -1543,17 +1704,25 @@ TEST_CASE("A thicker first layer keeps the organic layer counts", "[TreeSupportO
         CHECK_THAT(po.get_layer(i)->print_z, Catch::Matchers::WithinAbs(po_plain.get_layer(i)->print_z, 1e-12));
         CHECK_THAT(po.get_layer(i)->height, Catch::Matchers::WithinAbs(po_plain.get_layer(i)->height, 1e-12));
     }
-    // ... and every support layer prints one of those layers, at that layer's height.
+    // ... and every support layer prints one of those layers at its height, except the one thin contact
+    // layer that finishes the exact gap: the first layer's 0.32 mm shifts the whole stack, so 0.2 of air
+    // does not land on a layer top and the remainder is printed by a layer of its own.
     REQUIRE(! po.support_layers().empty());
+    const ContactExpectation expected = expected_contact(po, 16.0, 0.2);
+    size_t                   thin_layers = 0;
     for (const SupportLayer *layer : po.support_layers()) {
-        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
-        const Layer *object_layer = nullptr;
-        for (const Layer *candidate : po.layers())
-            if (std::abs(candidate->print_z - layer->print_z) < 1e-9)
-                object_layer = candidate;
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height
+                                      << " expected contact " << expected.top << " exact " << expected.exact);
+        if (expected.exact && std::abs(layer->print_z - expected.top) < 1e-9) {
+            ++ thin_layers;
+            CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(expected.top - expected.grid_top, 1e-6));
+            continue;
+        }
+        const Layer *object_layer = object_layer_at(po, layer->print_z);
         REQUIRE(object_layer != nullptr);
         CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-12));
     }
+    CHECK(thin_layers == (expected.exact ? 1u : 0u));
 }
 
 // One overhang area can hold two downward faces at different heights: a slope whose lowest vertex sits
@@ -1738,51 +1907,56 @@ TEST_CASE("A shallow slope sharing its overhang area with a shelf keeps the requ
 // ::build_layer_grid()), so the transformed mesh and the grid are in one and the same frame and the
 // overhang search must not convert between them. This runs the whole pipeline on a belt printer, where the
 // offset is not zero, and measures the gap under every point of the contact against the mesh.
+// The belt fixture: two_tier_mesh() on a 45 degree belt printer, with and without organic support.
+// Returns what the generator printed to stdout, i.e. the support diagnostics.
+std::string slice_belt_two_tier(Slic3r::Print &print, const TriangleMesh &mesh, const bool with_support, const double gap)
+{
+
+    Slic3r::Model        model;
+    Slic3r::ModelObject *object = model.add_object();
+    object->name = "two_tier.stl";
+    object->add_volume(mesh);
+    object->add_instance();
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "belt_printer",                 1 },
+        { "belt_slice_rotation",          "x" },
+        { "belt_slice_rotation_angle",    45 },
+        { "gcode_remap_x",                "rev_x" },
+        { "gcode_remap_y",                "pos_z" },
+        { "gcode_remap_z",                "pos_y" },
+        { "enable_support",               with_support ? 1 : 0 },
+        { "support_type",                 "tree(auto)" },
+        { "support_style",                "organic" },
+        { "support_threshold_angle",      30 },
+        { "support_top_z_distance",       gap },
+        { "support_interface_top_layers", 2 },
+        { "layer_height",                 0.2 },
+        { "initial_layer_print_height",   0.2 },
+        { "skirt_loops",                  0 },
+        { "z_hop",                        0 },
+        { "machine_start_gcode",          "T[initial_tool]\n" },
+        { "before_layer_change_gcode",    "G92 E0" },
+    });
+    print.apply(model, config);
+    const std::string validation = print.validate().string;
+    INFO("validate: " << validation);
+    REQUIRE(validation.empty());
+    ScopedStdoutCapture capture;
+    print.process();
+    return capture.finish();
+}
+
 TEST_CASE("A belt print keeps the organic top gap it asked for", "[TreeSupportOrganicGap][belt]")
 {
     const TriangleMesh mesh = two_tier_mesh();
     constexpr double  gap   = 0.25;
 
-    auto slice_belt = [&mesh](Slic3r::Print &print, const bool with_support) {
-        Slic3r::Model        model;
-        Slic3r::ModelObject *object = model.add_object();
-        object->name = "two_tier.stl";
-        object->add_volume(mesh);
-        object->add_instance();
-        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
-        config.set_deserialize_strict({
-            { "belt_printer",                 1 },
-            { "belt_slice_rotation",          "x" },
-            { "belt_slice_rotation_angle",    45 },
-            { "gcode_remap_x",                "rev_x" },
-            { "gcode_remap_y",                "pos_z" },
-            { "gcode_remap_z",                "pos_y" },
-            { "enable_support",               with_support ? 1 : 0 },
-            { "support_type",                 "tree(auto)" },
-            { "support_style",                "organic" },
-            { "support_threshold_angle",      30 },
-            { "support_top_z_distance",       gap },
-            { "support_interface_top_layers", 2 },
-            { "layer_height",                 0.2 },
-            { "initial_layer_print_height",   0.2 },
-            { "skirt_loops",                  0 },
-            { "z_hop",                        0 },
-            { "machine_start_gcode",          "T[initial_tool]\n" },
-            { "before_layer_change_gcode",    "G92 E0" },
-        });
-        print.apply(model, config);
-        const std::string validation = print.validate().string;
-        INFO("validate: " << validation);
-        REQUIRE(validation.empty());
-        ScopedStdoutCapture capture;
-        print.process();
-        return capture.finish();
-    };
 
     Slic3r::Print     supported;
     Slic3r::Print     unsupported;
-    const std::string diagnostics = slice_belt(supported, true);
-    slice_belt(unsupported, false);
+    const std::string diagnostics = slice_belt_two_tier(supported, mesh, true, gap);
+    slice_belt_two_tier(unsupported, mesh, false, gap);
     CHECK(diagnostic_count(diagnostics) == 0);
     CHECK(critical_diagnostic_count(diagnostics) == 0);
 
@@ -1806,30 +1980,10 @@ TEST_CASE("A belt print keeps the organic top gap it asked for", "[TreeSupportOr
         CHECK_THAT(layer.slice_z, Catch::Matchers::WithinAbs(plain.slice_z, 1e-12));
     }
 
-    // Every support layer sits on an object layer Z and prints that layer's height, and so does every
-    // extrusion path of it: no gap remainder became a layer height. This belt configuration emits base
-    // support paths only (no roof / interface layer is produced for it), so the path check covers
-    // erSupportMaterial here; the interface path heights are asserted by the non-belt cases above.
-    REQUIRE(! po.support_layers().empty());
-    const std::multiset<double> profile_heights = object_layer_heights(po);
-    size_t                      base_paths      = 0;
-    for (const SupportLayer *layer : po.support_layers()) {
-        const auto it = std::find_if(po.layers().begin(), po.layers().end(),
-            [&layer](const Layer *object_layer) { return std::abs(object_layer->print_z - layer->print_z) < 1e-9; });
-        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
-        CHECK(it != po.layers().end());
-        if (it == po.layers().end())
-            continue;
-        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
-        for (const SupportPathRole &path : support_path_roles(*layer)) {
-            INFO("support path role " << int(path.role) << " height " << path.height);
-            CHECK(profile_heights.find(path.height) != profile_heights.end());
-            ++base_paths;
-        }
-    }
-    REQUIRE(base_paths > 0);
-
-    // The top contact: the highest support layer that carries fill.
+    // The top contact: the highest support layer that carries fill. On a belt print the requested gap
+    // does not have to land on a layer top either, and then this layer is the exact contact layer, whose
+    // Z is the requested gap rather than an object layer Z. It is checked against the mesh below; every
+    // other support layer must still sit on an object layer Z.
     const SupportLayer *contact = nullptr;
     for (const SupportLayer *layer : po.support_layers()) {
         Points points;
@@ -1839,6 +1993,36 @@ TEST_CASE("A belt print keeps the organic top gap it asked for", "[TreeSupportOr
     }
     REQUIRE(contact != nullptr);
     INFO("contact print_z " << contact->print_z << " height " << contact->height);
+
+    REQUIRE(! po.support_layers().empty());
+    const std::multiset<double> profile_heights = object_layer_heights(po);
+    size_t                      base_paths      = 0;
+    for (const SupportLayer *layer : po.support_layers()) {
+        const auto it = std::find_if(po.layers().begin(), po.layers().end(),
+            [&layer](const Layer *object_layer) { return std::abs(object_layer->print_z - layer->print_z) < 1e-9; });
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
+        if (it == po.layers().end()) {
+            // Not a grid layer: this is the exact contact layer that finishes a gap which does not end on an
+            // object layer top. It must stand on a real layer top and stay thinner than any profile layer,
+            // so the gap remainder cannot sneak into the object's own layer stack.
+            const auto below = std::find_if(po.layers().begin(), po.layers().end(),
+                [&layer](const Layer *object_layer) {
+                    return std::abs(object_layer->print_z - (layer->print_z - layer->height)) < 1e-9; });
+            INFO("exact contact layer bottom " << (layer->print_z - layer->height));
+            CHECK(below != po.layers().end());
+            CHECK(layer->height > 0.);
+            CHECK(layer->height < *profile_heights.begin());
+            continue;
+        }
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs((*it)->height, 1e-12));
+        for (const SupportPathRole &path : support_path_roles(*layer)) {
+            INFO("support path role " << int(path.role) << " height " << path.height);
+            CHECK(is_allowed_support_path_height(po, *layer, path.height));
+            ++base_paths;
+        }
+    }
+    REQUIRE(base_paths > 0);
+
 
     // The mesh in the frame it was sliced in. Applying `trafo_sliced()` puts the vertices in the frame of
     // `Layer::lslices`, and that frame carries the belt rotation but not the global offset the layers got
@@ -2124,4 +2308,756 @@ TEST_CASE("A raft and a thicker first layer keep the per-layer growth at its nom
         CHECK_THAT(config.bp_radius_increase_at(layer_idx),
                    Catch::Matchers::WithinAbs(config.bp_radius_increase_per_layer, 1e-6));
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Exact top gap: what organic and tree_slim actually print on a fixed 0.2 mm profile.
+//
+// The cases above pin the layer synchronised semantics: the contact takes a whole existing layer, so a
+// requested 0.1 mm comes out as 0.2. The measurement below records what each engine really produces -
+// the support Z and height of every printed support layer, the air gap measured point by point against
+// the mesh, and the Z the G-code actually prints the support at - so a change that makes the gap exact
+// is judged on the printed result rather than on the layer grid.
+// ---------------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr double exact_gap_overhang_face_z = 16.0; // underside of two_tier_mesh()'s upper plate
+
+struct SupportPathSample
+{
+    ExtrusionRole role;
+    double        height;
+    double        width;
+    double        mm3_per_mm;
+};
+
+std::vector<SupportPathSample> support_path_samples(const SupportLayer &layer)
+{
+    std::vector<SupportPathSample> paths;
+    for (const ExtrusionEntity *entity : layer.support_fills.flatten().entities)
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity))
+            paths.push_back({ path->role(), double(path->height), double(path->width), double(path->mm3_per_mm) });
+    return paths;
+}
+
+// Shift from the print frame (scaled Points of the slices and support fills) to the mesh frame, taken
+// from a layer whose slice spans the whole model footprint instead of being assumed.
+std::optional<std::pair<double, double>> print_to_mesh_shift(const PrintObject &po, const TriangleMesh &mesh)
+{
+    const BoundingBoxf3 mesh_bb = mesh.bounding_box();
+    for (const Layer *layer : po.layers()) {
+        if (layer->lslices.empty())
+            continue;
+        const BoundingBox bb = get_extents(layer->lslices);
+        if (std::abs(unscaled(bb.max.x() - bb.min.x()) - double(mesh_bb.max.x() - mesh_bb.min.x())) > 1e-3)
+            continue;
+        if (std::abs(unscaled(bb.max.y() - bb.min.y()) - double(mesh_bb.max.y() - mesh_bb.min.y())) > 1e-3)
+            continue;
+        return std::make_pair(unscaled(bb.min.x()) - double(mesh_bb.min.x()),
+                              unscaled(bb.min.y()) - double(mesh_bb.min.y()));
+    }
+    return std::nullopt;
+}
+
+struct OverhangSupportSample
+{
+    double face_z;   // lowest mesh face above this support point
+    double print_z;  // support layer Z the point is printed at
+    double height;   // SupportLayer::height of that layer
+};
+
+// Every support point printed under the upper plate's underside (the face at z = 16.0), with the face
+// above it. Points over the column, the lower plate or open air are dropped, so the sample is the top
+// contact under the overhang and not some unrelated highest support Z.
+std::vector<OverhangSupportSample> overhang_support_samples(const PrintObject &po, const TriangleMesh &mesh,
+                                                            double shift_x, double shift_y)
+{
+    std::vector<OverhangSupportSample> samples;
+    for (const SupportLayer *layer : po.support_layers()) {
+        Points points;
+        layer->support_fills.collect_points(points);
+        for (const Point &p : points) {
+            const double                x    = unscaled(p.x()) - shift_x;
+            const double                y    = unscaled(p.y()) - shift_y;
+            const std::optional<double> face = face_above(mesh, x, y, layer->print_z + 1e-6);
+            if (face && std::abs(*face - exact_gap_overhang_face_z) < 1e-3)
+                samples.push_back({ *face, layer->print_z, layer->height });
+        }
+    }
+    return samples;
+}
+
+// One extruding move of the emitted G-code: the machine Z it is printed at and the extruded length. The Z
+// is the modal machine state (G90/G91 for XYZ, G92 for the current position, G0/G1/G2/G3 for the move),
+// not the ;Z: / ;HEIGHT: comments, so a layer model that never reaches the machine cannot pass.
+struct SupportMotionSample
+{
+    double z;
+    double e_length;
+};
+
+struct GcodeMotion
+{
+    std::vector<SupportMotionSample> support_moves;
+    std::set<double>                 support_z;
+    // Extruded length at a Z, within `tolerance`.
+    double extrusion_at(const double z, const double tolerance = 1e-3) const
+    {
+        double total = 0.;
+        for (const SupportMotionSample &move : support_moves)
+            if (std::abs(move.z - z) <= tolerance)
+                total += move.e_length;
+        return total;
+    }
+};
+
+// Axis words of one G-code line, without the command number. A command letter (G/M/T) is skipped with
+// its number; every other letter carries the value that follows it.
+std::vector<std::pair<char, double>> gcode_axis_words(const std::string &line)
+{
+    std::vector<std::pair<char, double>> words;
+    for (size_t i = 0; i < line.size(); ++ i) {
+        const char c = line[i];
+        if (c == ';')
+            break;
+        if (! std::isalpha(static_cast<unsigned char>(c)))
+            continue;
+        size_t j = i + 1;
+        while (j < line.size() && (line[j] == ' ' || line[j] == '='))
+            ++ j;
+        if (c == 'G' || c == 'M' || c == 'T') {
+            while (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j])))
+                ++ j;
+            i = j - 1;
+            continue;
+        }
+        char        *end   = nullptr;
+        const double value = std::strtod(line.c_str() + j, &end);
+        if (end == line.c_str() + j)
+            continue;
+        words.emplace_back(c, value);
+        i = size_t(end - line.c_str()) - 1;
+    }
+    return words;
+}
+
+bool gcode_is_command(const std::string &line, const char *command)
+{
+    const size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos || line.compare(first, strlen(command), command) != 0)
+        return false;
+    const size_t after = first + strlen(command);
+    return after >= line.size() || line[after] == ' ' || line[after] == '\t' || line[after] == ';';
+}
+
+// Every extruding move of the G-code that prints support, with its machine Z. G90/G91 switch all axes
+// between absolute and relative, G92 defines the current position, M82/M83 switch the extruder axis. The
+// emitted G-code starts in the absolute XYZ / absolute E default the machine is reset to.
+GcodeMotion support_gcode_motion(const std::string &gcode)
+{
+    GcodeMotion motion;
+    double      x = 0., y = 0., z = 0., e = 0.;
+    bool        xyz_relative = false;
+    bool        e_relative   = false;
+    bool        support      = false;
+    std::istringstream lines(gcode);
+    std::string        line;
+    while (std::getline(lines, line)) {
+        if (! line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.rfind(";TYPE:", 0) == 0) {
+            support = line.rfind(";TYPE:Support", 0) == 0;
+            continue;
+        }
+        if (line.rfind(";", 0) == 0)
+            continue;
+        if (gcode_is_command(line, "G90")) { xyz_relative = false; continue; }
+        if (gcode_is_command(line, "G91")) { xyz_relative = true;  continue; }
+        if (gcode_is_command(line, "M82")) { e_relative   = false; continue; }
+        if (gcode_is_command(line, "M83")) { e_relative   = true;  continue; }
+        const std::vector<std::pair<char, double>> words = gcode_axis_words(line);
+        if (gcode_is_command(line, "G92")) {
+            for (const std::pair<char, double> &word : words) {
+                if (word.first == 'X') x = word.second;
+                else if (word.first == 'Y') y = word.second;
+                else if (word.first == 'Z') z = word.second;
+                else if (word.first == 'E') e = word.second;
+            }
+            continue;
+        }
+        if (! gcode_is_command(line, "G0") && ! gcode_is_command(line, "G1") &&
+            ! gcode_is_command(line, "G2") && ! gcode_is_command(line, "G3"))
+            continue;
+        const double old_e = e;
+        bool         has_xy = false;
+        for (const std::pair<char, double> &word : words) {
+            switch (word.first) {
+            case 'X': x = xyz_relative ? x + word.second : word.second; has_xy = true; break;
+            case 'Y': y = xyz_relative ? y + word.second : word.second; has_xy = true; break;
+            case 'Z': z = xyz_relative ? z + word.second : word.second; break;
+            case 'E': e = e_relative ? e + word.second : word.second;   break;
+            default: break;
+            }
+        }
+        const double extruded = e - old_e;
+        if (support && has_xy && extruded > 0.) {
+            motion.support_moves.push_back({ z, extruded });
+            motion.support_z.insert(std::round(z * 1e6) / 1e6);
+        }
+    }
+    return motion;
+}
+
+// The support area a layer covers including the spacing between its lines: what it really lays under the
+// layer above, as opposed to the individual line polygons.
+Polygons support_covered_area(const SupportLayer &layer)
+{
+    return layer.support_fills.polygons_covered_by_spacing();
+}
+
+// The object layer face the upper plate starts at, derived from the sliced stack instead of assumed: the
+// first layer whose slice is the plate footprint (the column alone is far smaller) begins at the face.
+double plate_underside_z(const PrintObject &po)
+{
+    for (const Layer *layer : po.layers()) {
+        const Polygons polygons = to_polygons(layer->lslices);
+        if (! polygons.empty() && area(polygons) * SCALING_FACTOR * SCALING_FACTOR > 1000.)
+            return layer->print_z - layer->height;
+    }
+    return 0.;
+}
+
+// Every printed path of `layer` must be as thick as the material this layer really lays down at that XY:
+// its own height where nothing else is in its slab, and - where a support layer sits inside the slab - the
+// thinner height the over-extrusion mitigation leaves above it (is_allowed_support_path_height()). The
+// height reaches Flow::with_height(), so a wrong one is a wrong material thickness, not a cosmetic value;
+// and a reduced height has to carry the flow that height implies, because the mitigation rebuilds the
+// fragment with Flow(width, height, -1).
+size_t check_layer_paths_thickness(const SupportLayer &layer, const PrintObject &po)
+{
+    size_t checked = 0;
+    for (const SupportPathSample &path : support_path_samples(layer)) {
+        INFO("path role " << int(path.role) << " height " << path.height << " width " << path.width
+                          << " mm3_per_mm " << path.mm3_per_mm << " layer height " << layer.height
+                          << " layer print_z " << layer.print_z);
+        CHECK(path.width > 0.);
+        CHECK(path.mm3_per_mm > 0.);
+        CHECK(is_allowed_support_path_height(po, layer, path.height));
+        if (std::abs(path.height - layer.height) > 1e-6)
+            CHECK_THAT(path.mm3_per_mm, Catch::Matchers::WithinRel(Flow(path.width, float(path.height), -1.f).mm3_per_mm(), 1e-6));
+        ++ checked;
+    }
+    return checked;
+}
+
+// `upper` stands on `lower`: no covered part of the upper layer lies outside the lower one, allowing one
+// line width for the pattern/spacing difference between two interface layers.
+void check_supported_from_below(const SupportLayer &upper, const SupportLayer &lower)
+{
+    const Polygons upper_area = support_covered_area(upper);
+    const Polygons lower_area = support_covered_area(lower);
+    REQUIRE(! upper_area.empty());
+    REQUIRE(! lower_area.empty());
+    const Polygons uncovered = diff(upper_area, offset(lower_area, scale_(0.05)));
+    INFO("upper print_z " << upper.print_z << " lower print_z " << lower.print_z
+                          << " uncovered area " << area(uncovered) << " of " << area(upper_area));
+    CHECK(area(uncovered) < 0.01 * area(upper_area));
+    CHECK_THAT(upper.bottom_z(), Catch::Matchers::WithinAbs(lower.print_z, 1e-6));
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The over-extrusion mitigation: where a support layer overlaps another support layer inside its own slab,
+// modulate_extrusion_by_overlapping_layers() re-fragments its toolpaths so the overlap is printed thinner.
+// A support material layer is not a flat list of paths - a large island is wrapped in an
+// ExtrusionEntityCollection (no_sort) and plain ExtrusionPath objects are appended next to it - so the
+// mitigation has to dispatch per entity instead of skipping the whole list.
+// ---------------------------------------------------------------------------------------------------
+struct ModulatedPathSample
+{
+    ExtrusionRole role;
+    double        height;
+    float         width;
+    double        mm3_per_mm;
+    double        min_x;
+    double        max_x;
+    bool          nested;   // the path came out of an ExtrusionEntityCollection of the list
+};
+
+void collect_modulated_paths(const ExtrusionEntity &entity, const bool nested, std::vector<ModulatedPathSample> &out)
+{
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection*>(&entity); collection != nullptr) {
+        for (const ExtrusionEntity *child : collection->entities)
+            collect_modulated_paths(*child, true, out);
+        return;
+    }
+    if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath*>(&entity); multipath != nullptr) {
+        for (const ExtrusionPath &path : multipath->paths)
+            collect_modulated_paths(path, nested, out);
+        return;
+    }
+    if (const auto *path = dynamic_cast<const ExtrusionPath*>(&entity); path != nullptr) {
+        double min_x = 0.;
+        double max_x = 0.;
+        bool   first = true;
+        for (const Point3 &point : path->polyline.points) {
+            const double x = unscaled(point.x());
+            min_x = first ? x : std::min(min_x, x);
+            max_x = first ? x : std::max(max_x, x);
+            first = false;
+        }
+        out.push_back({ path->role(), double(path->height), path->width, double(path->mm3_per_mm), min_x, max_x, nested });
+    }
+}
+
+// The runs of a support layer that the mitigation reduced below the layer's own height, and the ones that
+// still carry it.
+struct OverlapThinning
+{
+    std::vector<ModulatedPathSample> reduced;
+    std::vector<ModulatedPathSample> full;
+    size_t                           reduced_nested { 0 };
+    size_t                           reduced_plain  { 0 };
+};
+
+OverlapThinning overlap_thinning(const SupportLayer &layer)
+{
+    OverlapThinning                  result;
+    std::vector<ModulatedPathSample> paths;
+    for (const ExtrusionEntity *entity : layer.support_fills.entities)
+        collect_modulated_paths(*entity, false, paths);
+    for (const ModulatedPathSample &path : paths) {
+        if (path.height < layer.height - 1e-6) {
+            result.reduced.push_back(path);
+            (path.nested ? result.reduced_nested : result.reduced_plain) += 1;
+        } else
+            result.full.push_back(path);
+    }
+    return result;
+}
+
+void delete_toolpath_entities(ExtrusionEntitiesPtr &entities)
+{
+    for (ExtrusionEntity *entity : entities)
+        delete entity;
+    entities.clear();
+}
+
+Polygons axis_rectangle(const double x0, const double y0, const double x1, const double y1)
+{
+    Polygon polygon;
+    polygon.points = { Point(coord_t(scale_(x0)), coord_t(scale_(y0))),
+                       Point(coord_t(scale_(x1)), coord_t(scale_(y0))),
+                       Point(coord_t(scale_(x1)), coord_t(scale_(y1))),
+                       Point(coord_t(scale_(x0)), coord_t(scale_(y1))) };
+    return { polygon };
+}
+
+// One straight support line of a synthetic layer, built exactly as the generator builds them.
+void append_test_support_line(ExtrusionEntitiesPtr &dst, const double y, const double x0, const double x1,
+                              const double mm3_per_mm, const float width, const float height)
+{
+    Polylines lines;
+    lines.push_back(Polyline(Points{ Point(coord_t(scale_(x0)), coord_t(scale_(y))),
+                                     Point(coord_t(scale_(x1)), coord_t(scale_(y))) }));
+    extrusion_entities_append_paths(dst, std::move(lines), ExtrusionRole::erSupportMaterial, mm3_per_mm, width, height);
+}
+
+} // namespace
+
+TEST_CASE("The overlap modulation thins the runs of a support layer that holds island collections",
+          "[TreeSupportOrganicGap]")
+{
+    constexpr float  width     = 0.4f;
+    constexpr float  height    = 0.2f;
+    const double     mm3_full  = Flow(width, height, -1.f).mm3_per_mm();
+    constexpr double overlap_x = 5.;   // the layer above covers x in [0, 5] of this layer's x in [0, 10]
+
+    SupportGeneratorLayer layer;
+    layer.print_z  = 0.4;
+    layer.bottom_z = 0.2;
+    layer.height   = 0.2;
+
+    SupportGeneratorLayer overlapping_layer;
+    overlapping_layer.print_z  = 0.3;
+    overlapping_layer.bottom_z = 0.1;
+    overlapping_layer.height   = 0.2;
+    overlapping_layer.polygons = axis_rectangle(0., 0., overlap_x, 10.);
+    SupportGeneratorLayersPtr overlapping{ &overlapping_layer };
+
+    // [plain path][island collection: 2 paths, no_sort][plain path], the shape a support material layer of
+    // tree_supports_generate_paths() has when it holds a large island next to small ones.
+    ExtrusionEntitiesPtr entities;
+    append_test_support_line(entities, 1., 0., 10., mm3_full, width, height);
+    auto *island = new ExtrusionEntityCollection();
+    island->no_sort = true;
+    append_test_support_line(island->entities, 3., 0., 10., mm3_full, width, height);
+    append_test_support_line(island->entities, 7., 0., 10., mm3_full, width, height);
+    entities.push_back(island);
+    append_test_support_line(entities, 9., 0., 10., mm3_full, width, height);
+    REQUIRE(entities.size() == 3);
+    REQUIRE(island->entities.size() == 2);
+
+    modulate_extrusion_by_overlapping_layers(entities, layer, overlapping);
+
+    // The list keeps its structure: the island is the same collection object, still no_sort, still one entry
+    // per generated path, in the same position.
+    REQUIRE(entities.size() == 3);
+    CHECK(entities[1] == island);
+    CHECK(island->no_sort);
+    REQUIRE(island->entities.size() == 2);
+
+    std::vector<ModulatedPathSample> paths;
+    for (const ExtrusionEntity *entity : entities)
+        collect_modulated_paths(*entity, false, paths);
+
+    const double thin_height = layer.print_z - overlapping_layer.print_z;   // 0.1
+    const double thin_mm3    = Flow(width, float(thin_height), -1.f).mm3_per_mm();
+    size_t thin = 0, full = 0, thin_nested = 0, thin_plain = 0, full_nested = 0, full_plain = 0;
+    double thin_length = 0., full_length = 0., total_length = 0.;
+    for (const ModulatedPathSample &path : paths) {
+        INFO("path role " << int(path.role) << " height " << path.height << " x " << path.min_x << ".." << path.max_x
+                          << " nested " << path.nested << " mm3_per_mm " << path.mm3_per_mm);
+        CHECK_THAT(double(path.width), Catch::Matchers::WithinAbs(double(width), 1e-9));
+        CHECK(path.role == erSupportMaterial);
+        const double length = path.max_x - path.min_x;
+        total_length += length;
+        CHECK(length > 0.);
+        if (std::abs(path.height - thin_height) < 1e-6) {
+            ++ thin;
+            (path.nested ? thin_nested : thin_plain) += 1;
+            // The reduced run is the part inside the overlapping area and it carries the flow its own
+            // thickness implies - not the full layer's flow spread over a thinner layer.
+            CHECK(path.min_x >= -1e-6);
+            CHECK(path.max_x <= overlap_x + 0.5 * double(width) + 1e-3);
+            CHECK_THAT(path.mm3_per_mm, Catch::Matchers::WithinRel(thin_mm3, 1e-6));
+            thin_length += length;
+        } else {
+            ++ full;
+            (path.nested ? full_nested : full_plain) += 1;
+            // The rest of that path lies outside the overlap and keeps the layer's full thickness.
+            CHECK_THAT(path.height, Catch::Matchers::WithinAbs(double(height), 1e-6));
+            CHECK_THAT(path.mm3_per_mm, Catch::Matchers::WithinRel(mm3_full, 1e-6));
+            CHECK(path.min_x >= overlap_x - 1e-3);
+            CHECK(path.max_x <= 10. + 1e-6);
+            full_length += length;
+        }
+    }
+    // Four generated paths (two plain, two inside the island), each split into a thin and a full run.
+    CHECK(thin == 4);
+    CHECK(full == 4);
+    CHECK(thin_nested == 2);
+    CHECK(thin_plain == 2);
+    CHECK(full_nested == 2);
+    CHECK(full_plain == 2);
+    CHECK(thin_length > 0.);
+    CHECK(full_length > 0.);
+    // Nothing is lost: the four 10 mm lines still total 40 mm of extrusion.
+    CHECK_THAT(total_length, Catch::Matchers::WithinAbs(40., 0.05));
+
+    delete_toolpath_entities(entities);
+
+    // With nothing inside the slab the list is left exactly as generated: same entities, same numbers.
+    ExtrusionEntitiesPtr untouched;
+    append_test_support_line(untouched, 1., 0., 10., mm3_full, width, height);
+    auto *untouched_island = new ExtrusionEntityCollection();
+    untouched_island->no_sort = true;
+    append_test_support_line(untouched_island->entities, 3., 0., 10., mm3_full, width, height);
+    untouched.push_back(untouched_island);
+    ExtrusionEntity *const plain_before  = untouched[0];
+    ExtrusionEntity *const nested_before = untouched_island->entities[0];
+    modulate_extrusion_by_overlapping_layers(untouched, layer, SupportGeneratorLayersPtr{});
+    REQUIRE(untouched.size() == 2);
+    CHECK(untouched[0] == plain_before);
+    CHECK(untouched[1] == untouched_island);
+    REQUIRE(untouched_island->entities.size() == 1);
+    CHECK(untouched_island->entities[0] == nested_before);
+    CHECK_THAT(dynamic_cast<ExtrusionPath*>(untouched[0])->height, Catch::Matchers::WithinAbs(double(height), 1e-9));
+    delete_toolpath_entities(untouched);
+}
+
+// The user-visible requirement: support_top_z_distance is a distance in millimetres, so 0.1 mm on a
+// 0.2 mm profile has to leave 0.1 mm of air under the overhang, not one whole 0.2 mm layer. The contact
+// layer of the object grid stays where it is and keeps its height; one thin support layer on top of it
+// finishes the exact gap.
+//
+// The object's own stack is untouched - that constraint is not negotiable - and the assertions refuse the
+// shortcuts: the thin layer's height is the Z span it really prints over, every path of it carries that
+// height (it reaches Flow::with_height()), the layer stands on the one below at the same XY, and the
+// G-code moves the machine to that Z and extrudes support there. The G-code Z comes from the modal motion
+// state, not from the ;Z: / ;HEIGHT: comments.
+TEST_CASE("An organic top gap of 0.1 mm leaves 0.1 mm of air under the overhang on a 0.2 mm profile",
+          "[TreeSupportOrganicGapExact]")
+{
+    constexpr double   gap  = 0.1;
+    const TriangleMesh mesh = two_tier_mesh();
+
+    Slic3r::Print print;
+    slice_with_tree_support(mesh, print, "organic", 30, 0, 0, {
+        { "support_top_z_distance",       gap },
+        { "support_interface_top_layers", 2 },
+    });
+    const PrintObject &po = *print.objects().front();
+
+    // The object's real layers are the slicing result and stay 0.2 mm; a fix may not buy the exact gap
+    // by rewriting them.
+    REQUIRE(po.layer_count() == 95);
+    for (size_t i = 0; i < po.layer_count(); ++ i) {
+        const Layer &layer = *po.get_layer(i);
+        INFO("object layer " << i << " print_z " << layer.print_z << " height " << layer.height
+                             << " slice_z " << layer.slice_z);
+        CHECK_THAT(layer.height, Catch::Matchers::WithinAbs(0.2, 1e-9));
+        CHECK_THAT(layer.print_z, Catch::Matchers::WithinAbs(0.2 * double(i + 1), 1e-9));
+        CHECK_THAT(layer.slice_z, Catch::Matchers::WithinAbs(0.2 * double(i + 1) - 0.1, 1e-9));
+    }
+
+    const std::optional<std::pair<double, double>> shift = print_to_mesh_shift(po, mesh);
+    REQUIRE(shift.has_value());
+    const std::vector<OverhangSupportSample> samples = overhang_support_samples(po, mesh, shift->first, shift->second);
+    REQUIRE(samples.size() > 10);
+    REQUIRE(! po.support_layers().empty());
+
+    double contact_print_z = 0.;
+    for (const OverhangSupportSample &sample : samples)
+        contact_print_z = std::max(contact_print_z, sample.print_z);
+    REQUIRE(contact_print_z > 15.);
+    INFO("contact print_z " << contact_print_z << " measured air gap " << exact_gap_overhang_face_z - contact_print_z
+                            << " samples " << samples.size());
+
+    // No printed support point under the face may sit closer than the requested gap ...
+    for (const OverhangSupportSample &sample : samples) {
+        INFO("support point at " << sample.print_z << " under face " << sample.face_z);
+        CHECK(sample.face_z - sample.print_z >= gap - 1e-6);
+    }
+    // ... and the gap itself has to be the requested distance, not an upward quantisation of it.
+    CHECK_THAT(exact_gap_overhang_face_z - contact_print_z, Catch::Matchers::WithinAbs(gap, 1e-3));
+
+    std::vector<const SupportLayer *> printed_layers;
+    for (const SupportLayer *layer : po.support_layers())
+        if (layer->has_extrusions())
+            printed_layers.emplace_back(layer);
+    REQUIRE(printed_layers.size() > 1);
+    std::sort(printed_layers.begin(), printed_layers.end(),
+              [](const SupportLayer *a, const SupportLayer *b) { return a->print_z < b->print_z; });
+
+    // Every printed support layer covers exactly the Z span it reports, and its material is as thick as
+    // that height - base and interface paths alike. The stack is the object's grid plus one thin layer on
+    // top; the fix may not move or retime any other layer.
+    size_t off_grid_layers = 0;
+    for (const SupportLayer *layer : printed_layers) {
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height
+                                      << " bottom " << layer->bottom_z());
+        CHECK(layer->height > 0.);
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(layer->print_z - layer->bottom_z(), 1e-6));
+        CHECK(check_layer_paths_thickness(*layer, po) > 0);
+        if (std::abs(layer->print_z / 0.2 - std::round(layer->print_z / 0.2)) > 1e-6)
+            ++ off_grid_layers;
+    }
+    CHECK(off_grid_layers <= 1);
+    CHECK_THAT(printed_layers.front()->bottom_z(), Catch::Matchers::WithinAbs(0., 1e-6));
+
+    // The thin layer is the top of the stack and it stands on the one below at the same XY: no part of it
+    // hangs in the air and no other layer is inserted under it.
+    const SupportLayer &contact = *printed_layers.back();
+    const SupportLayer &below   = *printed_layers[printed_layers.size() - 2];
+    CHECK_THAT(contact.print_z, Catch::Matchers::WithinAbs(contact_print_z, 1e-9));
+    CHECK_THAT(contact.print_z - contact.height, Catch::Matchers::WithinAbs(below.print_z, 1e-6));
+    check_supported_from_below(contact, below);
+
+    // The G-code moves to the contact Z to print support there; a Z that only exists in the layer model
+    // would mean the fix never reached the machine. Every printed support layer is really printed at its
+    // own Z, and no support is extruded at a Z the layer model does not know.
+    const std::string         gcode  = Slic3r::Test::gcode(print);
+    const GcodeMotion         motion = support_gcode_motion(gcode);
+    REQUIRE(! motion.support_moves.empty());
+    for (const SupportLayer *layer : printed_layers) {
+        INFO("support layer print_z " << layer->print_z);
+        CHECK(motion.extrusion_at(layer->print_z) > 0.);
+    }
+    INFO("contact z " << contact.print_z << " extrusion " << motion.extrusion_at(contact.print_z));
+    CHECK(motion.extrusion_at(contact.print_z) > 0.);
+    for (const double z : motion.support_z) {
+        const auto it = std::find_if(printed_layers.begin(), printed_layers.end(),
+            [z](const SupportLayer *layer) { return std::abs(layer->print_z - z) < 1e-3; });
+        INFO("support G-code Z " << z);
+        CHECK(it != printed_layers.end());
+    }
+
+    // Same input, same stack and same support Z set.
+    Slic3r::Print again;
+    slice_with_tree_support(mesh, again, "organic", 30, 0, 0, {
+        { "support_top_z_distance",       gap },
+        { "support_interface_top_layers", 2 },
+    });
+    const PrintObject &repeated = *again.objects().front();
+    REQUIRE(repeated.support_layers().size() == po.support_layers().size());
+    for (size_t i = 0; i < po.support_layers().size(); ++ i) {
+        INFO("support layer " << i << " print_z " << po.support_layers()[i]->print_z);
+        CHECK_THAT(repeated.support_layers()[i]->print_z, Catch::Matchers::WithinAbs(po.support_layers()[i]->print_z, 1e-12));
+        CHECK_THAT(repeated.support_layers()[i]->height,  Catch::Matchers::WithinAbs(po.support_layers()[i]->height, 1e-12));
+    }
+    CHECK(support_gcode_motion(Slic3r::Test::gcode(again)).support_z == motion.support_z);
+}
+
+// The requested gap is a millimetre distance, so it is printed exactly whenever the remainder above the
+// object layer can be printed at all: whole multiples of the layer height need no extra layer, a fraction
+// gets one thin layer. A remainder below the profile's minimum layer height cannot be printed; the contact
+// then stays on the whole layer below and the gap comes out wider than requested - never narrower.
+TEST_CASE("An organic top gap ends at the requested Z unless its remainder is below the minimum layer height",
+          "[TreeSupportOrganicGapExact]")
+{
+    constexpr double   face = 16.0;
+    const TriangleMesh mesh = two_tier_mesh();
+    const double       gap  = GENERATE(0.0, 0.1, 0.12, 0.19, 0.199999, 0.2, 0.3, 0.399999);
+    INFO("support_top_z_distance " << gap);
+
+    Slic3r::Print print;
+    slice_with_tree_support(mesh, print, "organic", 30, 0, 0, {
+        { "support_top_z_distance",       gap },
+        { "support_interface_top_layers", 2 },
+    });
+    const PrintObject &po = *print.objects().front();
+
+    // The object layers are the 0.2 mm stack, whatever the gap asked for.
+    REQUIRE(po.layer_count() == 95);
+    for (const Layer *layer : po.layers()) {
+        INFO("object layer " << layer->print_z);
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(0.2, 1e-9));
+    }
+
+    std::vector<const SupportLayer *> printed_layers;
+    for (const SupportLayer *layer : po.support_layers())
+        if (layer->has_extrusions())
+            printed_layers.emplace_back(layer);
+    REQUIRE(! printed_layers.empty());
+    std::sort(printed_layers.begin(), printed_layers.end(),
+              [](const SupportLayer *a, const SupportLayer *b) { return a->print_z < b->print_z; });
+    const SupportLayer &contact = *printed_layers.back();
+
+    // The gap split: the contact layer of the object grid, the remainder above it, and whether that
+    // remainder is printable on this profile. The printable minimum is the profile's own
+    // min_layer_height, the same number add_exact_contact_area() refuses on.
+    const double min_layer_height = po.slicing_parameters().min_layer_height;
+    const double target     = face - gap;
+    const double grid_top   = std::floor((target + 1e-9) / 0.2) * 0.2;
+    const double remainder  = target - grid_top;
+    const bool   printable  = remainder > EPSILON && remainder + EPSILON >= min_layer_height;
+    const double expected   = printable ? target : grid_top;
+    INFO("contact print_z " << contact.print_z << " height " << contact.height << " expected " << expected
+                            << " remainder " << remainder << " min layer height " << min_layer_height);
+    CHECK_THAT(contact.print_z, Catch::Matchers::WithinAbs(expected, 1e-6));
+    // The air gap never gets narrower than requested: a rounded-up remainder could lift the contact onto a
+    // grid top that sits above the requested Z.
+    CHECK(contact.print_z <= target + 1e-9);
+    // No two support layers share a print_z. If a remainder were lifted onto a grid layer top, the two top
+    // contacts at that Z would merge into one support layer and one of the two areas would lose its
+    // toolpaths (generate_support_layers() keeps at most one top contact per print_z).
+    std::set<double> support_print_zs;
+    for (const SupportLayer *layer : po.support_layers())
+        CHECK(support_print_zs.insert(micron_rounded(layer->print_z)).second);
+    if (printable)
+        CHECK_THAT(face - contact.print_z, Catch::Matchers::WithinAbs(gap, 1e-6));
+    else {
+        CHECK(face - contact.print_z > gap);
+        CHECK(face - contact.print_z < gap + 0.2);
+    }
+    // An exact request is a layer of its own; anything else leaves the top on the object grid.
+    for (const SupportLayer *layer : printed_layers) {
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height);
+        CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(layer->print_z - layer->bottom_z(), 1e-6));
+        CHECK(check_layer_paths_thickness(*layer, po) > 0);
+    }
+    if (std::abs(contact.print_z - target) < 1e-6 && printable) {
+        REQUIRE(printed_layers.size() > 1);
+        check_supported_from_below(contact, *printed_layers[printed_layers.size() - 2]);
+    }
+
+    const GcodeMotion motion = support_gcode_motion(Slic3r::Test::gcode(print));
+    REQUIRE(! motion.support_moves.empty());
+    CHECK(motion.extrusion_at(contact.print_z) > 0.);
+}
+
+// A raft moves the object's whole stack up, including the overhang face; the gap is still measured from
+// that face and ends exactly. The tree starts on the raft contact layer, not on the bed and not above it.
+TEST_CASE("An organic top gap is exact above a raft and the tree starts on the raft contact", "[TreeSupportOrganicGapExact]")
+{
+    constexpr double   gap  = 0.1;
+    const TriangleMesh mesh = two_tier_mesh();
+
+    Slic3r::Print print;
+    slice_with_tree_support(mesh, print, "organic", 30, 0, 2, {
+        { "support_top_z_distance",       gap },
+        { "support_interface_top_layers", 2 },
+    });
+    const PrintObject &po = *print.objects().front();
+    const double       face = plate_underside_z(po);
+    INFO("raft top " << po.slicing_parameters().raft_contact_top_z << " face " << face);
+    REQUIRE(face > 16.0);
+
+    std::vector<const SupportLayer *> printed_layers;
+    for (const SupportLayer *layer : po.support_layers())
+        if (layer->has_extrusions())
+            printed_layers.emplace_back(layer);
+    REQUIRE(printed_layers.size() > 3);
+    std::sort(printed_layers.begin(), printed_layers.end(),
+              [](const SupportLayer *a, const SupportLayer *b) { return a->print_z < b->print_z; });
+    const SupportLayer &contact = *printed_layers.back();
+    INFO("contact print_z " << contact.print_z);
+    CHECK_THAT(face - contact.print_z, Catch::Matchers::WithinAbs(gap, 1e-6));
+    CHECK_THAT(contact.height, Catch::Matchers::WithinAbs(contact.print_z - contact.bottom_z(), 1e-6));
+    check_supported_from_below(contact, *printed_layers[printed_layers.size() - 2]);
+
+    // The raft contact layer is the floor of the tree: the first layer above it starts exactly on its top.
+    const double raft_top = po.slicing_parameters().raft_contact_top_z;
+    const auto   tree_first = std::find_if(printed_layers.begin(), printed_layers.end(),
+        [raft_top](const SupportLayer *layer) { return layer->print_z > raft_top + 1e-6; });
+    REQUIRE(tree_first != printed_layers.end());
+    INFO("first tree layer bottom " << (*tree_first)->bottom_z() << " raft top " << raft_top);
+    CHECK_THAT((*tree_first)->bottom_z(), Catch::Matchers::WithinAbs(raft_top, 1e-6));
+}
+
+// The pipeline state F1 is about: a thin exact contact layer can end inside the slab of the support layer
+// above it (the belt tilt gives every layer its own overhang, so support stacks over support). That list is
+// what the mitigation now walks: with the old all-or-nothing guard the toolpath stage crashed on it.
+// In this fixture the contact area and the material of that layer do not intersect in XY - the layer above a
+// contact stands next to the object, not over it - so a correct modulation leaves every run at the layer's
+// full thickness. Inventing a thinner run here would be a wrong material thickness, not a fix.
+TEST_CASE("An exact contact layer inside another support layer's slab does not thin material that does not overlap",
+          "[TreeSupportOrganicGap][belt]")
+{
+    const TriangleMesh mesh = two_tier_mesh();
+    Slic3r::Print     print;
+    slice_belt_two_tier(print, mesh, true, 0.25);
+    const PrintObject &po = *print.objects().front();
+
+    size_t interleaved_layers = 0, paths_checked = 0, reduced_total = 0;
+    for (const SupportLayer *layer : po.support_layers()) {
+        const bool interleaved = std::any_of(po.support_layers().begin(), po.support_layers().end(),
+            [layer](const SupportLayer *other) {
+                return other->print_z > layer->bottom_z() + 1e-6 && other->print_z < layer->print_z - 1e-6;
+            });
+        if (! interleaved)
+            continue;
+        const OverlapThinning thinning = overlap_thinning(*layer);
+        INFO("interleaved support layer print_z " << layer->print_z << " height " << layer->height
+                                                  << " bottom " << layer->bottom_z()
+                                                  << " reduced " << thinning.reduced.size()
+                                                  << " full " << thinning.full.size());
+        ++ interleaved_layers;
+        reduced_total += thinning.reduced.size();
+        for (const ModulatedPathSample &path : thinning.full) {
+            INFO("path height " << path.height << " width " << path.width << " mm3_per_mm " << path.mm3_per_mm);
+            CHECK_THAT(path.height, Catch::Matchers::WithinAbs(layer->height, 1e-6));
+            CHECK(path.width > 0.f);
+            CHECK(path.mm3_per_mm > 0.);
+            ++ paths_checked;
+        }
+    }
+    INFO("interleaved layers " << interleaved_layers << ", checked paths " << paths_checked
+                               << ", reduced runs " << reduced_total);
+    // The Z-interleaving exists in a real print ...
+    REQUIRE(interleaved_layers > 0);
+    REQUIRE(paths_checked > 0);
+    // ... and it is a Z-only overlap here: no material may be thinned where nothing shares the slab in XY.
+    CHECK(reduced_total == 0);
 }
