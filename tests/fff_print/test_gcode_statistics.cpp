@@ -124,7 +124,8 @@ TEST_CASE("An export that does not keep the preview payload reports the same G-c
     // document is summed from an accumulator fed in the move list's order (see
     // GCodeProcessorResult::PreviewStatistics), so this is the comparison that proves it.
     const auto slice_once = [](bool preview_payload, GCodeProcessorResult &result,
-                               std::initializer_list<ConfigBase::SetDeserializeItem> extra = {}) {
+                               std::initializer_list<ConfigBase::SetDeserializeItem> extra = {},
+                               size_t *masked_header_lines = nullptr) {
         DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
         config.set_deserialize_strict({ { "layer_height", 0.2 },
                                         { "initial_layer_print_height", 0.2 },
@@ -136,13 +137,21 @@ TEST_CASE("An export that does not keep the preview payload reports the same G-c
         Print print;
         Model model;
         Test::init_print({ Test::cube(20) }, print, model, config, nullptr, true, 2);
-        return Test::gcode(print, &result, preview_payload);
+        return Test::gcode(print, &result, preview_payload, masked_header_lines);
     };
 
     GCodeProcessorResult stored;
-    const std::string    gcode_stored = slice_once(true, stored);
+    size_t               stored_masked = 0;
+    const std::string    gcode_stored = slice_once(true, stored, {}, &stored_masked);
     GCodeProcessorResult skipped;
-    const std::string    gcode_skipped = slice_once(false, skipped);
+    size_t               skipped_masked = 0;
+    const std::string    gcode_skipped = slice_once(false, skipped, {}, &skipped_masked);
+
+    // The byte comparison below only holds while the export timestamp is masked. If the header's
+    // format changes so that no line is masked any more, these fail here instead of letting the
+    // comparison start flaking whenever the two exports straddle a second.
+    REQUIRE(stored_masked > 0);
+    REQUIRE(skipped_masked > 0);
 
     REQUIRE(!stored.moves.empty());
     REQUIRE(!stored.statistics_json.empty());
@@ -167,9 +176,15 @@ TEST_CASE("An export that does not keep the preview payload reports the same G-c
     // config block echoes `enable_pre_heating = 1`. Against the non-preheat run those lines alone
     // differ, so comparing across configs would test the flag, not the caller override.
     GCodeProcessorResult preheated_stored;
-    const std::string    gcode_preheated_stored = slice_once(true, preheated_stored, { { "enable_pre_heating", "1" } });
+    size_t               preheated_stored_masked = 0;
+    const std::string    gcode_preheated_stored = slice_once(true, preheated_stored, { { "enable_pre_heating", "1" } },
+                                                             &preheated_stored_masked);
     GCodeProcessorResult preheated;
-    const std::string    gcode_preheated = slice_once(false, preheated, { { "enable_pre_heating", "1" } });
+    size_t               preheated_masked = 0;
+    const std::string    gcode_preheated = slice_once(false, preheated, { { "enable_pre_heating", "1" } },
+                                                      &preheated_masked);
+    REQUIRE(preheated_stored_masked > 0);
+    REQUIRE(preheated_masked > 0);
     CHECK(!preheated.preview_payload_skipped);
     CHECK(!preheated.moves.empty());
     CHECK(gcode_preheated == gcode_preheated_stored);

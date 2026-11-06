@@ -1426,7 +1426,10 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
                 // Did this pass store the payload at all? The result mirrors the processor's
                 // materialize_moves() in preview_payload_skipped (set by apply_config), which is the
                 // question to ask here - an empty move list is only the current consequence of it.
-                if (m_result.preview_payload_skipped) {
+                // The empty-list test is the fallback for the case the flag and the list disagree:
+                // indexing an empty list below would be undefined behaviour, and the marker's print_z
+                // (all this branch writes) is the same either way.
+                if (m_result.preview_payload_skipped || m_result.moves.empty()) {
                     // No vertex to move and no ids to shift here, but the marker's print_z is what
                     // the relocation updated for every consumer that survives without the payload.
                     // The caller mirrors the erasure on the statistics' own copies of the moves.
