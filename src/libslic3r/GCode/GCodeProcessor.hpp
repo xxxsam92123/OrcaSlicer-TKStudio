@@ -1414,13 +1414,19 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             // `position` is the latest stored move's position, which is where the marker is moved to.
             // It is passed in (and not read back off the move list) because an export that does not
             // store the payload has no list to read it from; see GCodeProcessor::last_stored_position().
-            std::optional<size_t> update(float height, const Vec3f &position) {
+            // `position` is taken by value on purpose: the move list is appended to below, and the
+            // caller hands in a reference into that very list (last_stored_position()), which an
+            // append that reallocates would dangle.
+            std::optional<size_t> update(float height, Vec3f position) {
                 if (!m_move_id.has_value() || !m_custom_gcode_per_print_z_id.has_value())
                     return std::nullopt;
 
                 const size_t erased = *m_move_id;
 
-                if (!m_result.has_preview_payload()) {
+                // Did this pass store the payload at all? The result mirrors the processor's
+                // materialize_moves() in preview_payload_skipped (set by apply_config), which is the
+                // question to ask here - an empty move list is only the current consequence of it.
+                if (m_result.preview_payload_skipped) {
                     // No vertex to move and no ids to shift here, but the marker's print_z is what
                     // the relocation updated for every consumer that survives without the payload.
                     // The caller mirrors the erasure on the statistics' own copies of the moves.
@@ -1429,10 +1435,13 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
                     return erased;
                 }
 
-                GCodeProcessorResult::MoveVertex& move = m_result.moves.emplace_back(m_result.moves[erased]);
-                move.position = position;
-                move.height = height;
+                // Copy out first: everything after the erased vertex shifts down by one, and the
+                // copy must not alias the vector it is pushed back into.
+                GCodeProcessorResult::MoveVertex copy = m_result.moves[erased];
+                copy.position = position;
+                copy.height = height;
                 m_result.moves.erase(m_result.moves.begin() + erased);
+                m_result.moves.push_back(copy);
                 m_result.custom_gcode_per_print_z[*m_custom_gcode_per_print_z_id].print_z = position.z();
                 reset();
                 return erased;
