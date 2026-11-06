@@ -16,6 +16,7 @@ add_executable(${_TEST_NAME}_tests
     test_filament_color_picker.cpp
     test_ams_materials_setting.cpp
     test_gcode_preview_colors.cpp
+    test_libvgcode_conversion.cpp
     test_device_progress.cpp
     test_device_manager_integration.cpp
     test_web_media_controller.cpp
@@ -41,6 +42,7 @@ add_executable(${_TEST_NAME}_tests
     test_plugin_lifecycle.cpp
     test_plugin_resource_texture.cpp
     test_plugin_printer_agent.cpp
+    test_post_processor.cpp
     test_printhost.cpp
     test_slicing_pipeline_bindings.cpp
     test_slicing_pipeline_config.cpp
@@ -49,6 +51,7 @@ add_executable(${_TEST_NAME}_tests
     test_plugin_audit.cpp
     test_plugin_json_depth.cpp
     test_shortcuts.cpp
+    test_speed_dial_position.cpp
     test_texture_color_palette.cpp
     test_texture_island_view.cpp
     test_timelapse_codecs.cpp
@@ -57,6 +60,7 @@ add_executable(${_TEST_NAME}_tests
     test_user_manager.cpp
     test_sequential_clearance.cpp
     test_object_list.cpp
+    test_geometry_import.cpp
     ../fff_print/test_helpers.cpp
     )
 

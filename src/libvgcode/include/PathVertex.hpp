@@ -103,7 +103,20 @@ struct PathVertex
     // Jerk value
     //
     float jerk{ 0.0f };
+    //
+    // ORCA: Set on the vertices of the start G-code's prepare stage (heat, home, prime).
+    // The viewer draws them - the prime line is part of the G-code - but they are not part of the
+    // printed model: the prime bead's height/width, the pinned Z and the start-up time belong to no
+    // layer, so they are kept out of the colour ranges (ViewerImpl::update_color_ranges) and out of
+    // the layer and print times accumulated in Layers::update and ViewerImpl::load.
+    //
+    bool prepare_stage{ false };
 
+    //
+    // Return true if the segment is measured: it is drawn and it feeds the colour ranges and the
+    // times the viewer accumulates. The start G-code's prepare stage is drawn but not measured.
+    //
+    bool is_measured() const { return !prepare_stage; }
     //
     // Return true if the segment is an extrusion move
     //

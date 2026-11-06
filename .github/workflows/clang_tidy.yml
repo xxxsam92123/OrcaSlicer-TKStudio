@@ -65,10 +65,12 @@ jobs:
           echo "deps-key=linux-clang-cache-orcaslicer_deps-build-${{ hashFiles('deps/**') }}" >> "$GITHUB_OUTPUT"
 
       # Parsing needs the dependency headers, not a build of this PR's deps/.
-      # Without an exact match the job waits for the build that saves it: this
-      # PR's own when it changes deps/, otherwise a running push build of the
-      # base branch with the same deps. With neither, a PR that keeps deps/
-      # falls back to the newest cache.
+      # Without an exact match the job waits for the build that saves it: a
+      # running push build of the base branch with the same deps/ when there is
+      # one, otherwise this PR's own Build all run for HEAD_SHA. With neither, or
+      # when that build saves no exact cache, the wait fails the job: an older
+      # cache is not what this PR built, and restoring one only moves the failure
+      # into clang-tidy's output.
       - name: Restore cached deps
         id: deps_cache
         if: steps.changes.outputs.cpp == 'true'
@@ -83,21 +85,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash scripts/ci_deps_cache.sh ${{ steps.changes.outputs.deps == 'true' && 'own' || 'check' }}
+          # A missing or failed producer has no fallback here.
+          STRICT: '1'
+        run: bash scripts/ci_deps_cache.sh ${{ steps.changes.outputs.deps == 'true' && 'own' || 'check-or-own' }}
 
       # Linux Build Deps takes about 35 minutes on GitHub-hosted runners. The
-      # wait ends early when the deps job fails.
+      # wait ends early when the deps job fails, and fails the job.
       - name: Wait for the deps cache
         if: steps.wait_check.outputs.wait-for != ''
         timeout-minutes: 100
         env:
           GH_TOKEN: ${{ github.token }}
           KEY: ${{ steps.changes.outputs.deps-key }}
-          CACHE_REF: ${{ steps.changes.outputs.deps == 'true' && github.ref || format('refs/heads/{0}', github.base_ref) }}
+          # Named by the wait check: this PR's merge ref for its own build, the
+          # base branch for a push build.
+          CACHE_REF: ${{ steps.wait_check.outputs.cache-ref }}
           KEY_INPUTS: ${{ steps.wait_check.outputs.key-inputs }}
           WAIT_FOR: ${{ steps.wait_check.outputs.wait-for }}
           WAIT_SINCE: ${{ steps.wait_check.outputs.wait-since }}
           WAIT_MINUTES: 90
+          STRICT: '1'
         run: bash scripts/ci_deps_cache.sh wait
 
       - name: Restore the deps cache after waiting
@@ -107,26 +114,9 @@ jobs:
         with:
           path: ${{ github.workspace }}/deps/build/OrcaSlicer_dep
           key: ${{ steps.changes.outputs.deps-key }}
-
-      - name: Fail without this PR's deps cache
-        if: steps.changes.outputs.deps == 'true' && steps.wait_check.outcome == 'success' && steps.waited_cache.outputs.cache-hit != 'true'
-        run: |
-          echo "::error::No deps cache ${{ steps.changes.outputs.deps-key }}. Check this PR's Linux Build Deps job, then rerun clang-tidy."
-          exit 1
-
-      - name: Restore the newest cached deps
-        id: newest_cache
-        if: steps.changes.outputs.deps != 'true' && steps.wait_check.outcome == 'success' && steps.waited_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ github.workspace }}/deps/build/OrcaSlicer_dep
-          key: ${{ steps.changes.outputs.deps-key }}
-          restore-keys: linux-clang-cache-orcaslicer_deps-build-
+          # The wait checked the cache list, so a miss here is a real race. Fail
+          # loudly rather than continue without the deps this PR built.
           fail-on-cache-miss: true
-
-      - name: Warn about older deps
-        if: steps.newest_cache.outcome == 'success' && steps.newest_cache.outputs.cache-hit != 'true'
-        run: echo "::warning title=Older deps::No cache matches this PR's deps/, so clang-tidy parsed against ${{ steps.newest_cache.outputs.cache-matched-key }}. If it reports errors in code that uses a dependency, rerun clang-tidy once the base branch's Build all has saved the new deps."
 
       - name: Apt-Install Dependencies
         if: steps.changes.outputs.cpp == 'true' && !vars.SELF_HOSTED

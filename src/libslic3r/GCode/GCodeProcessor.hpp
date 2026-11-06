@@ -268,6 +268,13 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             int  object_label_id{-1};
             float print_z{0.0f};
 
+            // Set on the moves emitted by the start G-code's prepare stage (the same region the
+            // time blocks tag with TimeBlock::Flags::prepare_stage). Those moves are not part of
+            // the printed model: a prime line's bead width/height, the pinned Z and the warm-up
+            // time all belong to no printed layer, so the preview keeps them drawable in the first
+            // layer's vertex range but leaves them out of the legend value ranges and layer times.
+            bool prepare_stage{ false };
+
             float volumetric_rate() const { return feedrate * mm3_per_mm; }
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
         };

@@ -65,8 +65,33 @@ jobs:
         shell: bash
         run: |
           leg="${{ runner.os }}-${{ inputs.arch || 'amd64' }}${{ runner.os == 'Windows' && format('-{0}', inputs.compiler) || '' }}"
-          echo "CCACHE_LEG=$leg" >> "$GITHUB_ENV"
-          echo "CCACHE_ENTRY=ccache-$leg-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
+          # The cache pool is a fixed 10 GB for the whole repository, shared
+          # with the deps and flatpak-builder caches, and it evicts by LRU.
+          # Uncapped, the eight ccache legs wrote 9.29 GB in one run and pushed
+          # the deps caches out; those are saved early in a run and restored
+          # cold in 47-61 minutes. So each leg gets a share sized from what it
+          # actually produced: Windows 1.2 GB, Linux 0.9-1.0 GB, macOS
+          # 0.4-0.9 GB (macOS hits least, so it loses least by a tight cap).
+          # Budget for the whole pool, worst case over all workflow legs:
+          #   ccache          2x700M + 2x600M + 2x400M + 2x800M = 5.00 GB
+          #   deps                                                  0.90 GB
+          #   flatpak-builder                       2x1.28 GB =      2.57 GB
+          #   get-cmake                                             0.27 GB
+          #   ------------------------------------------------------------
+          #   total                                                  8.71 GB
+          # 8.71 GB is under the 9 GB budget, which itself leaves ~1 GB of the
+          # 10 GB pool hard limit for LRU churn and transient entries.
+          case "$leg" in
+            Windows-*) max=700M ;;
+            Linux-*)   max=600M ;;
+            macOS-*)   max=400M ;;
+            *)         max=600M ;;
+          esac
+          {
+            echo "CCACHE_MAX_SIZE=$max"
+            echo "CCACHE_LEG=$leg"
+            echo "CCACHE_ENTRY=ccache-$leg-${{ github.run_id }}-${{ github.run_attempt }}"
+          } >> "$GITHUB_ENV"
 
       # The action only installs and configures ccache. Restore and save go
       # through actions/cache with one path string, since the cache service
@@ -79,7 +104,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: ${{ env.CCACHE_LEG }}
-          max-size: 3G
+          # Capped per platform by the leg step above: the pool is shared with
+          # the deps caches and evicts by LRU, so no leg may take the whole 10 GB.
+          max-size: ${{ env.CCACHE_MAX_SIZE }}
           restore: false
           save: false
           # ccache -s runs as its own step; no summary table per job.
@@ -755,12 +782,40 @@ jobs:
 
       # The build has just touched everything it can use, so an object
       # untouched for a week is dead, usually orphaned by a flag change.
+      # ccache applies max_size only during a cleanup pass, so trim here --
+      # before the entry is saved -- or the cap would not bind at all: a
+      # directory at 576% of its limit stayed there across 40 more compiles
+      # and only dropped below it after ccache -c.
+      # A trim that fails costs cache, not correctness, so it may not redden
+      # a build that already succeeded.
       - name: Compiler cache statistics
         if: ${{ always() && steps.ccache.outcome == 'success' }}
         shell: bash
         run: |
-          ccache --evict-older-than 7d
+          # Set the cap explicitly: max_size lives in ccache.conf, which may
+          # itself sit in a directory the cache entry restores/overwrites (the
+          # Flatpak leg proved this -- restoring an old entry brought back the
+          # old 3G max_size). Setting it here makes the limit independent of
+          # where the config file landed.
+          ccache --max-size "$CCACHE_MAX_SIZE" || true
+          # A trim that fails leaves the oversized directory to be saved as is,
+          # which silently breaks the budget above, so warn instead of hiding it.
+          ccache -c || echo "::warning title=ccache trim failed::cap not applied"
+          ccache --evict-older-than 7d || true
           ccache -s -v || ccache -s
+          # Guardrail: one line telling us whether the cap actually bound, so a
+          # future log shows the eviction instead of us guessing from the pool.
+          echo "--- ccache limits (guardrail) ---"
+          ccache --show-config | grep -E 'max_size|max_files|limit_multiple' || true
+          # ccache >= 4.9 reports cache_size_kibibyte; older ones only cache_size.
+          used_kib=$(ccache --print-stats | awk -F'\t' '$1=="cache_size_kibibyte"{print $2; exit} $1=="cache_size"{printf "%d\n", $2/1024; exit}')
+          if [ -n "$used_kib" ]; then
+            cap_kib=$(awk -v s="$CCACHE_MAX_SIZE" 'BEGIN{u=substr(s,length(s)); v=substr(s,1,length(s)-1)+0; m=(u=="G")?1048576:((u=="M")?1024:1); printf "%d", v*m}')
+            pct=$(awk -v u="$used_kib" -v c="$cap_kib" 'BEGIN{ if (c>0) printf "%.1f", 100*u/c; else printf "n/a" }')
+            echo "ccache size: ${used_kib} KiB of ${cap_kib} KiB cap (${pct}%) - leg ${CCACHE_LEG}, cap ${CCACHE_MAX_SIZE}"
+          else
+            echo "ccache size: unknown (no cache_size in --print-stats) - leg ${CCACHE_LEG}, cap ${CCACHE_MAX_SIZE}"
+          fi
 
       # Entries are immutable, so the new one is saved first and the older
       # ones for this leg on this ref are dropped afterwards: a failed save
