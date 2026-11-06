@@ -7190,7 +7190,13 @@ int CLI::run(int argc, char **argv)
                                     }
                                     BOOST_LOG_TRIVIAL(info) << "process finished, will export gcode temporarily to " << outfile << std::endl;
                                     temp_time = (long long)Slic3r::Utils::get_current_time_utc();
-                                    outfile = print_fff->export_gcode(outfile, gcode_result, nullptr);
+                                    // The command line never renders a preview from this result: it writes
+                                    // the G-code out and, with --export-3mf, packs it into a project. So
+                                    // the per-move payload is not stored (the statistics, the M73 time
+                                    // lines and the printable-area check still are), which is what keeps
+                                    // a many-plate batch's peak inside the machine instead of holding
+                                    // every plate's vertices at once.
+                                    outfile = print_fff->export_gcode(outfile, gcode_result, nullptr, /*preview_payload=*/false);
                                     time_using_cache = time_using_cache + ((long long)Slic3r::Utils::get_current_time_utc() - temp_time);
                                     BOOST_LOG_TRIVIAL(info) << "export_gcode finished: time_using_cache update to " << time_using_cache << " secs.";
                                     if (gcode_result && gcode_result->gcode_check_result.error_code) {

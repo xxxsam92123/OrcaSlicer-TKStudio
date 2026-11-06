@@ -99,7 +99,9 @@ void init_and_process_print(std::initializer_list<TestMesh> meshes, Slic3r::Prin
 void init_and_process_print(std::initializer_list<TriangleMesh> meshes, Slic3r::Print &print, std::initializer_list<Slic3r::ConfigBase::SetDeserializeItem> config_items);
 
 // Process `print` and return its exported G-code, filling `result` when one is given.
-std::string gcode(Print& print, GCodeProcessorResult* result = nullptr);
+// `preview_payload` false exports the way the command line does, without storing the per-move
+// payload (see Print::export_gcode()).
+std::string gcode(Print& print, GCodeProcessorResult* result = nullptr, bool preview_payload = true);
 
 // Build, slice, and return the G-code for `meshes` under the given config.
 std::string slice(std::initializer_list<TestMesh> meshes, const DynamicPrintConfig &config);

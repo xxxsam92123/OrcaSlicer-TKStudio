@@ -345,12 +345,12 @@ void init_and_process_print(std::initializer_list<TriangleMesh> meshes, Slic3r::
 	print.process();
 }
 
-std::string gcode(Print & print, GCodeProcessorResult* result)
+std::string gcode(Print & print, GCodeProcessorResult* result, bool preview_payload)
 {
     ScopedTemporaryFile temp(".gcode");
     print.set_status_silent();
     print.process();
-    print.export_gcode(temp.string(), result, nullptr);
+    print.export_gcode(temp.string(), result, nullptr, preview_payload);
     std::ifstream t(temp.string(), std::ios::binary);
 	std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
 	return str;

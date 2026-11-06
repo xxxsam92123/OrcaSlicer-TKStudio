@@ -5497,7 +5497,14 @@ int PartPlate::load_gcode_from_file(const std::string& filename)
 
 bool PartPlate::has_slice_payload() const
 {
-	return m_gcode_result != nullptr && m_gcode_result->has_preview_payload();
+	// A result whose export deliberately did not store the per-move payload is still a complete
+	// slice result: the moves are absent because nothing was going to draw them, and the G-code file
+	// the export wrote has them (see GCodeProcessorResult::preview_payload_skipped). Reporting it as
+	// "no payload" here would make release_finished_slice_resources() refuse to release anything,
+	// and a many-plate batch would keep every plate's slicing state resident - which is exactly what
+	// the release exists to stop.
+	return m_gcode_result != nullptr &&
+	       (m_gcode_result->has_preview_payload() || m_gcode_result->preview_payload_skipped);
 }
 
 // Both the released payload and the plate's own "sliced" state rest on the result's G-code file:
@@ -5527,7 +5534,10 @@ bool PartPlate::release_slice_payload()
 
 bool PartPlate::restore_slice_payload()
 {
-	if (has_slice_payload())
+	// Only moves that are here count as restored: a result whose export skipped the payload still
+	// reports a slice result (see has_slice_payload()), and asking for its preview has to rebuild
+	// the moves from the file rather than hand back nothing.
+	if (m_gcode_result != nullptr && m_gcode_result->has_preview_payload())
 		return true;
 	// Nothing to restore from: an unsliced plate, a plate whose current round did not complete its
 	// G-code export (its result still names the file of an earlier round), a plate whose file is
