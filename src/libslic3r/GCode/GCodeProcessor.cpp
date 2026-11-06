@@ -33,6 +33,9 @@
 #include <boost/log/trivial.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/split.hpp>
+// boost::uintmax_t, the type boost::filesystem::file_size() reports; the headers below reach it
+// only through boost/filesystem's own use of it.
+#include <boost/cstdint.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/filesystem/path.hpp>
