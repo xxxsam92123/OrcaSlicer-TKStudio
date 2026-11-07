@@ -1219,23 +1219,26 @@ static std::string dbg_index_to_color(int idx)
 // leading to over extrusion, where they overlap. The over extrusion is better avoided as it often makes the interface layers
 // to stick too firmly to the object.
 //
-// Modulate thickness (increase bottom_z) of extrusions_in_out generated for this_layer
-// if they overlap with overlapping_layers, whose print_z is above this_layer.bottom_z() and below this_layer.print_z.
-static void modulate_extrusion_by_overlapping_layers(
+// Modulate thickness (increase bottom_z) of the extrusions_in_out generated for this_layer if they
+// overlap with overlapping_layers, whose print_z is above this_layer.bottom_z() and below this_layer.print_z.
+//
+// `extrusions_in_out` is one run of ExtrusionPath objects that all carry the same role, width, height and
+// flow: the fragments below are built from the first path's parameters, so a run may never mix them.
+// The caller (modulate_extrusion_entity_list) takes care of splitting the toolpath list into such runs.
+static void modulate_extrusion_path_run(
     // Extrusions generated for this_layer.
     ExtrusionEntitiesPtr                               &extrusions_in_out,
     const SupportGeneratorLayer          &this_layer,
     // Multiple layers overlapping with this_layer, sorted bottom up.
     const SupportGeneratorLayersPtr      &overlapping_layers)
 {
-    size_t n_overlapping_layers = overlapping_layers.size();
-    if (n_overlapping_layers == 0 || extrusions_in_out.empty())
-        // The extrusions do not overlap with any other extrusion.
-        return;
+    const size_t n_overlapping_layers = overlapping_layers.size();
+    assert(n_overlapping_layers > 0 && ! extrusions_in_out.empty());
 
     // Get the initial extrusion parameters.
     ExtrusionPath *extrusion_path_template = dynamic_cast<ExtrusionPath*>(extrusions_in_out.front());
     assert(extrusion_path_template != nullptr);
+
     ExtrusionRole extrusion_role  = extrusion_path_template->role();
     float         extrusion_width = extrusion_path_template->width;
 
@@ -1457,6 +1460,73 @@ static void modulate_extrusion_by_overlapping_layers(
     //FIXME this shall not happen, if the Clipper works as expected and all paths split to fragments could be re-connected.
     for (auto it_fragment = path_fragments.begin(); it_fragment != path_fragments.end(); ++ it_fragment)
         extrusion_entities_append_paths(extrusions_in_out, std::move(it_fragment->polylines), extrusion_role, it_fragment->mm3_per_mm, it_fragment->width, it_fragment->height);
+}
+
+// Apply the overlap thickness/flow modulation to one toolpath list without flattening it.
+//
+// A support layer's toolpath list is not necessarily a flat list of ExtrusionPath: the support material
+// generators wrap the material of a large island into an ExtrusionEntityCollection
+// (tree_supports_generate_paths() for an organic base layer, fill_expolygons_with_sheath_generate_paths()
+// with no_sort for a sheathed one), and plain ExtrusionPath objects are appended next to them. Only paths
+// can be re-fragmented, but skipping the whole list whenever it holds a collection turns the
+// over-extrusion mitigation off exactly where it is needed: the thin contact layer of an exact top gap can
+// end inside another support layer's slab. So dispatch per entity instead:
+//   * a maximal run of consecutive paths with identical extrusion parameters goes through
+//     modulate_extrusion_path_run(), which keeps the path_ends/re-chaining behaviour for that run;
+//   * a collection is recursed into in place, so its entity order, its no_sort flag and its ownership of
+//     the entities stay exactly as generated;
+//   * an entity that is neither a path nor a collection is kept untouched, so the modulation stays off for
+//     that entity only - it carries no extrusion parameters this function could scale.
+static void modulate_extrusion_entity_list(ExtrusionEntitiesPtr &entities,
+    const SupportGeneratorLayer &this_layer, const SupportGeneratorLayersPtr &overlapping_layers)
+{
+    ExtrusionEntitiesPtr modulated;
+    modulated.reserve(entities.size());
+    for (size_t i = 0; i < entities.size();) {
+        ExtrusionEntity *entity = entities[i];
+        if (auto *collection = dynamic_cast<ExtrusionEntityCollection*>(entity); collection != nullptr) {
+            modulate_extrusion_entity_list(collection->entities, this_layer, overlapping_layers);
+            modulated.push_back(entity);
+            ++ i;
+            continue;
+        }
+        if (dynamic_cast<ExtrusionPath*>(entity) == nullptr) {
+            modulated.push_back(entity);
+            ++ i;
+            continue;
+        }
+        // One run the fragmentation below may treat with a single template. Splitting by the extrusion
+        // parameters, not only by "is a path", is what keeps a run from borrowing the flow of a different
+        // role, width or height; a homogeneous list - what the generators produce - stays one run, and the
+        // list is rebuilt in place order, so the entity order does not change either.
+        const auto *first = dynamic_cast<const ExtrusionPath*>(entity);
+        size_t      j     = i + 1;
+        for (; j < entities.size(); ++ j) {
+            const auto *path = dynamic_cast<const ExtrusionPath*>(entities[j]);
+            if (path == nullptr || path->role() != first->role() || path->width != first->width ||
+                path->height != first->height || path->mm3_per_mm != first->mm3_per_mm)
+                break;
+        }
+        // The run owns nothing yet: its entities are still owned by `entities` (or by the collection that
+        // holds them), and modulate_extrusion_path_run() deletes and replaces them inside the run only.
+        ExtrusionEntitiesPtr run(entities.begin() + i, entities.begin() + j);
+        modulate_extrusion_path_run(run, this_layer, overlapping_layers);
+        modulated.insert(modulated.end(), run.begin(), run.end());
+        i = j;
+    }
+    entities.swap(modulated);
+}
+
+void modulate_extrusion_by_overlapping_layers(
+    ExtrusionEntitiesPtr                               &extrusions_in_out,
+    const SupportGeneratorLayer          &this_layer,
+    const SupportGeneratorLayersPtr      &overlapping_layers)
+{
+    if (overlapping_layers.empty() || extrusions_in_out.empty())
+        // The extrusions do not overlap with any other extrusion: the toolpath list is left exactly as
+        // generated, down to the entity pointers.
+        return;
+    modulate_extrusion_entity_list(extrusions_in_out, this_layer, overlapping_layers);
 }
 
 // Support layer that is covered by some form of dense interface.

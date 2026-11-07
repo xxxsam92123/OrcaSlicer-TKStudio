@@ -106,6 +106,17 @@ void generate_support_toolpaths(
 	const SupportGeneratorLayersPtr   	&interface_layers,
     const SupportGeneratorLayersPtr   	&base_interface_layers);
 
+// Fragment and re-chain the toolpaths produced for one support layer so that the parts that overlap
+// another support layer in Z are extruded thinner (the over-extrusion mitigation of
+// generate_support_toolpaths()). Path runs are re-fragmented, collections are recursed into in place and
+// the list order and the entity ownership are preserved. Exposed for the fff_print regression that pins
+// the modulation of a toolpath list holding nested ExtrusionEntityCollection islands; the generator is the
+// only production caller.
+void modulate_extrusion_by_overlapping_layers(
+    ExtrusionEntitiesPtr               &extrusions_in_out,
+    const SupportGeneratorLayer        &this_layer,
+    const SupportGeneratorLayersPtr    &overlapping_layers);
+
 // FN_HIGHER_EQUAL: the provided object pointer has a Z value >= of an internal threshold.
 // Find the first item with Z value >= of an internal threshold of fn_higher_equal.
 // If no vec item with Z value >= of an internal threshold of fn_higher_equal is found, return vec.size()
