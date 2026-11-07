@@ -3672,32 +3672,38 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     {
         const size_t estimated_points = estimate_preview_moves(print);
         // Arc fitting is what inflates the move count: the writer fits a run of path points into
-        // one G2/G3 line and the processor then discretizes that arc back into several moves, so
-        // one path point becomes close to three moves. Over-reserving only costs committed memory
-        // while the export runs - the payload itself is unchanged - and an under-estimate falls back
-        // to the half-step growth in GCodeProcessorResult::ensure_move_capacity().
+        // one G2/G3 line and the processor then discretizes that arc back into several moves.
+        // Measured on this project (7 plates), the payload an export stores runs 2.63-2.71 moves
+        // per extruded path point with arc fitting on - plate 1 releases 79.2M moves for 29.28M
+        // points - and 1.99-2.00 with it off (57.3M for 28.83M), so 2.9 and 2.15 keep 7% over the
+        // worst plate of each kind. The payload is about twice the G-code's own move count because
+        // the time pass stores an extra move per speed change; the 1.25 that used to be here was
+        // calibrated on the lower figure and under-reserved every arc-off plate by 1.6x, which
+        // reallocated four times per plate. A ratio bound below those figures - "1.6 moves per
+        // point" was tried - under-reserves every plate the same way, so the bound is the absolute
+        // one below, not a ratio.
         const bool arc_fitting = print.config().enable_arc_fitting.value != ArcFittingMode::Disabled;
-        // Moves per extrusion point, over-estimated. Measured on this project: 2.63-2.71 with arc
-        // fitting (the figure counts travels, retractions and the machine G-code too, as it is total
-        // moves over path points), so 2.9 keeps 7% over the worst measurement; 1.25 without arc
-        // fitting, where a path point is one move and the quarter covers the moves that carry none.
-        // The 2.9 was calibrated on a plate where arcs are 74% of the motion lines. A plate the
-        // writer fits almost no arcs on turns out ~1.0-1.1 moves per point, so the same 2.9 would
-        // commit 2.6-2.9 times the payload it is there to protect; the cap below is what bounds that.
-        const double moves_per_point = arc_fitting ? 2.9 : 1.25;
+        const double moves_per_point = arc_fitting ? 2.9 : 2.15;
         size_t reserved = size_t(double(estimated_points) * moves_per_point) + 4096;
-        // A ceiling on what one plate may pre-commit: half of the physical memory, and never more
-        // than 20 GiB. Half rather than a quarter because the largest plate measured here reserves
-        // 12.9 GB (129.2M moves x 100 B) on a 31.7 GiB machine: a quarter would clip it, and the
-        // clip would come straight back through ensure_move_capacity(), which holds the old and the
-        // new block at once (12.9 + 8.5 GB) and so would peak above the reservation it replaced.
-        // The absolute part is for machines with more memory, where half of it is not a figure a
-        // single plate's payload should hold. A reservation still short after the cap is handled by
-        // that same growth path, one half step and one warning at a time.
+        // Absolute ceiling on what one plate may pre-commit: what the process can still commit, and
+        // never more than 20 GiB. Commit (RAM + pagefile), not installed RAM, is what a reserve() of
+        // this size is charged against, and it is what a plate actually runs out of. The ceiling is
+        // deliberately the whole of that figure and not a fraction of it, because a clip is not
+        // free: the export then grows through ensure_move_capacity(), which holds the clipped block
+        // and the grown one at once. Half of the available commit was measured here and it clipped
+        // this project's plate 2 (12.92 GB asked, 9.53 GB granted), grew it to 107.3M moves, and the
+        // run died on plate 2 with 25.2 GB committed - the failure the ceiling was meant to prevent.
+        // What the ceiling does buy is the pathological estimate: an estimate that is orders of
+        // magnitude off is refused up front instead of being reserved and then failing at the first
+        // reallocation. When the platform cannot report a commit limit, half of the physical memory
+        // and then a flat 20 GiB stand in, so the bound never degenerates into reserving nothing.
         const size_t bytes_per_move = sizeof(GCodeProcessorResult::MoveVertex);
-        const size_t cap = std::min<size_t>(total_physical_memory() / 2 / bytes_per_move,
-                                            (size_t(20) << 30) / bytes_per_move);
-        if (reserved > cap) {
+        const size_t commit_avail  = available_commit_memory();
+        const size_t commit_budget = commit_avail > 0                 ? commit_avail
+                                   : total_physical_memory() > 0      ? total_physical_memory() / 2
+                                                                      : 20ull * 1024 * 1024 * 1024;
+        const size_t cap = std::min<size_t>(commit_budget, 20ull * 1024 * 1024 * 1024) / bytes_per_move;
+        if (cap > 0 && reserved > cap) {
             BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reservation capped to %1% moves (the estimate asked for %2%)")
                 % cap % reserved;
             reserved = cap;

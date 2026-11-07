@@ -458,9 +458,10 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         // limit. Reserving ahead costs whatever the estimate over-states and changes nothing about
         // what is stored. A count of 0 leaves the matching vector alone.
         void reserve_preview_payload(size_t moves_count, size_t lines_count = 0);
-        // Make room for `needed` moves before appending to the payload. Growth here is by half,
-        // not by double: this only runs when the reservation taken before the pass was too small,
-        // and a doubling would commit a second full copy of a multi-gigabyte payload.
+        // Make room for `needed` moves before appending to the payload. Grows relative to the
+        // request (`needed` + 1/8, at least 1M moves) rather than relative to the old capacity: this
+        // only runs when the reservation taken before the pass was too small, and a step measured
+        // from a small old block would reallocate again a moment later.
         void ensure_move_capacity(size_t needed);
         // Whether the per-move payload is resident.
         bool has_preview_payload() const { return !moves.empty(); }
