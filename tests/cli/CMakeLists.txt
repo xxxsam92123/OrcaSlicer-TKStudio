@@ -61,3 +61,12 @@ set_tests_properties(cli_malformed_input PROPERTIES
     LABELS "CLI;RequiresApp"
     SKIP_RETURN_CODE 77
     TIMEOUT 900)
+
+# --slice-all releases a plate's sliced objects before the 3MF export measures its first-layer
+# bboxes; a released plate must still carry them in Metadata/plate_N.json.
+add_test(NAME cli_export_3mf_bbox
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_export_3mf_bbox.sh $<TARGET_FILE:OrcaSlicer> ${ORCA_CLI_TEST_PYTHON})
+set_tests_properties(cli_export_3mf_bbox PROPERTIES
+    LABELS "CLI;RequiresApp"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300)

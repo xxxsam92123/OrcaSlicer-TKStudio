@@ -33,6 +33,7 @@
 #include <imgui.h>
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Memory.hpp"
 #include "libslic3r/LocalesUtils.hpp"
 #include <cstdlib>
 #include <limits>
@@ -5566,21 +5567,36 @@ bool PartPlate::restore_slice_payload()
 	return restored;
 }
 
-bool PartPlate::release_finished_slice_resources()
+SliceResourceRelease PartPlate::release_finished_slice_resources()
 {
 	if (!m_slice_result_valid || m_print == nullptr)
-		return false;
+		return SliceResourceRelease::Nothing;
 	// The payload is the condition for the rest: only a plate whose own G-code file is still on
 	// disk can be read back, and only then is giving up the sliced objects of the print safe.
 	if (!release_slice_payload())
-		return false;
+		return SliceResourceRelease::Nothing;
 
 	// The print refuses while any of its steps is still running, and says so: the caller is the one
 	// that has to have stopped the background processing before it gets here.
-	if (!m_print->release_slicing_state())
-		return false;
+	if (!m_print->release_slicing_state()) {
+		// A partial release: the payload above is already gone, so the allocator pages that held
+		// the moves can be reclaimed now. Only the allocator caches - the PrintObjects that the
+		// print refused to hand back are still live, so the process working set must not be
+		// evicted here (on Windows that would page out memory this plate may still read). This is
+		// the one trim a partial release may do, and the CLI applies the same rule to the same
+		// outcome.
+		Slic3r::trim_allocator_caches();
+		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% released its preview payload only, the print kept its sliced objects") % m_plate_index;
+		return SliceResourceRelease::PayloadOnly;
+	}
+	// Both halves are gone and this thread is the one that dropped them: the moves of the result
+	// and the PrintObjects of the print were the last references to that memory. Trim here, after
+	// the release, so the pages of a finished plate are back before the next plate allocates its
+	// own - trimming before the release would only trim what the release still holds. This one is
+	// the full process trim, which is allowed exactly here: the plate's run is over.
+	Slic3r::trim_process_memory();
 	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% released its slicing state, restorable from %2%") % m_plate_index % m_gcode_result->filename;
-	return true;
+	return SliceResourceRelease::Complete;
 }
 
 std::string PartPlate::slice_statistics_json()
@@ -6769,7 +6785,7 @@ int PartPlateList::release_finished_plate_resources(int keep_plate_index)
 		if (plate_index == keep_plate_index)
 			continue;
 		PartPlate *plate = m_plate_list[plate_index];
-		if (plate != nullptr && plate->release_finished_slice_resources())
+		if (plate != nullptr && plate->release_finished_slice_resources() == SliceResourceRelease::Complete)
 			++released;
 	}
 	return released;

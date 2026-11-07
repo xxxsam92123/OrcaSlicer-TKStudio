@@ -740,3 +740,22 @@ TEST_CASE("Z contouring follows the surface of each instance as it is turned", "
         CHECK(lifted > 0);
     }
 }
+
+// The per-volume first-layer slices are the input of the volume grouping; the groups it produces
+// are what brim generation reads afterwards. A sliced object therefore has to keep the groups and
+// must not keep a second copy of the same first layer.
+TEST_CASE("A sliced object keeps its first-layer groups and drops the per-volume slices", "[PrintObject]")
+{
+    Print print;
+    init_and_process_print({ cube(20.) }, print, DynamicPrintConfig::full_print_config());
+    REQUIRE(print.objects().size() == 1);
+    const PrintObject *object = print.objects().front();
+    REQUIRE(!object->layers().empty());
+
+    CHECK(object->firstLayerObjSlice().empty());
+    CHECK(!object->firstLayerObjGroups().empty());
+
+    // Dropping the volume slices did not cut the slice short: the export that consumes it still
+    // produces G-code.
+    CHECK(!gcode(print).empty());
+}

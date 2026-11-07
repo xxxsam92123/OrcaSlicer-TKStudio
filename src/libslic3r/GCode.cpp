@@ -49,6 +49,7 @@
 #include "GCode/OrderingStrategies.hpp"
 #include "Print.hpp"
 #include "Utils.hpp"
+#include "Memory.hpp"
 #include "ClipperUtils.hpp"
 #include "LocalesUtils.hpp"
 #include "libslic3r/format.hpp"
@@ -3340,6 +3341,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code finished" << log_memory_info();
     print->set_done(psGCodeExport);
+    // The toolpaths, orderings and the per-layer working sets of the export are gone at this
+    // point; only the emitted result, which the caller owns, survives. This is the peak of an
+    // export-heavy run, so give the allocator's share of it back here rather than at the next
+    // slice. Allocator caches only: the caller still reads this print's layers.
+    trim_allocator_caches();
 
     {
         LifecycleEventContext ctx;

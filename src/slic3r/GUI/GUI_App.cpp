@@ -5,6 +5,7 @@
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
+#include "libslic3r/Memory.hpp"
 #include "RemoteAPI/RemoteAPIServer.hpp"
 #include "RemoteAPI/RemoteAPIController.hpp"
 #include "GUI_App.hpp"
@@ -2924,6 +2925,9 @@ void GUI_App::init_single_instance_checker(const std::string &name, const std::s
 
 bool GUI_App::OnInit()
 {
+    // Before on_init_inner() builds anything: the allocator thresholds only affect allocations
+    // made after they are set.
+    Slic3r::initialize_memory_allocator();
     try {
         return on_init_inner();
     } catch (const std::exception& e) {
@@ -3902,6 +3906,21 @@ bool GUI_App::on_init_inner()
 
         if (m_post_initialized && app_config->dirty() && app_config->save_due())
             app_config->save();
+
+        // Idle trim: a slice leaves its peak behind in the working set, and once the user has been
+        // away from the window for a while nothing of it is being read. Trimmed once per idle
+        // period - m_last_input moves past last_idle_trim on the next real input, so a user who
+        // stays away does not get the process paged out again every tick, and the first thing
+        // they touch on returning is not a page fault per page. A running background slice owns
+        // the memory being trimmed and is left alone.
+        if (m_post_initialized && this->input_idle_ms() >= 10000) {
+            static auto last_idle_trim = std::chrono::steady_clock::time_point::min();
+            if (m_last_input > last_idle_trim) {
+                last_idle_trim = std::chrono::steady_clock::now();
+                if (!plater_->is_background_process_slicing())
+                    Slic3r::trim_process_memory();
+            }
+        }
 
     });
 

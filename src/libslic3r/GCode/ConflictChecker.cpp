@@ -18,10 +18,12 @@
 #include <tbb/parallel_for.h>
 #include <tbb/concurrent_vector.h>
 
-#include <map>
+#include <unordered_map>
+#include <boost/container_hash/hash.hpp>
 #include <functional>
 #include <atomic>
 #include <utility>
+#include <iterator>
 #include <vector>
 #include "libslic3r/Model.hpp"
 
@@ -205,9 +207,19 @@ ObjectExtrusions getAllLayersExtrusionPathsFromObject(PrintObject *obj)
 {
     ObjectExtrusions oe;
 
+    // Every layer region contributes its perimeter paths, so the total is known before the
+    // append loop reallocates its way up to it.
+    size_t total_regions = 0;
+    for (const Layer *layer : obj->layers())
+        total_regions += layer->regions().size();
+    oe.perimeters.reserve(total_regions);
+    oe.support.reserve(obj->support_layers().size());
+
     for (auto layerPtr : obj->layers()) {
         auto perimeters = getExtrusionPathsFromLayer(layerPtr->regions());
-        oe.perimeters.insert(oe.perimeters.end(), perimeters.begin(), perimeters.end());
+        oe.perimeters.insert(oe.perimeters.end(),
+                             std::make_move_iterator(perimeters.begin()),
+                             std::make_move_iterator(perimeters.end()));
     }
 
     for (auto supportLayerPtr : obj->support_layers()) { oe.support.push_back(getExtrusionPathsFromSupportLayer(supportLayerPtr)); }
@@ -218,18 +230,28 @@ ObjectExtrusions getAllLayersExtrusionPathsFromObject(PrintObject *obj)
 ConflictComputeOpt ConflictChecker::find_inter_of_lines(const LineWithIDs &lines)
 {
     using namespace RasterizationImpl;
-    std::map<IndexPair, std::vector<int>> indexToLine;
+    // A hash map: this index is looked up once per rasterized cell of every line, and order is
+    // never used - the first intersection found is the answer. Reserved for two cells per line,
+    // which is what an average line rasterizes to, so the table does not rehash while it fills.
+    std::unordered_map<IndexPair, std::vector<int>, boost::hash<IndexPair>> indexToLine;
+    indexToLine.reserve(lines.size() * 2);
 
     for (int i = 0; i < lines.size(); ++i) {
         const LineWithID &l1      = lines[i];
         auto              indexes = line_rasterization(l1._line);
         for (auto index : indexes) {
-            const auto &possibleIntersectIdxs = indexToLine[index];
-            for (auto possibleIntersectIdx : possibleIntersectIdxs) {
-                const LineWithID &l2 = lines[possibleIntersectIdx];
-                if (auto interRes = line_intersect(l1, l2); interRes.has_value()) { return interRes; }
+            // One lookup per cell: the emplace-free find() below tells apart "already has lines"
+            // from "first line in this cell" without a second hash of the same key.
+            auto it = indexToLine.find(index);
+            if (it != indexToLine.end()) {
+                for (auto possibleIntersectIdx : it->second) {
+                    const LineWithID &l2 = lines[possibleIntersectIdx];
+                    if (auto interRes = line_intersect(l1, l2); interRes.has_value()) { return interRes; }
+                }
+                it->second.push_back(i);
+            } else {
+                indexToLine[index].push_back(i);
             }
-            indexToLine[index].push_back(i);
         }
     }
     return {};

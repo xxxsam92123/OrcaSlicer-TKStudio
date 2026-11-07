@@ -105,6 +105,16 @@ struct WipeTowerRelocation
     bool overlaps_objects = false; // no spot on the plate was clear of the objects, so it sits on one
 };
 
+// What PartPlate::release_finished_slice_resources() managed to give back. The preview payload and
+// the print's sliced objects are released by two separate calls, and only the second one can be
+// refused (the print still has a running step), so a caller has to know how much is gone before it
+// hands memory back to the OS: a partial release still has live PrintObjects.
+enum class SliceResourceRelease {
+    Nothing,     // nothing was given back: the plate is unsliced, has no print, or its G-code file cannot be read back
+    PayloadOnly, // the preview payload is gone, the print still owns its sliced objects
+    Complete     // the preview payload and the print's sliced objects are both gone
+};
+
 class PartPlate : public ObjectBase
 {
 public:
@@ -728,13 +738,18 @@ public:
     // half. Both are derived from the plate's own G-code file and its model, so neither has to stay
     // resident for every plate of a project at once. Statistics, the valid flag, the G-code file
     // name and the config stay, so the 3MF export, the statistics panel and the send path keep
-    // working. Returns false when the payload cannot be read back from the G-code file: nothing is
-    // given back then. It also returns false when the print refuses to let go of its objects because
-    // one of its steps is still running - the preview payload has already been given back at that
-    // point, and restore_slice_payload() reads it back, so the plate is left released but
-    // restorable, not changed. The caller must have stopped the background processing that owns
-    // this plate's print (Print::release_slicing_state() checks that and refuses otherwise).
-    bool release_finished_slice_resources();
+    // working.
+    //   Nothing      the payload cannot be read back from the G-code file, so nothing is given
+    //                back: neither half is touched.
+    //   PayloadOnly  the payload was given back, then the print refused to let go of its objects
+    //                because one of its steps is still running. The plate is left released but
+    //                restorable (restore_slice_payload() reads the payload back), and its
+    //                PrintObjects are still live.
+    //   Complete     both halves are gone.
+    // The release trims the allocator caches by itself for the partial case, and the full process
+    // footprint for Complete. The caller must have stopped the background processing that owns this
+    // plate's print (Print::release_slicing_state() checks that and refuses otherwise).
+    SliceResourceRelease release_finished_slice_resources();
     // The statistics document of this plate's G-code, or an empty string when there is none to be
     // had. Served from the cache the export filled, summed from the moves when they are still
     // resident, and read back from the plate's own G-code file when both are gone - a project opened
