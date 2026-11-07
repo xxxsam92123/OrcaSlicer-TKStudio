@@ -653,7 +653,7 @@ size_t GCodeProcessor::TimeMachine::plan_klipper(bool lazy)
     return flush_count;
 }
 
-void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks, float additional_time, EMoveType target_move_type, bool is_final)
+void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks, float additional_time, EMoveType target_move_type, bool is_final, bool materialize_moves)
 {
     if (!enabled)
         return;
@@ -723,7 +723,18 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
         // reader until the pre-heat injector consumes it, so output is byte-identical.
         if (block.skippable_type != SkipType::stNone)
             result.skippable_part_time[block.skippable_type] += motion_time;
-        result.moves[block.move_id].time[static_cast<size_t>(mode)] = block_time;
+        if (materialize_moves)
+            result.moves[block.move_id].time[static_cast<size_t>(mode)] = block_time;
+        // The block's duration as the move list would hold it: the assignment above stores into a
+        // float, and the statistics read that float back as a double.
+        const float move_time = static_cast<float>(block_time);
+        // While the payload is not stored, this block's duration goes to the accumulator, which
+        // feeds the moves in move-list order. `named_move` is kept for the type test below: the
+        // block names a move id, and the move that id holds decides whether this block reaches the
+        // g1_times_cache push - exactly as the collected path reads it off the vertex.
+        const GCodeProcessorResult::PreviewMove *named_move = nullptr;
+        if (!materialize_moves && mode == PrintEstimatedStatistics::ETimeMode::Normal)
+            named_move = &result.preview_statistics.assign_time(block.move_id, move_time);
         gcode_time.cache += block_time;
         //BBS
         if (block.flags.prepare_stage)
@@ -733,7 +744,14 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
             first_layer_time += block_time;
 
         // detect actual speed moves required to render toolpaths using actual speed
-        if (mode == PrintEstimatedStatistics::ETimeMode::Normal) {
+        if (named_move != nullptr) {
+            // There is no move list to receive an interpolation vertex, and no vertex to interpolate
+            // towards; the block's own move type is what the collected path tests below.
+            if (named_move->type != EMoveType::Extrude &&
+                named_move->type != EMoveType::Travel &&
+                named_move->type != EMoveType::Wipe)
+                continue;
+        } else if (mode == PrintEstimatedStatistics::ETimeMode::Normal) {
             GCodeProcessorResult::MoveVertex& curr_move = result.moves[block.move_id];
             if (curr_move.type != EMoveType::Extrude &&
                 curr_move.type != EMoveType::Travel &&
@@ -2813,6 +2831,10 @@ void GCodeProcessorResult::reset() {
     export_completed = false;
     // And its statistics describe that earlier round's moves, which are dropped just below.
     statistics_json.clear();
+    // The accumulator is the statistics of a payload that was never stored; a new round starts
+    // without either.
+    preview_statistics.clear();
+    preview_payload_skipped = false;
 
     // moves and lines_ends grow with the print: free them, as no reset result reuses the capacity.
     clear_and_shrink(moves);
@@ -2882,7 +2904,9 @@ void GCodeProcessorResult::reset() {
 void GCodeProcessorResult::reserve_preview_payload(size_t moves_count, size_t lines_count)
 {
     lock();
-    if (moves_count > 0 && moves.capacity() < moves_count)
+    // Only a payload that will be stored is worth reserving: a pass that skips it must not commit
+    // gigabytes for a move list it never fills (see GCodeProcessor::set_preview_payload_wanted()).
+    if (moves_count > 0 && !preview_payload_skipped && moves.capacity() < moves_count)
         moves.reserve(moves_count);
     if (lines_count > 0 && lines_ends.capacity() < lines_count)
         lines_ends.reserve(lines_count);
@@ -2914,6 +2938,9 @@ void GCodeProcessorResult::release_preview_payload()
     // releasing it, and nothing grows these arrays again but a fresh process_file().
     clear_and_shrink(moves);
     clear_and_shrink(lines_ends);
+    // A pass that did not store the payload feeds its statistics as the moves go by, so the copies
+    // it holds are spent by the end of the export; whatever is left is dead weight as well.
+    preview_statistics.clear_pending(true);
     unlock();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: this=%2% preview payload released") % __LINE__ % this;
 }
@@ -3113,6 +3140,25 @@ void GCodeProcessor::process_M6211(const GCodeReader::GCodeLine& line)
         process_elegoo_M6211(line);
 }
 
+Vec3d GCodeProcessor::printable_area_position(const GCodeProcessorResult::MoveVertex &move) const
+{
+    Vec3d pos = move.position.cast<double>();
+    if (!m_machine_frame_transform.is_active())
+        return pos;
+    Vec3d extruder_off = Vec3d::Zero();
+    if (size_t(move.extruder_id) < m_extruder_offsets.size())
+        extruder_off = m_extruder_offsets[move.extruder_id].cast<double>();
+    // Strip plate + extruder offsets to recover the raw machine-frame
+    // coordinate that was emitted into the G-code (see store_move_vertex).
+    Vec3d machine(pos.x() - m_x_offset - extruder_off.x(),
+                  pos.y() - m_y_offset - extruder_off.y(),
+                  pos.z() - extruder_off.z() + m_z_offset);
+    Vec3d build = m_machine_frame_transform.apply_inverse(machine);
+    // Re-apply plate offset so the result matches plate_printable_poly,
+    // which is translated by plate_offset below.
+    return Vec3d(build.x() + m_x_offset, build.y() + m_y_offset, build.z());
+}
+
 bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                         extruder_size,
                                                       const Pointfs                     plate_printable_area,
                                                       const double                      plate_printable_height,
@@ -3142,22 +3188,8 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
     // (is_active() == false) apply_inverse is identity and behaviour is
     // unchanged from before.
     const bool machine_frame_active = m_machine_frame_transform.is_active();
-    auto compare_pos = [&](const GCodeProcessorResult::MoveVertex &move) -> Vec3d {
-        Vec3d pos = move.position.cast<double>();
-        if (!machine_frame_active)
-            return pos;
-        Vec3d extruder_off = Vec3d::Zero();
-        if (size_t(move.extruder_id) < m_extruder_offsets.size())
-            extruder_off = m_extruder_offsets[move.extruder_id].cast<double>();
-        // Strip plate + extruder offsets to recover the raw machine-frame
-        // coordinate that was emitted into the G-code (see store_move_vertex).
-        Vec3d machine(pos.x() - m_x_offset - extruder_off.x(),
-                      pos.y() - m_y_offset - extruder_off.y(),
-                      pos.z() - extruder_off.z() + m_z_offset);
-        Vec3d build = m_machine_frame_transform.apply_inverse(machine);
-        // Re-apply plate offset so the result matches plate_printable_poly,
-        // which is translated by plate_offset below.
-        return Vec3d(build.x() + m_x_offset, build.y() + m_y_offset, build.z());
+    auto compare_pos = [this](const GCodeProcessorResult::MoveVertex &move) -> Vec3d {
+        return printable_area_position(move);
     };
 
     struct GCodePosInfo
@@ -3168,6 +3200,18 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
         float  max_print_z_custom;
     };
     std::map<int, std::map<int, GCodePosInfo>> gcode_path_pos; // object_id, filament_id, pos
+    if (m_result.preview_payload_skipped) {
+        // There are no moves to gather the positions from: they were folded into the extents as the
+        // moves went by (see store_move_vertex()). Two points, the extent's corners, span the box
+        // the gathered points spanned - which is all this check reads off the polygon.
+        for (const auto &[key, extent] : m_path_extents) {
+            if (!extent.defined)
+                continue;
+            GCodePosInfo &info = gcode_path_pos[key.first][key.second];
+            info.pos           = { extent.min, extent.max };
+            info.max_print_z   = extent.max_print_z;
+        }
+    } else {
     for (const GCodeProcessorResult::MoveVertex &move : m_result.moves) {
         // sometimes, the start line extrude was outside the edge of plate a little, this is allowed, so do not include into the gcode_path_pos
         if (move.type == EMoveType::Extrude /* && move.extrusion_role != ExtrusionRole::erFlush || move.type == EMoveType::Travel*/) {
@@ -3187,6 +3231,7 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
                                                                                                    z_for_height);
             }
         }
+    }
     }
 
     bool valid = true;
@@ -3478,6 +3523,25 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     if (z_offset != nullptr)
         m_z_offset = z_offset->value;
 
+    // Settle the preview payload request: `enable_pre_heating` is only known from here on, and the
+    // injector reads every move's time and position, so it overrules a caller that asked to skip
+    // the payload. Recorded on the result because the release/restore contract and the statistics
+    // document both read it.
+    const bool materialize = materialize_moves();
+    if (!materialize && !m_preview_payload_wanted) {
+        BOOST_LOG_TRIVIAL(info) << "preview payload: skipped for this pass (the caller does not render it)";
+    } else if (materialize && !m_preview_payload_wanted) {
+        BOOST_LOG_TRIVIAL(info) << "preview payload: kept, the pre-heat/pre-cool injector reads every move";
+    }
+    m_result.preview_payload_skipped = !materialize;
+    // The dummy first move opens the id space that next_move_id() sizes from the move list, and
+    // initialize_result_moves() ran before apply_config() so it could not know the flag would
+    // overrule the caller. Seed it now, before the stream stores its first move: otherwise that
+    // move's TimeBlock names id 0 (the dummy), and its time is attributed to a move that is not
+    // this one - the statistics' per-type sums then differ from the storing pass by exactly that
+    // move's duration.
+    if (materialize && m_result.moves.empty())
+        m_result.moves.emplace_back(GCodeProcessorResult::MoveVertex());
 }
 
 void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
@@ -3560,6 +3624,12 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
     const ConfigOptionBool* enable_pre_heating = config.option<ConfigOptionBool>("enable_pre_heating");
     if (enable_pre_heating != nullptr)
         m_enable_pre_heating = enable_pre_heating->value;
+
+    // Same settling as the PrintConfig overload: `enable_pre_heating` may overrule a caller that
+    // asked to skip the payload (see materialize_moves()). The dummy first move that opens the id
+    // space is seeded by initialize_result_moves() on this path: process_file() calls this before
+    // it, and it sets m_preview_payload_wanted = true there, so seeding here would add a second one.
+    m_result.preview_payload_skipped = !materialize_moves();
 
     const ConfigOptionBool* handle_hotend_as_extruder = config.option<ConfigOptionBool>("handle_hotend_as_extruder");
     if (handle_hotend_as_extruder != nullptr)
@@ -3946,6 +4016,15 @@ void GCodeProcessor::reset()
 
     m_line_id = 0;
     m_last_line_id = 0;
+    // The move id space restarts with the dummy move. The payload request goes back to the default
+    // (store it); the caller that wants the opposite sets it again right after this reset, before
+    // anything is stored - see DoExport::init_gcode_processor().
+    m_preview_payload_wanted = true;
+    m_move_count = 1;
+    m_last_move = GCodeProcessorResult::MoveVertex();
+    m_path_extents.clear();
+    m_path_extent_key = { -1, -1 };
+    m_path_extent = nullptr;
     m_feedrate = 0.0f;
     m_width = 0.0f;
     m_height = 0.0f;
@@ -4109,6 +4188,14 @@ bool GCodeProcessor::process_file(const std::string& filename, std::function<voi
     // process gcode
     m_result.filename = filename;
     m_result.id = ++s_result_id;
+    // Reading an existing file is always the full payload: this is the path that renders a plate
+    // (Print::reload_gcode_moves()) and the one that sums statistics out of a file, and both need
+    // the moves themselves. A batch export that skips the payload never comes through here.
+    m_preview_payload_wanted = true;
+    // Forcing the payload overrules a caller that asked to skip it, so the record of that
+    // decision has to follow: the reservation below and the readers of the flag (PartPlate,
+    // GCode.cpp) test it, and a stale true would report a payload this pass does store as dropped.
+    m_result.preview_payload_skipped = false;
     initialize_result_moves();
     // The file being read is the only size hint available before the moves are built, so reserve
     // the payload from it: a std::vector that reaches its capacity while it already holds gigabytes
@@ -4243,6 +4330,12 @@ void GCodeProcessor::finalize(bool post_process)
     // Orca: final pass -- also drains any filament-change delay still buffered because
     // calculate_time early-returns with fewer than two queued blocks (see calculate_time).
     calculate_time(m_result, 0, 0.0f, EMoveType::Noop, /*is_final=*/true);
+
+    // Every block has now named its move, so the statistics accumulator holds the last of them:
+    // feed the moves no block ever named (they keep their zero time, as the move list would have
+    // summed them) before anything reads the document.
+    if (m_result.preview_statistics.accumulated || !m_result.preview_statistics.pending.empty())
+        m_result.preview_statistics.flush();
 
     // process the time blocks
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
@@ -4904,7 +4997,7 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
             store_move_vertex(EMoveType::Color_change);
             CustomGCode::Item item = { static_cast<double>(m_end_position[2]), CustomGCode::ColorChange, filament_id + 1, color, "" };
             m_result.custom_gcode_per_print_z.emplace_back(item);
-            m_options_z_corrector.set();
+            m_options_z_corrector.set(last_stored_move_id());
             process_custom_gcode_time(CustomGCode::ColorChange);
             process_filaments(CustomGCode::ColorChange);
         }
@@ -4917,7 +5010,7 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         store_move_vertex(EMoveType::Pause_Print);
         CustomGCode::Item item = { static_cast<double>(m_end_position[2]), CustomGCode::PausePrint, get_filament_id() + 1, "", ""};
         m_result.custom_gcode_per_print_z.emplace_back(item);
-        m_options_z_corrector.set();
+        m_options_z_corrector.set(last_stored_move_id());
         process_custom_gcode_time(CustomGCode::PausePrint);
         return;
     }
@@ -4927,7 +5020,7 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         store_move_vertex(EMoveType::Custom_GCode);
         CustomGCode::Item item = { static_cast<double>(m_end_position[2]), CustomGCode::Custom, get_filament_id() + 1, "", ""};
         m_result.custom_gcode_per_print_z.emplace_back(item);
-        m_options_z_corrector.set();
+        m_options_z_corrector.set(last_stored_move_id());
         return;
     }
 
@@ -5583,7 +5676,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
                 *exclusion_motion_type,
                 static_cast<unsigned char>(type),
                 m_line_id,
-                m_result.moves.size());
+                next_move_id());
         }
     }
 
@@ -5619,7 +5712,11 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         if (origin == G1DiscretizationOrigin::G1)
             m_extruded_last_z = m_end_position[Z];
         // The queued blocks of the moves after the erased one follow them down the list.
-        if (const std::optional<size_t> erased = m_options_z_corrector.update(m_height)) {
+        if (const std::optional<size_t> erased = m_options_z_corrector.update(m_height, last_stored_position())) {
+            if (!materialize_moves())
+                // No move list to erase from here; the statistics' own copies of the moves have to
+                // follow the same erasure, or their ids no longer match the blocks.
+                m_result.preview_statistics.erase_move(static_cast<unsigned int>(*erased));
             for (TimeMachine& machine : m_time_processor.machines) {
                 for (TimeBlock& block : machine.blocks) {
                     if (block.move_id > *erased)
@@ -5709,7 +5806,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom) ? m_extrusion_role : erNone;
         block.distance = distance;
         block.g1_line_id = m_g1_line_id;
-        block.move_id = static_cast<unsigned int>(m_result.moves.size());
+        block.move_id = next_move_id();
         block.remaining_internal_g1_lines = remaining_internal_g1_lines.has_value() ? *remaining_internal_g1_lines : 0;
         block.layer_id = std::max<unsigned int>(1, m_layer_id);
         block.flags.prepare_stage = m_processing_start_custom_gcode;
@@ -5952,7 +6049,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         // check for seam starting vertex
         if (type == EMoveType::Extrude && m_extrusion_role == erExternalPerimeter) {
             //BBS: m_result.moves.back().position has plate offset, must minus plate offset before calculate the real seam position
-            const Vec3f new_pos = m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset;
+            const Vec3f new_pos = last_stored_position() - m_extruder_offsets[filament_id] - plate_offset;
             if (!m_seams_detector.has_first_vertex()) {
                 m_seams_detector.set_first_vertex(new_pos);
             } else if (m_detect_layer_based_on_tag) {
@@ -5971,7 +6068,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
             const Vec3f curr_pos(m_end_position[X], m_end_position[Y], m_end_position[Z]);
             //BBS: m_result.moves.back().position has plate offset, must minus plate offset before calculate the real seam position
-            const Vec3f new_pos = m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset;
+            const Vec3f new_pos = last_stored_position() - m_extruder_offsets[filament_id] - plate_offset;
             const std::optional<Vec3f> first_vertex = m_seams_detector.get_first_vertex();
             // the threshold value = 0.0625f == 0.25 * 0.25 is arbitrary, we may find some smarter condition later
 
@@ -5986,7 +6083,7 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
     }
     else if (type == EMoveType::Extrude && m_extrusion_role == erExternalPerimeter) {
         m_seams_detector.activate(true);
-        m_seams_detector.set_first_vertex(m_result.moves.back().position - m_extruder_offsets[filament_id] - plate_offset);
+        m_seams_detector.set_first_vertex(last_stored_position() - m_extruder_offsets[filament_id] - plate_offset);
     }
 
     if (type == EMoveType::Extrude)
@@ -7638,7 +7735,7 @@ void GCodeProcessor::process_filament_change(int id, int nozzle_id)
         if (!machine.enabled)
             continue;
         TimeBlock block;
-        block.move_id             = static_cast<unsigned int>(m_result.moves.size()) - 1;
+        block.move_id             = last_stored_move_id();
         block.move_type           = EMoveType::Tool_change;
         block.skippable_type      = m_skippable_type;
         block.layer_id            = std::max<unsigned int>(1, m_layer_id);
@@ -7759,7 +7856,7 @@ void GCodeProcessor::process_filament_change(int id)
         if (!machine.enabled)
             continue;
         TimeBlock block;
-        block.move_id             = static_cast<unsigned int>(m_result.moves.size()) - 1;
+        block.move_id             = last_stored_move_id();
         block.move_type           = EMoveType::Tool_change;
         // stamp the current SKIPPABLE type onto the tool-change block (the fleet-wide time_lapse_gcode
         // regions stamp stTimelapse); byte-inert because nothing reads the stamp until the injector
@@ -7838,10 +7935,9 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         ? m_first_layer_height
         : m_end_position[Z] - m_z_offset;
 
-    m_result.ensure_move_capacity(m_result.moves.size() + 1);
     // The trailing field is MoveVertex::prepare_stage: the same condition the time blocks are
     // stamped with, so the preview can leave the start G-code's moves out of the printed layers.
-    m_result.moves.push_back({
+    const GCodeProcessorResult::MoveVertex vertex{
         m_last_line_id,
         type,
         m_extrusion_role,
@@ -7871,7 +7967,43 @@ void GCodeProcessor::store_move_vertex(EMoveType type, EMovePathType path_type, 
         m_object_label_id,
         m_print_z,
         m_processing_start_custom_gcode
-    });
+    };
+
+    if (materialize_moves()) {
+        // A pass that started out not storing the payload still needs the dummy first move to open
+        // the id space once the pre-heat setting turns out to demand the payload (see
+        // initialize_result_moves()).
+        if (m_result.moves.empty())
+            m_result.moves.emplace_back(GCodeProcessorResult::MoveVertex());
+        m_result.ensure_move_capacity(m_result.moves.size() + 1);
+        m_result.moves.push_back(vertex);
+    } else {
+        // Nothing keeps the vertex. The latest one is held anyway, for the seam detector and the
+        // custom-gcode Z corrector, which read the move list's back().
+        m_last_move = vertex;
+        // The statistics document is summed from these vertices, so the per-move figures it reads
+        // are taken here, with the same arithmetic and in the same order (see PreviewStatistics).
+        // gcode_statistics_json() rebuilds the volume from the stored float, not from the position
+        // pair, and this uses the same float the vertex would have carried.
+        const double delta_extruder = double(vertex.delta_extruder);
+        const double volume = delta_extruder * M_PI * sqr(0.5 * double(m_result.filament_diameters[filament_id]));
+        const bool   has_density = size_t(filament_id) < m_result.filament_densities.size() && m_result.filament_densities[filament_id] > 0.f;
+        const double weight = 0.001 * volume * (has_density ? m_result.filament_densities[filament_id] : DEFAULT_FILAMENT_DENSITY);
+        m_result.preview_statistics.push_move(m_move_count, vertex.layer_id, vertex.type, vertex.extrusion_role,
+                                              vertex.internal_only, vertex.position.z(), volume, weight);
+        if (type == EMoveType::Extrude && m_extrusion_role != erCustom) {
+            // The printable-area check tests the extrusion positions against the bed, and it would
+            // otherwise walk the move list for them; folded in here, it needs no payload at all.
+            const std::pair<int, int> key{ m_object_label_id, int(filament_id) };
+            if (m_path_extent == nullptr || key != m_path_extent_key) {
+                m_path_extent     = &m_path_extents[key];
+                m_path_extent_key = key;
+            }
+            const Vec3d position = printable_area_position(vertex);
+            m_path_extent->add(Point(scale_(position.x()), scale_(position.y())), m_print_z);
+        }
+    }
+    ++m_move_count;
 
     if (type == EMoveType::Seam) {
         m_seams_count++;
@@ -8375,14 +8507,20 @@ void GCodeProcessor::process_filaments(CustomGCode::Type code)
 void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_last_n_blocks, float additional_time, EMoveType target_move_type, bool is_final)
 {
     // calculate times
+    const bool materialize_moves = this->materialize_moves();
     std::vector<TimeMachine::ActualSpeedMove> actual_speed_moves;
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
         TimeMachine& machine = m_time_processor.machines[i];
         machine.klipper = m_flavor == gcfKlipper;
-        machine.calculate_time(m_result, static_cast<PrintEstimatedStatistics::ETimeMode>(i), keep_last_n_blocks, additional_time, target_move_type, is_final);
+        machine.calculate_time(m_result, static_cast<PrintEstimatedStatistics::ETimeMode>(i), keep_last_n_blocks, additional_time, target_move_type, is_final, materialize_moves);
         if (static_cast<PrintEstimatedStatistics::ETimeMode>(i) == PrintEstimatedStatistics::ETimeMode::Normal)
             actual_speed_moves = std::move(machine.actual_speed_moves);
     }
+
+    if (!materialize_moves)
+        // The actual-speed collection was skipped, so there is nothing to insert, and no move list
+        // to insert it into. The blocks' move ids already name the stored moves directly.
+        return;
 
     // actual_speed_moves holds, per block in move order, the moves to insert before the block's move and then an
     // entry without a position for that move; positioned entries after the last such entry are dropped.
@@ -8456,6 +8594,9 @@ void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_la
         }
     }
     m_options_z_corrector.on_moves_inserted(m_actual_speed_id_map);
+    // The insertion moved every id after the first inserted vertex; m_move_count names the next
+    // slot, and while the payload is stored that is the list's size again.
+    m_move_count = static_cast<unsigned int>(moves.size());
 }
 
 void GCodeProcessor::simulate_st_synchronize(float additional_time, EMoveType target_move_type)

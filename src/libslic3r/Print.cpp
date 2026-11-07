@@ -4207,7 +4207,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 // The export_gcode may die for various reasons (fails to process filename_format,
 // write error into the G-code, cannot execute post-processing scripts).
 // It is up to the caller to show an error message.
-std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload)
 {
     // output everything to a G-code file
     // The following call may die if the filename_format template substitution fails.
@@ -4241,7 +4241,7 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
     this->update_imex_slice_offset();
     const Vec2d imex_off = this->get_imex_slice_offset();
     gcode->set_gcode_offset_with_imex_shift(origin(0), origin(1), imex_off.x(), imex_off.y());
-    gcode->do_export(this, path.c_str(), result, thumbnail_cb);
+    gcode->do_export(this, path.c_str(), result, thumbnail_cb, preview_payload);
     gcode->export_layer_filaments(result);
     //BBS
     if (result != nullptr) {
@@ -6053,6 +6053,10 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
     std::lock_guard<std::mutex> lock(result->result_mutex);
     result->moves      = std::move(reloaded.moves);
     result->lines_ends = std::move(reloaded.lines_ends);
+    // The payload is resident again, so the result is no longer the one that skipped it - and the
+    // accumulator that stood in for it has nothing left to stand in for.
+    result->preview_payload_skipped = false;
+    result->preview_statistics.clear();
 }
 
 std::tuple<float, float> Print::object_skirt_offset(double margin_height) const

@@ -17,6 +17,7 @@
 #include "libslic3r/GCode/MachineFrameTransform.hpp"
 
 #include <atomic>
+#include <boost/log/trivial.hpp>
 #include <cstddef>
 #include <cassert>
 #include <cstdint>
@@ -279,6 +280,197 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             float actual_volumetric_rate() const { return actual_feedrate * mm3_per_mm; }
         };
 
+        // The per-layer figures gcode_statistics_json() sums from the move list. An export that does
+        // not keep the moves accumulates them as they go by instead, so the document it writes is
+        // the one the move list would have summed to - the arithmetic is the move list's, only the
+        // storage differs. Every field is added in the order the move list is read in (see
+        // GCodeStatistics.cpp), which is what makes the sums identical rather than merely close.
+        struct PreviewUsage
+        {
+            double time{ 0. };
+            double volume{ 0. };
+            double weight{ 0. };
+            void add(const PreviewUsage &other)
+            {
+                time += other.time;
+                volume += other.volume;
+                weight += other.weight;
+            }
+        };
+
+        struct PreviewLayer
+        {
+            float                                 z{ 0.f };
+            double                                travel_time{ 0. };
+            PreviewUsage                          total;
+            std::map<ExtrusionRole, PreviewUsage> features;
+        };
+
+        // One stored vertex, reduced to the fields gcode_statistics_json() reads off it, plus the
+        // volume its `delta_extruder` stands for, which is worked out when the vertex is stored so
+        // this carries no reference back to the result.
+        struct PreviewMove
+        {
+            unsigned int  id{ 0 };              // its slot in the move list
+            unsigned int  layer_id{ 0 };
+            float         z{ 0.f };
+            float         time{ 0.f };          // the float the move list would hold
+            double        volume{ 0. };
+            double        weight{ 0. };
+            ExtrusionRole role{ erNone };
+            EMoveType     type{ EMoveType::Noop };
+            bool          internal_only{ false };
+            bool          has_time{ false };
+        };
+
+        struct PreviewStatistics
+        {
+            std::vector<PreviewLayer>             layers;
+            std::map<ExtrusionRole, PreviewUsage> features;
+            double                                travel_time{ 0. };
+            // Whether a move was fed in at all. A result that never stored one sums to a document
+            // with no statistics in it, which gcode_statistics_json() must not present as a slice's.
+            bool                                  accumulated{ false };
+            // How many moves went into the sums: the count the move list would have had, which is
+            // what the export log reports in place of the payload it did not store.
+            size_t                                moves_fed{ 0 };
+            // The moves whose time the planner has not handed out yet, in move-list order. A vertex
+            // is stored before its time is computed, and the block that names it comes later, so
+            // the two are matched here by id. Held back one block: an id repeated by a second block
+            // has its time replaced, exactly as the move list's assignment would replace it.
+            std::vector<PreviewMove> pending;
+            size_t                   pending_head{ 0 };
+
+            PreviewLayer &layer(unsigned int layer_id)
+            {
+                if (layers.size() <= layer_id)
+                    layers.resize(size_t(layer_id) + 1);
+                return layers[layer_id];
+            }
+            // One move into the sums, exactly as the move list's loop adds it: every move counts
+            // into its layer's total, a travel into the travel sums too, and a non-internal
+            // extrusion into its feature's time and material.
+            void feed(const PreviewMove &move)
+            {
+                accumulated = true;
+                ++moves_fed;
+                // The move list's first slot is the dummy move, which is what makes its loop touch
+                // layer 0 before anything else does; keep that empty layer.
+                if (layers.empty())
+                    layers.emplace_back();
+                PreviewLayer &l = layer(move.layer_id);
+                const double  time = double(move.time);
+                l.total.time += time;
+                if (move.type == EMoveType::Travel) {
+                    l.travel_time += time;
+                    travel_time += time;
+                }
+                // A vertex added inside a move to show its acceleration carries no extrusion of its
+                // own, and the move list drops it here as well.
+                if (move.type != EMoveType::Extrude || move.internal_only)
+                    return;
+                if (move.role != erCustom)
+                    l.z = move.z;
+                PreviewUsage usage;
+                usage.time   = time;
+                usage.volume = move.volume;
+                usage.weight = move.weight;
+                l.total.volume += move.volume;
+                l.total.weight += move.weight;
+                l.features[move.role].add(usage);
+                features[move.role].add(usage);
+            }
+            void push_move(unsigned int id, unsigned int layer_id, EMoveType type, ExtrusionRole role, bool internal_only,
+                           float z, double volume, double weight)
+            {
+                PreviewMove move;
+                move.id            = id;
+                move.layer_id      = layer_id;
+                move.type          = type;
+                move.role          = role;
+                move.internal_only = internal_only;
+                move.z             = z;
+                move.volume        = volume;
+                move.weight        = weight;
+                pending.push_back(move);
+            }
+            // Hand one block's duration to the move it names, after feeding every move before it
+            // (their blocks are all in by now, as blocks are processed in move order). Returns the
+            // move, so the caller can apply the same type test the collected path applies.
+            const PreviewMove &assign_time(unsigned int id, float time)
+            {
+                while (pending_head < pending.size() && pending[pending_head].id < id) {
+                    feed(pending[pending_head]);
+                    ++pending_head;
+                }
+                if (pending_head > 4096 && pending_head * 2 > pending.size()) {
+                    // Only this buffer's own front is dead: drop it, so a long pass does not walk
+                    // gigabytes of spent descriptors to reach the live tail.
+                    pending.erase(pending.begin(), pending.begin() + pending_head);
+                    pending_head = 0;
+                }
+                if (pending_head == pending.size() || pending[pending_head].id != id) {
+                    // A block naming a move whose slot is not here: the move list would have written
+                    // the time into a slot this pass no longer tracks. Cannot happen while blocks
+                    // are processed in move order, and the alternative (dropping it) would shift
+                    // every figure after it.
+                    BOOST_LOG_TRIVIAL(warning) << "preview payload: block names move " << id
+                                               << ", which the statistics accumulator no longer holds";
+                    static const PreviewMove unmatched;
+                    return unmatched;
+                }
+                PreviewMove &move = pending[pending_head];
+                move.time         = time;
+                move.has_time     = true;
+                return move;
+            }
+            // Feed what the planner never named. A move without a block keeps its zero time, which
+            // is what the move list would have summed for it.
+            void flush()
+            {
+                for (; pending_head < pending.size(); ++pending_head)
+                    feed(pending[pending_head]);
+                clear_pending(true);
+            }
+            // The custom-gcode Z corrector moves its marker to the end of the move list and erases
+            // it from where it was, which shifts every id after it down. Mirror that on the copies:
+            // the ids after the hole go down by one, and the copy takes the last id.
+            void erase_move(unsigned int id)
+            {
+                for (size_t i = pending_head; i < pending.size(); ++i) {
+                    if (pending[i].id != id)
+                        continue;
+                    const unsigned int last_id = pending.back().id;
+                    PreviewMove        copy    = pending[i];
+                    pending.erase(pending.begin() + i);
+                    for (size_t k = i; k < pending.size(); ++k)
+                        --pending[k].id;
+                    copy.id = last_id;
+                    pending.push_back(copy);
+                    return;
+                }
+                BOOST_LOG_TRIVIAL(warning) << "preview payload: the z corrector erased move " << id
+                                           << " after its statistics were accumulated";
+            }
+            void clear_pending(bool shrink)
+            {
+                if (shrink)
+                    clear_and_shrink(pending);
+                else
+                    pending.clear();
+                pending_head = 0;
+            }
+            void clear()
+            {
+                layers.clear();
+                features.clear();
+                travel_time = 0.;
+                accumulated = false;
+                moves_fed = 0;
+                clear_pending(true);
+            }
+        };
+
         struct SliceWarning {
             int         level;                  // 0: normal tips, 1: warning; 2: error
             std::string msg;                    // enum string
@@ -342,6 +534,11 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         // Set only by mark_export_completed(): whether `filename` was written by this result's own
         // export. See preview_payload_restorable().
         bool export_completed { false };
+        // Set by an export that was allowed to skip the per-move preview payload (see
+        // GCodeProcessor::set_preview_payload_wanted()). `moves` was then never resident, though the
+        // file this result's export wrote can still rebuild it on demand (Print::reload_gcode_moves),
+        // so the release/restore contract is unchanged - the payload just starts out absent.
+        bool preview_payload_skipped { false };
         // The per-layer statistics document of the exported G-code, computed once the export filled
         // the moves in. It is the only part of them the 3MF writer needs, and the moves it is
         // summed from may be gone by then (release_preview_payload()), so it is kept as the text
@@ -350,6 +547,9 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         std::string statistics_json;
         unsigned int id;
         std::vector<MoveVertex> moves;
+        // The move list's per-layer sums, filled only when the moves are not stored (see
+        // preview_payload_skipped). Empty - and unused - whenever `moves` is the payload.
+        PreviewStatistics preview_statistics;
         ObjectMass plate_mass;
         // One per object instance, and one per connected body of the instances of several, when the sliced objects were at hand.
         std::vector<ObjectMass> object_masses;
@@ -496,6 +696,10 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             statistics_json = std::forward<Other>(other).statistics_json;
             id = std::forward<Other>(other).id;
             moves = std::forward<Other>(other).moves;
+            // A result that skipped the payload carries the accumulator the document is summed from
+            // and the flag the release/restore contract reads; both travel with the result.
+            preview_payload_skipped = std::forward<Other>(other).preview_payload_skipped;
+            preview_statistics = std::forward<Other>(other).preview_statistics;
             plate_mass = std::forward<Other>(other).plate_mass;
             object_masses = std::forward<Other>(other).object_masses;
             body_masses = std::forward<Other>(other).body_masses;
@@ -944,7 +1148,11 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
 
             // additional_time is attributed to the first block matching target_move_type
             // (EMoveType::Noop matches any block, i.e. the first processed block).
-            void calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks = 0, float additional_time = 0.0f, EMoveType target_move_type = EMoveType::Noop, bool is_final = false);
+            // `materialize_moves` false means the pass does not store the preview payload: the move
+            // list is then not written to, and the per-move times go to the result's statistics
+            // accumulator instead, with the actual-speed collection skipped (it exists only to place
+            // preview interpolation vertices).
+            void calculate_time(GCodeProcessorResult& result, PrintEstimatedStatistics::ETimeMode mode, size_t keep_last_n_blocks = 0, float additional_time = 0.0f, EMoveType target_move_type = EMoveType::Noop, bool is_final = false, bool materialize_moves = true);
         };
 
         struct UsedFilaments  // filaments per ColorChange
@@ -1182,8 +1390,10 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             explicit OptionsZCorrector(GCodeProcessorResult& result) : m_result(result) {
             }
 
-            void set() {
-                m_move_id = m_result.moves.size() - 1;
+            // Records the marker's move: the last one stored, which the caller names because a pass
+            // that does not store the payload has no move list to look it up in.
+            void set(size_t move_id) {
+                m_move_id = move_id;
                 m_custom_gcode_per_print_z_id = m_result.custom_gcode_per_print_z.size() - 1;
             }
 
@@ -1201,17 +1411,40 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             }
 
             // Returns the index of the move erased from the list, if any.
-            std::optional<size_t> update(float height) {
+            // `position` is the latest stored move's position, which is where the marker is moved to.
+            // It is passed in (and not read back off the move list) because an export that does not
+            // store the payload has no list to read it from; see GCodeProcessor::last_stored_position().
+            // `position` is taken by value on purpose: the move list is appended to below, and the
+            // caller hands in a reference into that very list (last_stored_position()), which an
+            // append that reallocates would dangle.
+            std::optional<size_t> update(float height, Vec3f position) {
                 if (!m_move_id.has_value() || !m_custom_gcode_per_print_z_id.has_value())
                     return std::nullopt;
 
-                const Vec3f  position = m_result.moves.back().position;
-                const size_t erased   = *m_move_id;
+                const size_t erased = *m_move_id;
 
-                GCodeProcessorResult::MoveVertex& move = m_result.moves.emplace_back(m_result.moves[erased]);
-                move.position = position;
-                move.height = height;
+                // Did this pass store the payload at all? The result mirrors the processor's
+                // materialize_moves() in preview_payload_skipped (set by apply_config), which is the
+                // question to ask here - an empty move list is only the current consequence of it.
+                // The empty-list test is the fallback for the case the flag and the list disagree:
+                // indexing an empty list below would be undefined behaviour, and the marker's print_z
+                // (all this branch writes) is the same either way.
+                if (m_result.preview_payload_skipped || m_result.moves.empty()) {
+                    // No vertex to move and no ids to shift here, but the marker's print_z is what
+                    // the relocation updated for every consumer that survives without the payload.
+                    // The caller mirrors the erasure on the statistics' own copies of the moves.
+                    m_result.custom_gcode_per_print_z[*m_custom_gcode_per_print_z_id].print_z = position.z();
+                    reset();
+                    return erased;
+                }
+
+                // Copy out first: everything after the erased vertex shifts down by one, and the
+                // copy must not alias the vector it is pushed back into.
+                GCodeProcessorResult::MoveVertex copy = m_result.moves[erased];
+                copy.position = position;
+                copy.height = height;
                 m_result.moves.erase(m_result.moves.begin() + erased);
+                m_result.moves.push_back(copy);
                 m_result.custom_gcode_per_print_z[*m_custom_gcode_per_print_z_id].print_z = position.z();
                 reset();
                 return erased;
@@ -1463,6 +1696,51 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         // calculate_time()'s map from each block's move id to its index after the actual speed moves are inserted,
         // a member to reuse its capacity.
         std::vector<std::pair<unsigned int, unsigned int>> m_actual_speed_id_map;
+        // Whether the caller wants the per-move preview payload (see set_preview_payload_wanted()).
+        // The pass stores it only when materialize_moves() says so, which also weighs the pre-heat
+        // injector's need for it.
+        bool m_preview_payload_wanted{ true };
+        // The move id space the time blocks name their moves in: 1 for the dummy first move, one
+        // more per stored vertex. It equals m_result.moves.size() whenever the payload is stored,
+        // and is the only counter left when it is not.
+        unsigned int m_move_count{ 1 };
+        // The most recently stored vertex. Kept even when the payload is not materialized because
+        // the seam detector and the custom-gcode Z corrector read the latest move's position.
+        GCodeProcessorResult::MoveVertex m_last_move;
+        // Extent of the extrusion positions of each (object label, filament), which is what
+        // update_slice_warnings() tests against the printable area. Accumulated as the moves are
+        // stored: the check then needs no copy of the payload, and a plate that prints a hundred
+        // million moves does not allocate a point per move to find a bounding box.
+        struct PathExtent
+        {
+            Point min{ 0, 0 };
+            Point max{ 0, 0 };
+            bool  defined{ false };
+            float max_print_z{ 0.f };
+            void add(const Point &point, float z)
+            {
+                if (!defined) {
+                    min = max = point;
+                    defined = true;
+                } else {
+                    min = min.cwiseMin(point);
+                    max = max.cwiseMax(point);
+                }
+                max_print_z = std::max(max_print_z, z);
+            }
+        };
+        std::map<std::pair<int, int>, PathExtent> m_path_extents;
+        // The extent the last extrusion was added to. Extrusions arrive in runs of one (object,
+        // filament), so this turns a map lookup per extrusion into a lookup per run.
+        std::pair<int, int> m_path_extent_key{ -1, -1 };
+        PathExtent *        m_path_extent{ nullptr };
+        // The position of the latest stored move, whichever mode stored it.
+        const Vec3f &last_stored_position() const { return (materialize_moves() && !m_result.moves.empty()) ? m_result.moves.back().position : m_last_move.position; }
+        // The move id the next stored vertex will take, i.e. what a block created now has to name.
+        // While the payload is stored that is the move list's own size; a pass without it keeps the
+        // same id space in m_move_count, so `move_id` means the same thing in both modes.
+        unsigned int next_move_id() const { return materialize_moves() ? static_cast<unsigned int>(m_result.moves.size()) : m_move_count; }
+        unsigned int last_stored_move_id() const { return next_move_id() - 1; }
         UsedFilaments m_used_filaments;
 
         Print* m_print{ nullptr };
@@ -1535,13 +1813,39 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         bool process_file(const std::string& filename, std::function<void()> cancel_callback = nullptr);
         // See GCodeProcessorResult::reserve_preview_payload().
         void reserve_preview_payload(size_t moves_count, size_t lines_count = 0) { m_result.reserve_preview_payload(moves_count, lines_count); }
+        // Whether this pass stores the per-move preview payload.
+        // True when the caller wants it, *or* when the multi-nozzle pre-heat/pre-cool injector
+        // needs it. The two are an OR, not an AND: the injector resolves its idle windows against
+        // every move's `gcode_id` and its cumulative time, so a fleet that runs it keeps the payload
+        // whatever the caller asked for - degrading it there would drop the injection silently (see
+        // run_second_pass_injection()), and the G-code would differ from the pass that kept it.
+        // `enable_pre_heating` is the machine capability bit the injector is gated on, not a nozzle
+        // count: H2D/H2D Pro/X2D set it while declaring a single nozzle.
+        bool materialize_moves() const { return m_preview_payload_wanted || m_enable_pre_heating; }
+        // Tell the processor whether the caller will render this result's preview. A batch export
+        // that hands the file over, or that releases the payload right after, says false: the pass
+        // then keeps only what the per-layer statistics, the M73 time lines and the printable-area
+        // check need - a few bytes per move instead of the vertex - and the payload is rebuilt from
+        // the G-code file when something does want it (Print::reload_gcode_moves()).
+        // Defaults to true, so a caller that says nothing keeps the full payload.
+        void set_preview_payload_wanted(bool wanted) { m_preview_payload_wanted = wanted; }
+        bool preview_payload_wanted() const { return m_preview_payload_wanted; }
 
         // Streaming interface, for processing G-codes just generated by PrusaSlicer in a pipelined fashion.
         void initialize(const std::string& filename);
         void initialize_result_moves() {
-            // 1st move must be a dummy move
-            assert(m_result.moves.empty());
-            m_result.moves.emplace_back(GCodeProcessorResult::MoveVertex());
+            // 1st move must be a dummy move, so that a block's move id can name the move before it.
+            // An export that does not store the payload keeps the id space (the dummy still counts
+            // as move 0) without keeping the vertex, so `move_id` means the same thing in both modes.
+            // The pre-heat setting is not known yet at this point - apply_config() comes later - so
+            // a pass that turns out to need the payload seeds the dummy lazily in store_move_vertex().
+            // A caller may also have configured the processor before this call, and process_file()
+            // is reached that way: apply_config() seeds the dummy itself when it has to overrule the
+            // caller's skip request, and a second one here would leave a vertex-less move at index
+            // 1, pushing the start G-code's prepare stage off the head of the move list.
+            if (m_preview_payload_wanted && m_result.moves.empty())
+                m_result.moves.emplace_back(GCodeProcessorResult::MoveVertex());
+            m_move_count = 1;
         }
         void process_buffer(const std::string& buffer);
         void finalize(bool post_process);
@@ -1592,6 +1896,11 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         void update_position_known_from_move(const std::array<std::optional<double>, 4> &axes, G1DiscretizationOrigin origin);
         void update_position_known_from_move(const GCodeReader::GCodeLine &line);
         void update_exclusion_volume_path_check_result();
+        // A stored vertex's position in the frame the printable area is defined in. Belt-printer
+        // post-gcode shear/scale/post_remap runs as the last step of BeltKinematics::to_machine, so
+        // the vertex is in the printer's machine frame there; this undoes it. Inactive otherwise, and
+        // then the inverse is the identity.
+        Vec3d printable_area_position(const GCodeProcessorResult::MoveVertex &move) const;
 
         // Arc Move
         void process_G2_G3(const GCodeReader::GCodeLine& line, bool clockwise);

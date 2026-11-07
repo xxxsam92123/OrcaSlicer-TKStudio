@@ -117,6 +117,80 @@ TEST_CASE("Copies sliced as objects of their own keep their number in the model 
     CHECK(instances == std::set<int>{ 0, 1 });
 }
 
+TEST_CASE("An export that does not keep the preview payload reports the same G-code and statistics", "[GCodeStatistics]")
+{
+    // What the command line does: export without the per-move payload, because it never renders a
+    // preview from the result. Neither the G-code nor the statistics document may move - the
+    // document is summed from an accumulator fed in the move list's order (see
+    // GCodeProcessorResult::PreviewStatistics), so this is the comparison that proves it.
+    const auto slice_once = [](bool preview_payload, GCodeProcessorResult &result,
+                               std::initializer_list<ConfigBase::SetDeserializeItem> extra = {},
+                               size_t *masked_header_lines = nullptr) {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({ { "layer_height", 0.2 },
+                                        { "initial_layer_print_height", 0.2 },
+                                        { "skirt_loops", 0 },
+                                        { "brim_type", "no_brim" },
+                                        { "filament_density", 1.25 },
+                                        { "enable_arc_fitting", "enabled" } });
+        config.set_deserialize_strict(extra);
+        Print print;
+        Model model;
+        Test::init_print({ Test::cube(20) }, print, model, config, nullptr, true, 2);
+        return Test::gcode(print, &result, preview_payload, masked_header_lines);
+    };
+
+    GCodeProcessorResult stored;
+    size_t               stored_masked = 0;
+    const std::string    gcode_stored = slice_once(true, stored, {}, &stored_masked);
+    GCodeProcessorResult skipped;
+    size_t               skipped_masked = 0;
+    const std::string    gcode_skipped = slice_once(false, skipped, {}, &skipped_masked);
+
+    // The byte comparison below only holds while the export timestamp is masked. If the header's
+    // format changes so that no line is masked any more, these fail here instead of letting the
+    // comparison start flaking whenever the two exports straddle a second.
+    REQUIRE(stored_masked > 0);
+    REQUIRE(skipped_masked > 0);
+
+    REQUIRE(!stored.moves.empty());
+    REQUIRE(!stored.statistics_json.empty());
+    CHECK(skipped.moves.empty());
+    CHECK(skipped.preview_payload_skipped);
+    // The G-code is written from the time machine's g1 cache, not from the moves, so dropping the
+    // moves must not touch a byte of it - the M73 lines included.
+    CHECK(gcode_skipped == gcode_stored);
+    CHECK(skipped.statistics_json == stored.statistics_json);
+    // The document still describes the plate, not an empty one.
+    const nlohmann::json statistics = nlohmann::json::parse(skipped.statistics_json);
+    CHECK(statistics["summary"]["layer_count"] == 100);
+    CHECK(statistics["summary"]["time"].get<double>() > 0.);
+    CHECK(statistics["summary"]["volume"].get<double>() > 0.);
+
+    // The multi-nozzle pre-heat/pre-cool injector resolves its idle windows against the moves, so a
+    // machine that enables pre-heating overrules the caller: the payload comes back even though this
+    // export said it would not render it. The control is the *same* machine with the payload stored,
+    // because turning enable_pre_heating on moves the G-code by design, before any of this is
+    // involved: the writer emits `; MACHINE_START_GCODE_END` / `; MACHINE_END_GCODE_START` for the
+    // injector's usage blocks (GCode.cpp, gated on the same flag: they are what activates it) and the
+    // config block echoes `enable_pre_heating = 1`. Against the non-preheat run those lines alone
+    // differ, so comparing across configs would test the flag, not the caller override.
+    GCodeProcessorResult preheated_stored;
+    size_t               preheated_stored_masked = 0;
+    const std::string    gcode_preheated_stored = slice_once(true, preheated_stored, { { "enable_pre_heating", "1" } },
+                                                             &preheated_stored_masked);
+    GCodeProcessorResult preheated;
+    size_t               preheated_masked = 0;
+    const std::string    gcode_preheated = slice_once(false, preheated, { { "enable_pre_heating", "1" } },
+                                                      &preheated_masked);
+    REQUIRE(preheated_stored_masked > 0);
+    REQUIRE(preheated_masked > 0);
+    CHECK(!preheated.preview_payload_skipped);
+    CHECK(!preheated.moves.empty());
+    CHECK(gcode_preheated == gcode_preheated_stored);
+    CHECK(preheated.statistics_json == preheated_stored.statistics_json);
+}
+
 TEST_CASE("The statistics file takes the G-code's name with the statistics extension", "[GCodeStatistics]")
 {
     CHECK(gcode_statistics_path("plate_1.gcode") == "plate_1.statistics.json");

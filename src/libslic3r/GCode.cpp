@@ -3074,7 +3074,7 @@ size_t estimate_preview_moves(const Print& print)
 }
 } // namespace
 
-void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload)
 {
     PROFILE_CLEAR();
 
@@ -3165,7 +3165,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     }
 
     try {
-        this->_do_export(*print, file, thumbnail_cb);
+        this->_do_export(*print, file, thumbnail_cb, preview_payload);
         file.flush();
         if (file.is_error()) {
             file.close();
@@ -3354,6 +3354,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         // releases after each plate's export. Produce it here, while they are the ones this export
         // just wrote, so the 3MF and the statistics file read it back instead of the moves.
         result->cache_statistics_json();
+        // In place of the payload it did not store, report what the pass summed: the count is the
+        // move list's own, so a plate's log line can be compared with a storing run.
+        if (result->preview_payload_skipped)
+            BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: %1% moves summed into the statistics, none stored, plate %2%")
+                % result->preview_statistics.moves_fed % path;
     }
     // Write the profiler measurements to file
     PROFILE_UPDATE();
@@ -3363,9 +3368,13 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 // free functions called by GCode::_do_export()
 namespace DoExport {
     static void init_gcode_processor(const PrintConfig& config, GCodeProcessor& processor,
-                                     const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase>& nozzle_group_result = nullptr)
+                                     const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase>& nozzle_group_result = nullptr,
+                                     bool preview_payload = true)
     {
         processor.reset();
+        // The payload request has to be in place before initialize_result_moves() seeds the move id
+        // space; reset() put it back to the default (store the payload).
+        processor.set_preview_payload_wanted(preview_payload);
         // Slot-resolution context for the streaming replay (reset() just cleared it). This is NOT
         // the post-stream result-field handover at the end of do_export, which gates the richer
         // change-time model and must stay after the stream.
@@ -3649,7 +3658,7 @@ static std::vector<int> get_imex_active_tools(const Print& print)
     return active_tools;
 }
 
-void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb)
+void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload)
 {
     PROFILE_FUNC();
 
@@ -3665,11 +3674,14 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // init as filament map
     update_layer_related_config(0);
 
-    DoExport::init_gcode_processor(print.config(), m_processor, print.get_layered_nozzle_group_result());
+    // The payload request is settled inside init_gcode_processor(), after the reset it starts
+    // with: the pre-heat injector can still overrule it (see GCodeProcessor::materialize_moves()).
+    DoExport::init_gcode_processor(print.config(), m_processor, print.get_layered_nozzle_group_result(), preview_payload);
     // Reserve the move payload from the sliced geometry before anything is appended to it: this
     // result's moves are released after every plate of a many-plate project, so the vector starts
-    // from the dummy move each time and can only be sized from an estimate.
-    {
+    // from the dummy move each time and can only be sized from an estimate. A pass that does not
+    // store the payload has nothing to size.
+    if (m_processor.materialize_moves()) {
         const size_t estimated_points = estimate_preview_moves(print);
         // Arc fitting is what inflates the move count: the writer fits a run of path points into
         // one G2/G3 line and the processor then discretizes that arc back into several moves.

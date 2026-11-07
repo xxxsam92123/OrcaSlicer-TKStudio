@@ -41,27 +41,21 @@ double weight_of(const GCodeProcessorResult &result, size_t filament, double vol
     return 0.001 * volume * (has_density ? result.filament_densities[filament] : DEFAULT_FILAMENT_DENSITY);
 }
 
-struct Usage
+// The per-layer sums are the processor's own type: the move list accumulates them as it goes by when
+// it does not store the moves, so both paths hand this function the same numbers.
+using PreviewLayer = GCodeProcessorResult::PreviewLayer;
+using PreviewUsage = GCodeProcessorResult::PreviewUsage;
+
+json usage_json(const PreviewUsage &usage)
 {
-    double time{ 0. };
-    double volume{ 0. };
-    double weight{ 0. };
+    return json{ { "time", rounded(usage.time, 3) }, { "volume", rounded(usage.volume, 3) }, { "weight", rounded(usage.weight, 4) } };
+}
 
-    void add(const Usage &other)
-    {
-        time += other.time;
-        volume += other.volume;
-        weight += other.weight;
-    }
-
-    json to_json() const { return json{ { "time", rounded(time, 3) }, { "volume", rounded(volume, 3) }, { "weight", rounded(weight, 4) } }; }
-};
-
-json features_json(const std::map<ExtrusionRole, Usage> &features)
+json features_json(const std::map<ExtrusionRole, PreviewUsage> &features)
 {
     json out = json::object();
     for (const auto &[role, usage] : features)
-        out[ExtrusionEntity::role_to_string(role)] = usage.to_json();
+        out[ExtrusionEntity::role_to_string(role)] = usage_json(usage);
     return out;
 }
 
@@ -77,23 +71,24 @@ std::string gcode_statistics_json(const GCodeProcessorResult &result)
 
     constexpr size_t normal = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal);
 
-    struct Layer
-    {
-        float                          z{ 0.f };
-        double                         travel_time{ 0. };
-        Usage                          total;
-        std::map<ExtrusionRole, Usage> features;
-    };
-    std::vector<Layer>             layers;
-    std::map<ExtrusionRole, Usage> features;
-    double                         travel_time = 0.;
+    std::vector<PreviewLayer>             layers;
+    std::map<ExtrusionRole, PreviewUsage> features;
+    double                                travel_time = 0.;
 
+    if (result.moves.empty() && result.preview_statistics.accumulated) {
+        // The export never stored the moves; it summed the same quantities as they went by, in the
+        // order this loop would have read them in, so the document is the one the move list would
+        // have produced (see GCodeProcessorResult::PreviewStatistics).
+        layers      = result.preview_statistics.layers;
+        features    = result.preview_statistics.features;
+        travel_time = result.preview_statistics.travel_time;
+    } else {
     // As the preview sums them: a layer takes the time of all its moves, a feature that of its extrusions.
     for (const GCodeProcessorResult::MoveVertex &move : result.moves) {
         if (layers.size() <= move.layer_id)
             layers.resize(move.layer_id + 1);
-        Layer       &layer = layers[move.layer_id];
-        const double time  = move.time[normal];
+        PreviewLayer &layer = layers[move.layer_id];
+        const double  time  = move.time[normal];
         layer.total.time += time;
         if (move.type == EMoveType::Travel) {
             layer.travel_time += time;
@@ -104,7 +99,7 @@ std::string gcode_statistics_json(const GCodeProcessorResult &result)
             continue;
         if (move.extrusion_role != erCustom)
             layer.z = move.position.z();
-        Usage usage;
+        PreviewUsage usage;
         usage.time   = time;
         usage.volume = double(move.delta_extruder) * M_PI * sqr(0.5 * double(result.filament_diameters[move.extruder_id]));
         usage.weight = weight_of(result, move.extruder_id, usage.volume);
@@ -112,6 +107,7 @@ std::string gcode_statistics_json(const GCodeProcessorResult &result)
         layer.total.weight += usage.weight;
         layer.features[move.extrusion_role].add(usage);
         features[move.extrusion_role].add(usage);
+    }
     }
 
     // As the preview's filament table, which counts the flush too.
@@ -155,7 +151,7 @@ std::string gcode_statistics_json(const GCodeProcessorResult &result)
                          { "features", features_json(features) } };
 
     json layers_json = json::array();
-    for (const Layer &layer : layers)
+    for (const PreviewLayer &layer : layers)
         layers_json.push_back(json{ { "z", rounded(layer.z, 3) },
                                     { "time", rounded(layer.total.time, 3) },
                                     { "travel_time", rounded(layer.travel_time, 3) },
@@ -229,7 +225,9 @@ void GCodeProcessorResult::cache_statistics_json()
     // has to compute it (the post-processing scripts may have rewritten the file the moves came
     // from).
     statistics_json.clear();
-    if (!moves.empty()) {
+    // Summed from the moves when they are there, or from the accumulator an export that never stored
+    // them filled instead: either way the document is the one this result's own pass produced.
+    if (!moves.empty() || preview_statistics.accumulated) {
         std::string document = gcode_statistics_json(*this);
         // A result that never moved sums to a document with no statistics in it, and keeping that
         // would make the cache look filled while there is nothing in it; see
@@ -244,7 +242,7 @@ bool has_gcode_statistics(const GCodeProcessorResult &result)
 {
     // statistics_json is either empty or a document with statistics in it: cache_statistics_json()
     // does not keep the empty one, and the project loader validates the one it reads back.
-    return !result.statistics_json.empty() || !result.moves.empty();
+    return !result.statistics_json.empty() || !result.moves.empty() || result.preview_statistics.accumulated;
 }
 
 std::string gcode_statistics_path(const std::string &gcode_path)
