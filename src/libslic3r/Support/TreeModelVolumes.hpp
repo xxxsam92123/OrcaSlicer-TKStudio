@@ -48,6 +48,17 @@ public:
     TreeModelVolumes() = default;
     explicit TreeModelVolumes(const PrintObject &print_object, const BuildVolume &build_volume,
         coord_t max_move, coord_t max_move_slow, size_t current_mesh_idx, 
+        // The layer grid the organic generator generated its support layers on: one entry per object
+        // layer (raft layers first), never a Z of its own. The top contact of an overhang is a whole
+        // layer plus, where the gap ends between two layers, one dedicated thin layer printing the
+        // remainder; the gap is measured from the bottom of the object layer that owns the overhang, so
+        // it is exact up to that remainder. No object layer - its print_z, height or material start - is
+        // rewritten for it. The collision volumes have to use the same Zs; `obj_bottom_z` is where the
+        // object's material inside a layer starts, which build_layer_grid() initialises to the layer
+        // bottom and the organic contact does not raise, so the clearance sees every printed layer from
+        // its bottom up.
+        // Null keeps the plain object layer grid.
+        const TreeSupportLayerGrid *layer_grid = nullptr,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
         double progress_multiplier, 
         double progress_offset, 
@@ -435,6 +446,21 @@ private:
      * move in consecutive layers if it does not have to avoid the model
      */
     coord_t m_max_move_slow;
+    /*!
+     * \brief The two movement limits above, one entry per layer of the object's layer grid.
+     *
+     * The "can this area still reach the build plate" region is propagated layer by layer by shrinking
+     * the region below by one layer's worth of movement, and the generator grows a branch by the same
+     * amount per layer. A variable layer height makes that amount differ per layer (`maximum_move_distance_at`),
+     * and using the nominal value for the propagation would let the region claim a reachability the
+     * branch cannot follow: on 0.1 mm layers the region grows by the nominal 0.2 mm worth of movement
+     * while the branch may only move half of it, so a branch following the region's edge ends up
+     * completely inside it and is dropped as a lost branch. Filled whenever the group carries a layer
+     * grid - a uniform grid stores the nominal value for every layer, so its propagation is unchanged -
+     * and empty without one, where the scalars above are used for every layer.
+     */
+    std::vector<coord_t> m_max_move_per_layer;
+    std::vector<coord_t> m_max_move_slow_per_layer;
     /*!
      * \brief The smallest maximum resolution for simplify
      */

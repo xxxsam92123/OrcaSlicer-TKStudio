@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <utility>
 #include <deque>
+#include <optional>
 #include <vector>
 #include <functional>
 
@@ -51,6 +52,7 @@ namespace Slic3r
 // Forward declarations
 class Print;
 class PrintObject;
+class TriangleMesh;
 struct SlicingParameters;
 
 namespace TreeSupport3D
@@ -262,7 +264,12 @@ struct SupportElementState : public SupportElementStateBits
  */
 [[nodiscard]] inline coord_t support_element_radius(const TreeSupportSettings &settings, const SupportElementState &elem)
 { 
-    return settings.getRadius(getEffectiveDTT(settings, elem), elem.elephant_foot_increases);
+    // The tip is `distance_to_top` layers *above* this element (propagate_down() decrements the layer
+    // index and increments the distance), so the Z the branch grew over is the span between this layer
+    // and that tip - not the span below the element, which is a different number of microns on a
+    // variable layer height (contract §4.1/§4.4).
+    return settings.getRadius_at(elem.layer_idx + LayerIndex(elem.distance_to_top), getEffectiveDTT(settings, elem),
+                                 elem.elephant_foot_increases);
 }
 
 /*!
@@ -272,7 +279,8 @@ struct SupportElementState : public SupportElementStateBits
  */
 [[nodiscard]] inline coord_t support_element_collision_radius(const TreeSupportSettings &settings, const SupportElementState &elem)
 {
-    return settings.getRadius(elem.effective_radius_height, elem.elephant_foot_increases);
+    return settings.getRadius_at(elem.layer_idx + LayerIndex(elem.distance_to_top), elem.effective_radius_height,
+                                 elem.elephant_foot_increases);
 }
 
 struct SupportElement
