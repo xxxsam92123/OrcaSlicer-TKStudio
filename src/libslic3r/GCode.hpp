@@ -264,7 +264,8 @@ public:
 public:
     // throws std::runtime_exception on error,
     // throws CanceledException through print->throw_if_canceled().
-    void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr,
+                              bool preview_payload = true);
     void            export_layer_filaments(GCodeProcessorResult* result);
     //BBS: set offset for gcode writer
     void set_gcode_offset(double x, double y) { m_writer.set_xy_offset(x, y); m_processor.set_xy_offset(x, y);}
@@ -453,7 +454,7 @@ protected:
     virtual bool should_disable_arc_fitting() const
         { return ! m_writer.kinematics().supports_arc_moves(); }
 
-    void            _do_export(Print &print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb);
+    void            _do_export(Print &print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload);
 
     static std::vector<LayerToPrint>        		                   collect_layers_to_print(const PrintObject &object, bool skip_empty_first_layer = false);
     static std::vector<std::pair<coordf_t, std::vector<LayerToPrint>>> collect_layers_to_print(const Print &print);

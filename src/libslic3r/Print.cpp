@@ -1065,7 +1065,9 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         const PrintInstance *print_instance;
         BoundingBox    bounding_box;
         Polygon        hull_polygon;
-        int                  object_index;
+        // Place of the instance in print.model()'s object and instance lists. Copies of one object get
+        // one PrintObject per distinct transformation, so print.objects() does not list them in order.
+        std::pair<int, int>  model_position;
         double               height;
         // Whether the instance reaches above extruder_clearance_height_to_rod, and the Y extent of it
         // the rod can hit while a later instance prints (see above_rod_y_range).
@@ -1126,13 +1128,24 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         }
         return any;
     };
-    auto find_object_index = [](const Model& model, const ModelObject* obj) {
-        for (int index = 0; index < model.objects.size(); index++)
-        {
-            if (model.objects[index] == obj)
-                return index;
-        }
-        return -1;
+    // Place of an instance in print.model()'s object and instance lists, which is the order the user
+    // sees in the object list. print.objects() groups the copies of one object by transformation, so
+    // it cannot be used for this.
+    auto model_position_of = [](const Model &model, const ModelInstance *instance) {
+        const ModelObject *object = instance->get_object();
+        int object_index = -1;
+        for (int index = 0; index < int(model.objects.size()); index++)
+            if (model.objects[index] == object) {
+                object_index = index;
+                break;
+            }
+        int instance_index = -1;
+        for (int index = 0; index < int(object->instances.size()); index++)
+            if (object->instances[index] == instance) {
+                instance_index = index;
+                break;
+            }
+        return std::make_pair(object_index, instance_index);
     };
 
     auto [object_skirt_offset, _] = print.object_skirt_offset();
@@ -1217,7 +1230,7 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
                 }
                 struct print_instance_info print_info {&instance, convex_hull.bounding_box(), convex_hull};
                 print_info.height = instance.print_object->height();
-                print_info.object_index = find_object_index(print.model(), print_object->model_object());
+                print_info.model_position = model_position_of(print.model(), instance.model_instance);
                 print_info.has_above_rod = above_rod_y_range(instance, print_info.rod_min_y, print_info.rod_max_y);
                 const BoundingBox footprint = print_info.bounding_box.inflated(-scale_(0.5 * print.config().extruder_clearance_radius.value + object_skirt_offset));
                 if (print_info.has_above_rod && !skirt_reaches_rod) {
@@ -1259,16 +1272,15 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
     {
         const size_t n = print_instance_with_bounding_box.size();
 
-        auto by_object_index = [&](size_t l, size_t r) {
-            return print_instance_with_bounding_box[l].object_index < print_instance_with_bounding_box[r].object_index;
-        };
-
+        // Order by place in the model's object and instance lists. Copies of one object share an object
+        // index, and print.objects() lists them grouped by transformation, so the instance index is what
+        // keeps them in their list order. No key repeats, so the sort does not depend on being stable.
         std::vector<size_t> fallback_order(n);
         for (size_t i = 0; i < n; ++i) fallback_order[i] = i;
-        std::stable_sort(fallback_order.begin(), fallback_order.end(), by_object_index);
+        std::sort(fallback_order.begin(), fallback_order.end(), [&](size_t l, size_t r) {
+            return print_instance_with_bounding_box[l].model_position < print_instance_with_bounding_box[r].model_position;
+        });
 
-        // Every instance of an object shares its object_index, so order by place in the list instead,
-        // which tells instances apart and keeps copies of one object in their list order.
         std::vector<size_t> list_position(n);
         for (size_t k = 0; k < n; ++k)
             list_position[fallback_order[k]] = k;
@@ -1386,7 +1398,7 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         for (auto &inst : print_instance_with_bounding_box)
             BOOST_LOG_TRIVIAL(debug) << "after sequential-print ordering, print_instance "
                                      << inst.print_instance->model_instance->get_object()->name
-                                     << ", object_index: " << inst.object_index
+                                     << ", model_position: " << inst.model_position.first << "/" << inst.model_position.second
                                      << ", height: " << inst.height
                                      << (solved ? " [reordered for clearance]" : " [object-list order]");
     }
@@ -2573,6 +2585,23 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     return filament_id < is_mixed.size() && is_mixed[filament_id];
                 }))
                 return {L("Spiral (vase) mode does not work when an object contains more than one material."), nullptr, "spiral_mode"};
+            // Enabling spiral vase mode in the GUI resets these keys in the global config only, so an object,
+            // part or height range can still override them. Layers with infill or more than one wall are
+            // printed without spiralizing.
+            for (const PrintRegion &region : object->all_regions()) {
+                const PrintRegionConfig &cfg = region.config();
+                const char *opt_key = cfg.sparse_infill_density.value > 0. ? "sparse_infill_density" :
+                                      cfg.wall_loops.value > 1             ? "wall_loops" :
+                                      cfg.top_shell_layers.value > 0       ? "top_shell_layers" : nullptr;
+                if (opt_key != nullptr) {
+                    // TRN %1% is the object name.
+                    warn(Slic3r::format(_u8L("Spiral vase mode needs no sparse infill, one wall loop and no top shell layers, "
+                                             "but the object %1% uses other values, so it will not print as a continuous spiral."),
+                                        object->model_object()->name),
+                         opt_key, object);
+                    break;
+                }
+            }
         }
     }
 
@@ -4195,7 +4224,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 // The export_gcode may die for various reasons (fails to process filename_format,
 // write error into the G-code, cannot execute post-processing scripts).
 // It is up to the caller to show an error message.
-std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload)
 {
     // output everything to a G-code file
     // The following call may die if the filename_format template substitution fails.
@@ -4229,7 +4258,7 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
     this->update_imex_slice_offset();
     const Vec2d imex_off = this->get_imex_slice_offset();
     gcode->set_gcode_offset_with_imex_shift(origin(0), origin(1), imex_off.x(), imex_off.y());
-    gcode->do_export(this, path.c_str(), result, thumbnail_cb);
+    gcode->do_export(this, path.c_str(), result, thumbnail_cb, preview_payload);
     gcode->export_layer_filaments(result);
     //BBS
     if (result != nullptr) {
@@ -6041,6 +6070,10 @@ void Print::reload_gcode_moves(GCodeProcessorResult* result) const
     std::lock_guard<std::mutex> lock(result->result_mutex);
     result->moves      = std::move(reloaded.moves);
     result->lines_ends = std::move(reloaded.lines_ends);
+    // The payload is resident again, so the result is no longer the one that skipped it - and the
+    // accumulator that stood in for it has nothing left to stand in for.
+    result->preview_payload_skipped = false;
+    result->preview_statistics.clear();
 }
 
 std::tuple<float, float> Print::object_skirt_offset(double margin_height) const

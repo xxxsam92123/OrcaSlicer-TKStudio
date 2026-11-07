@@ -1109,7 +1109,12 @@ public:
     void                process(long long *time_cost_with_cache = nullptr, bool use_cache = false) override;
     // Exports G-code into a file name based on the path_template, returns the file path of the generated G-code file.
     // If preview_data is not null, the preview_data is filled in for the G-code visualization (not used by the command line Slic3r).
-    std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
+    // `preview_payload` false says the caller will not render this result's preview: the per-move
+    // payload is then not stored (the statistics and the M73 time lines still are), and the preview
+    // is rebuilt from the file when something does ask for it. See
+    // GCodeProcessor::set_preview_payload_wanted(). Defaults to true.
+    std::string         export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb = nullptr,
+                                     bool preview_payload = true);
     //return 0 means successful
     int                 export_cached_data(const std::string& dir_path, bool with_space=false) override;
     int                 load_cached_data(const std::string& directory) override;

@@ -2091,7 +2091,12 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
                         }
                     }
                 }
-                if (!skip_line) {
+                if (skip_line) {
+                    // Also drop the planner sync WipeTower2 put right before the stripped M109.
+                    const std::string sync = flush_planner_queue_command(gcodegen.config().gcode_flavor.value);
+                    if (boost::ends_with(out, sync))
+                        out.resize(out.size() - sync.size());
+                } else {
                     out.append(line);
                     if (line_end < tcr_rotated_gcode.size())
                         out.push_back('\n');
@@ -3020,7 +3025,61 @@ static void set_mass_locator(GCodeProcessor &processor, const Print &print)
     processor.set_mass_locator(std::move(locate), std::move(object_masses));
 }
 
-void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
+namespace {
+// Counts the points of the extrusion paths an export turns into moves: a path point becomes one
+// G-code move, and an arc line is discretized back into the same order of segments it was fitted
+// from, so this is the closest figure to the final move count that exists before the pass runs.
+size_t count_extrusion_points(const ExtrusionEntity* entity)
+{
+    if (entity == nullptr)
+        return 0;
+    if (entity->is_collection()) {
+        size_t points = 0;
+        for (const ExtrusionEntity* child : static_cast<const ExtrusionEntityCollection*>(entity)->entities)
+            points += count_extrusion_points(child);
+        return points;
+    }
+    if (const auto* path = dynamic_cast<const ExtrusionPath*>(entity))
+        return path->polyline.size();
+    if (const auto* multi_path = dynamic_cast<const ExtrusionMultiPath*>(entity)) {
+        size_t points = 0;
+        for (const ExtrusionPath& sub_path : multi_path->paths)
+            points += sub_path.polyline.size();
+        return points;
+    }
+    if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(entity)) {
+        size_t points = 0;
+        for (const ExtrusionPath& sub_path : loop->paths)
+            points += sub_path.polyline.size();
+        return points;
+    }
+    return 0;
+}
+
+// An estimate of the moves this export will store, taken from the sliced geometry before the export
+// runs. The moves vector grows for the whole export and is measured in gigabytes on a large plate,
+// so it has to be reserved up front: a std::vector that reallocates at that size holds the old and
+// the new block at once (see GCodeProcessorResult::reserve_preview_payload). Travels, retractions
+// and the machine G-code add moves that carry no point, which is what the caller's safety factor
+// covers.
+size_t estimate_preview_moves(const Print& print)
+{
+    size_t points = 0;
+    for (const PrintObject* object : print.objects()) {
+        size_t per_instance = 0;
+        for (const Layer* layer : object->layers())
+            for (const LayerRegion* region : layer->regions())
+                per_instance += count_extrusion_points(&region->perimeters) + count_extrusion_points(&region->fills);
+        for (const SupportLayer* support_layer : object->support_layers())
+            per_instance += count_extrusion_points(&support_layer->support_fills);
+        // The layers hold the paths of one instance; the export repeats them for every instance.
+        points += per_instance * std::max<size_t>(1, object->instances().size());
+    }
+    return points;
+}
+} // namespace
+
+void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload)
 {
     PROFILE_CLEAR();
 
@@ -3111,7 +3170,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     }
 
     try {
-        this->_do_export(*print, file, thumbnail_cb);
+        this->_do_export(*print, file, thumbnail_cb, preview_payload);
         file.flush();
         if (file.is_error()) {
             file.close();
@@ -3300,6 +3359,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         // releases after each plate's export. Produce it here, while they are the ones this export
         // just wrote, so the 3MF and the statistics file read it back instead of the moves.
         result->cache_statistics_json();
+        // In place of the payload it did not store, report what the pass summed: the count is the
+        // move list's own, so a plate's log line can be compared with a storing run.
+        if (result->preview_payload_skipped)
+            BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: %1% moves summed into the statistics, none stored, plate %2%")
+                % result->preview_statistics.moves_fed % path;
     }
     // Write the profiler measurements to file
     PROFILE_UPDATE();
@@ -3309,9 +3373,13 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 // free functions called by GCode::_do_export()
 namespace DoExport {
     static void init_gcode_processor(const PrintConfig& config, GCodeProcessor& processor,
-                                     const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase>& nozzle_group_result = nullptr)
+                                     const std::shared_ptr<MultiNozzleUtils::NozzleGroupResultBase>& nozzle_group_result = nullptr,
+                                     bool preview_payload = true)
     {
         processor.reset();
+        // The payload request has to be in place before initialize_result_moves() seeds the move id
+        // space; reset() put it back to the default (store the payload).
+        processor.set_preview_payload_wanted(preview_payload);
         // Slot-resolution context for the streaming replay (reset() just cleared it). This is NOT
         // the post-stream result-field handover at the end of do_export, which gates the richer
         // change-time model and must stay after the stream.
@@ -3492,32 +3560,30 @@ static inline std::vector<const PrintInstance*> sort_object_instances_by_max_z(c
 }
 #endif
 
-// Produce a vector of PrintObjects in the order of their respective ModelObjects in print.model().
+// Produce a vector of PrintInstances in the order of their ModelInstances in the object and instance lists of print.model().
 //BBS: add sort logic for seq-print
 std::vector<const PrintInstance*> sort_object_instances_by_model_order(const Print& print, bool init_order)
 {
-    auto find_object_index = [](const Model& model, const ModelObject* obj) {
-        for (int index = 0; index < model.objects.size(); index++)
-        {
-            if (model.objects[index] == obj)
-                return index;
-        }
-        return -1;
-    };
+    if (init_order) {
+        // Number by position in the model's object and instance lists. Copies of one object can be split
+        // into separate PrintObjects, one per distinct transformation, and print.objects() orders those by
+        // transformation, so its order is not the list order.
+        int order = 0;
+        for (const ModelObject *model_object : print.model().objects)
+            for (ModelInstance *model_instance : model_object->instances)
+                model_instance->arrange_order = ++order;
+    }
 
     // Build up map from ModelInstance* to PrintInstance*
     std::vector<std::pair<const ModelInstance*, const PrintInstance*>> model_instance_to_print_instance;
     model_instance_to_print_instance.reserve(print.num_object_instances());
     for (const PrintObject *print_object : print.objects())
         for (const PrintInstance &print_instance : print_object->instances())
-        {
-            if (init_order)
-                const_cast<ModelInstance*>(print_instance.model_instance)->arrange_order = find_object_index(print.model(), print_object->model_object());
             model_instance_to_print_instance.emplace_back(print_instance.model_instance, &print_instance);
-        }
     std::sort(model_instance_to_print_instance.begin(), model_instance_to_print_instance.end(), [](auto &l, auto &r) { return l.first->arrange_order < r.first->arrange_order; });
     if (init_order) {
-        // Re-assign the arrange_order so each instance has a unique order number
+        // Re-assign the arrange_order so each instance of this print has a unique order number. The
+        // numbering above covers the whole model, including the instances of the other plates.
         for (int k = 0; k < model_instance_to_print_instance.size(); k++) {
             const_cast<ModelInstance*>(model_instance_to_print_instance[k].first)->arrange_order = k + 1;
         }
@@ -3525,13 +3591,8 @@ std::vector<const PrintInstance*> sort_object_instances_by_model_order(const Pri
 
     std::vector<const PrintInstance*> instances;
     instances.reserve(model_instance_to_print_instance.size());
-    for (const ModelObject *model_object : print.model().objects)
-        for (const ModelInstance *model_instance : model_object->instances) {
-            auto it = std::lower_bound(model_instance_to_print_instance.begin(), model_instance_to_print_instance.end(), std::make_pair(model_instance, nullptr), [](auto &l, auto &r) { return l.first->arrange_order < r.first->arrange_order; });
-            if (it != model_instance_to_print_instance.end() && it->first == model_instance)
-                instances.emplace_back(it->second);
-        }
-    std::sort(instances.begin(), instances.end(), [](auto& l, auto& r) { return l->model_instance->arrange_order < r->model_instance->arrange_order; });
+    for (const auto &model_instance_print_instance : model_instance_to_print_instance)
+        instances.emplace_back(model_instance_print_instance.second);
     return instances;
 }
 
@@ -3595,7 +3656,7 @@ static std::vector<int> get_imex_active_tools(const Print& print)
     return active_tools;
 }
 
-void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb)
+void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb, bool preview_payload)
 {
     PROFILE_FUNC();
 
@@ -3611,7 +3672,56 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // init as filament map
     update_layer_related_config(0);
 
-    DoExport::init_gcode_processor(print.config(), m_processor, print.get_layered_nozzle_group_result());
+    // The payload request is settled inside init_gcode_processor(), after the reset it starts
+    // with: the pre-heat injector can still overrule it (see GCodeProcessor::materialize_moves()).
+    DoExport::init_gcode_processor(print.config(), m_processor, print.get_layered_nozzle_group_result(), preview_payload);
+    // Reserve the move payload from the sliced geometry before anything is appended to it: this
+    // result's moves are released after every plate of a many-plate project, so the vector starts
+    // from the dummy move each time and can only be sized from an estimate. A pass that does not
+    // store the payload has nothing to size.
+    if (m_processor.materialize_moves()) {
+        const size_t estimated_points = estimate_preview_moves(print);
+        // Arc fitting is what inflates the move count: the writer fits a run of path points into
+        // one G2/G3 line and the processor then discretizes that arc back into several moves.
+        // Measured on this project (7 plates), the payload an export stores runs 2.63-2.71 moves
+        // per extruded path point with arc fitting on - plate 1 releases 79.2M moves for 29.28M
+        // points - and 1.99-2.00 with it off (57.3M for 28.83M), so 2.9 and 2.15 keep 7% over the
+        // worst plate of each kind. The payload is about twice the G-code's own move count because
+        // the time pass stores an extra move per speed change; the 1.25 that used to be here was
+        // calibrated on the lower figure and under-reserved every arc-off plate by 1.6x, which
+        // reallocated four times per plate. A ratio bound below those figures - "1.6 moves per
+        // point" was tried - under-reserves every plate the same way, so the bound is the absolute
+        // one below, not a ratio.
+        const bool arc_fitting = print.config().enable_arc_fitting.value != ArcFittingMode::Disabled;
+        const double moves_per_point = arc_fitting ? 2.9 : 2.15;
+        size_t reserved = size_t(double(estimated_points) * moves_per_point) + 4096;
+        // Absolute ceiling on what one plate may pre-commit: what the process can still commit, and
+        // never more than 20 GiB. Commit (RAM + pagefile), not installed RAM, is what a reserve() of
+        // this size is charged against, and it is what a plate actually runs out of. The ceiling is
+        // deliberately the whole of that figure and not a fraction of it, because a clip is not
+        // free: the export then grows through ensure_move_capacity(), which holds the clipped block
+        // and the grown one at once. Half of the available commit was measured here and it clipped
+        // this project's plate 2 (12.92 GB asked, 9.53 GB granted), grew it to 107.3M moves, and the
+        // run died on plate 2 with 25.2 GB committed - the failure the ceiling was meant to prevent.
+        // What the ceiling does buy is the pathological estimate: an estimate that is orders of
+        // magnitude off is refused up front instead of being reserved and then failing at the first
+        // reallocation. When the platform cannot report a commit limit, half of the physical memory
+        // and then a flat 20 GiB stand in, so the bound never degenerates into reserving nothing.
+        const size_t bytes_per_move = sizeof(GCodeProcessorResult::MoveVertex);
+        const size_t commit_avail  = available_commit_memory();
+        const size_t commit_budget = commit_avail > 0                 ? commit_avail
+                                   : total_physical_memory() > 0      ? total_physical_memory() / 2
+                                                                      : 20ull * 1024 * 1024 * 1024;
+        const size_t cap = std::min<size_t>(commit_budget, 20ull * 1024 * 1024 * 1024) / bytes_per_move;
+        if (cap > 0 && reserved > cap) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reservation capped to %1% moves (the estimate asked for %2%)")
+                % cap % reserved;
+            reserved = cap;
+        }
+        m_processor.reserve_preview_payload(reserved);
+        BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reserved %1% moves for %2% extrusion points (arc fitting %3%)")
+            % reserved % estimated_points % (arc_fitting ? "on" : "off");
+    }
     set_mass_locator(m_processor, print);
     const bool is_bbl_printers = print.is_BBL_printer();
     const bool skip_config_block = print.config().gcode_skip_config_block;
