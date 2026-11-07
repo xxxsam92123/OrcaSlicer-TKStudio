@@ -1930,6 +1930,29 @@ size_t total_physical_memory()
 #endif
 }
 
+// Returns how many bytes the process may still commit (RAM plus pagefile), or 0 when the platform
+// cannot report it. total_physical_memory() answers "how big is this machine", which is not the same
+// question: a machine can have most of its RAM free and still have almost no commit charge left, and
+// that is the limit a reserve() of several gigabytes runs into.
+size_t available_commit_memory()
+{
+#if defined(_WIN32) && (defined(__CYGWIN__) || defined(__CYGWIN32__))
+	// Cygwin under Windows. ------------------------------------
+	// The 64-bit MEMORYSTATUSEX is not available there, and the 32-bit MEMORYSTATUS carries no
+	// pagefile figure, so the caller falls back to physical memory.
+	return 0;
+#elif defined(_WIN32)
+	MEMORYSTATUSEX status;
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx( &status ))
+		return (size_t)status.ullAvailPageFile;
+	return 0;
+#else
+	// No portable figure for the commit limit; the caller falls back to physical memory.
+	return 0;
+#endif
+}
+
 bool makedir(const std::string path) {
 	// if dir doesn't exist, make it
 #ifdef WIN32

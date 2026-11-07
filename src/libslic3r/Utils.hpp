@@ -113,6 +113,11 @@ extern std::string log_memory_info(bool ignore_loglevel = false);
 extern void disable_multi_threading();
 // Returns the size of physical memory (RAM) in bytes.
 extern size_t total_physical_memory();
+// Returns how many bytes the process can still commit (RAM plus pagefile), or 0 when the platform
+// cannot report it. Distinct from total_physical_memory(): a machine can have most of its RAM free
+// and still have no commit charge left, and a reserve() of several gigabytes is charged to the
+// latter.
+extern size_t available_commit_memory();
 
 // Set a path with GUI resource files.
 void set_var_dir(const std::string &path);

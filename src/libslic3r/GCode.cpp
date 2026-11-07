@@ -3020,6 +3020,60 @@ static void set_mass_locator(GCodeProcessor &processor, const Print &print)
     processor.set_mass_locator(std::move(locate), std::move(object_masses));
 }
 
+namespace {
+// Counts the points of the extrusion paths an export turns into moves: a path point becomes one
+// G-code move, and an arc line is discretized back into the same order of segments it was fitted
+// from, so this is the closest figure to the final move count that exists before the pass runs.
+size_t count_extrusion_points(const ExtrusionEntity* entity)
+{
+    if (entity == nullptr)
+        return 0;
+    if (entity->is_collection()) {
+        size_t points = 0;
+        for (const ExtrusionEntity* child : static_cast<const ExtrusionEntityCollection*>(entity)->entities)
+            points += count_extrusion_points(child);
+        return points;
+    }
+    if (const auto* path = dynamic_cast<const ExtrusionPath*>(entity))
+        return path->polyline.size();
+    if (const auto* multi_path = dynamic_cast<const ExtrusionMultiPath*>(entity)) {
+        size_t points = 0;
+        for (const ExtrusionPath& sub_path : multi_path->paths)
+            points += sub_path.polyline.size();
+        return points;
+    }
+    if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(entity)) {
+        size_t points = 0;
+        for (const ExtrusionPath& sub_path : loop->paths)
+            points += sub_path.polyline.size();
+        return points;
+    }
+    return 0;
+}
+
+// An estimate of the moves this export will store, taken from the sliced geometry before the export
+// runs. The moves vector grows for the whole export and is measured in gigabytes on a large plate,
+// so it has to be reserved up front: a std::vector that reallocates at that size holds the old and
+// the new block at once (see GCodeProcessorResult::reserve_preview_payload). Travels, retractions
+// and the machine G-code add moves that carry no point, which is what the caller's safety factor
+// covers.
+size_t estimate_preview_moves(const Print& print)
+{
+    size_t points = 0;
+    for (const PrintObject* object : print.objects()) {
+        size_t per_instance = 0;
+        for (const Layer* layer : object->layers())
+            for (const LayerRegion* region : layer->regions())
+                per_instance += count_extrusion_points(&region->perimeters) + count_extrusion_points(&region->fills);
+        for (const SupportLayer* support_layer : object->support_layers())
+            per_instance += count_extrusion_points(&support_layer->support_fills);
+        // The layers hold the paths of one instance; the export repeats them for every instance.
+        points += per_instance * std::max<size_t>(1, object->instances().size());
+    }
+    return points;
+}
+} // namespace
+
 void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
     PROFILE_CLEAR();
@@ -3612,6 +3666,52 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     update_layer_related_config(0);
 
     DoExport::init_gcode_processor(print.config(), m_processor, print.get_layered_nozzle_group_result());
+    // Reserve the move payload from the sliced geometry before anything is appended to it: this
+    // result's moves are released after every plate of a many-plate project, so the vector starts
+    // from the dummy move each time and can only be sized from an estimate.
+    {
+        const size_t estimated_points = estimate_preview_moves(print);
+        // Arc fitting is what inflates the move count: the writer fits a run of path points into
+        // one G2/G3 line and the processor then discretizes that arc back into several moves.
+        // Measured on this project (7 plates), the payload an export stores runs 2.63-2.71 moves
+        // per extruded path point with arc fitting on - plate 1 releases 79.2M moves for 29.28M
+        // points - and 1.99-2.00 with it off (57.3M for 28.83M), so 2.9 and 2.15 keep 7% over the
+        // worst plate of each kind. The payload is about twice the G-code's own move count because
+        // the time pass stores an extra move per speed change; the 1.25 that used to be here was
+        // calibrated on the lower figure and under-reserved every arc-off plate by 1.6x, which
+        // reallocated four times per plate. A ratio bound below those figures - "1.6 moves per
+        // point" was tried - under-reserves every plate the same way, so the bound is the absolute
+        // one below, not a ratio.
+        const bool arc_fitting = print.config().enable_arc_fitting.value != ArcFittingMode::Disabled;
+        const double moves_per_point = arc_fitting ? 2.9 : 2.15;
+        size_t reserved = size_t(double(estimated_points) * moves_per_point) + 4096;
+        // Absolute ceiling on what one plate may pre-commit: what the process can still commit, and
+        // never more than 20 GiB. Commit (RAM + pagefile), not installed RAM, is what a reserve() of
+        // this size is charged against, and it is what a plate actually runs out of. The ceiling is
+        // deliberately the whole of that figure and not a fraction of it, because a clip is not
+        // free: the export then grows through ensure_move_capacity(), which holds the clipped block
+        // and the grown one at once. Half of the available commit was measured here and it clipped
+        // this project's plate 2 (12.92 GB asked, 9.53 GB granted), grew it to 107.3M moves, and the
+        // run died on plate 2 with 25.2 GB committed - the failure the ceiling was meant to prevent.
+        // What the ceiling does buy is the pathological estimate: an estimate that is orders of
+        // magnitude off is refused up front instead of being reserved and then failing at the first
+        // reallocation. When the platform cannot report a commit limit, half of the physical memory
+        // and then a flat 20 GiB stand in, so the bound never degenerates into reserving nothing.
+        const size_t bytes_per_move = sizeof(GCodeProcessorResult::MoveVertex);
+        const size_t commit_avail  = available_commit_memory();
+        const size_t commit_budget = commit_avail > 0                 ? commit_avail
+                                   : total_physical_memory() > 0      ? total_physical_memory() / 2
+                                                                      : 20ull * 1024 * 1024 * 1024;
+        const size_t cap = std::min<size_t>(commit_budget, 20ull * 1024 * 1024 * 1024) / bytes_per_move;
+        if (cap > 0 && reserved > cap) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reservation capped to %1% moves (the estimate asked for %2%)")
+                % cap % reserved;
+            reserved = cap;
+        }
+        m_processor.reserve_preview_payload(reserved);
+        BOOST_LOG_TRIVIAL(info) << boost::format("preview payload: reserved %1% moves for %2% extrusion points (arc fitting %3%)")
+            % reserved % estimated_points % (arc_fitting ? "on" : "off");
+    }
     set_mass_locator(m_processor, print);
     const bool is_bbl_printers = print.is_BBL_printer();
     const bool skip_config_block = print.config().gcode_skip_config_block;
