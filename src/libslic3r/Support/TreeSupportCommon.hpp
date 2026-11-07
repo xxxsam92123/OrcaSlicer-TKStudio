@@ -59,8 +59,9 @@ using LayerIndex = int;
  * two of them, the top contact area is finished by one additional thin support layer at the exact Z (see
  * ExactContactLayer in TreeSupport3D.cpp); that layer's height is the remainder it really prints, so its
  * Flow matches its material. No object layer and no grid entry moves, and `support_top_z_distance` is
- * honoured exactly unless the remainder is below the profile's minimum layer height - then the contact
- * stays on the whole layer and the gap is wider, never narrower. See place_top_contact().
+ * honoured exactly unless the remainder cannot be a support layer of its own on this profile - it is below
+ * the minimum layer height, or the support layer grouping would lift it onto the next object layer. Then the
+ * contact stays on the whole layer and the gap is wider, never narrower. See place_top_contact().
  */
 struct TreeSupportLayerGrid
 {
@@ -276,7 +277,10 @@ struct TreeSupportLayerGrid
     // ExactContactLayer in TreeSupport3D.cpp), which makes the air gap exact without moving an object
     // layer or rewriting a support layer's Z. When the remainder is below the profile's minimum layer
     // height it cannot be printed, the caller adds no layer, and the gap comes out at least the requested
-    // distance and less than one layer wider - never narrower, so the support cannot fuse to the object.
+    // distance and less than one layer wider - never narrower, so the support cannot fuse to the object. The
+    // same holds when the remainder ends within the support layer grouping tolerance below the next layer top:
+    // generate_support_layers() would merge the exact contact with that top and lift it, so the caller refuses
+    // that layer as well and keeps the contact on the whole layer below.
     //
     // Layer 0 is the build plate face and has no support below it, and a raft layer has no object above
     // it to gain distance from, so the contact never lands in either of them; a contact that would have

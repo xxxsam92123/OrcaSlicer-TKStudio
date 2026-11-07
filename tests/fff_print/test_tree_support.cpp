@@ -86,6 +86,18 @@ TriangleMesh scaled(TestMesh id, float scale)
     return mesh;
 }
 
+// two_tier_mesh() plus a wider plate at 24 mm. Its support tree runs from its own contact layer down to
+// the bed, so a support layer exists at the object grid layers under the 16 mm plate - including the grid
+// top directly above that plate's contact layer, which is the layer the exact contact would be grouped with.
+TriangleMesh two_tier_mesh_with_support_above(float upper_bottom_z = 16.f)
+{
+    TriangleMesh mesh = two_tier_mesh(upper_bottom_z);
+    TriangleMesh wide = make_cube(70, 70, 3);
+    wide.translate(-20.f, -20.f, 24.f);
+    mesh.merge(wide);
+    return mesh;
+}
+
 // What the exact-gap contract says the printed support under the overhang ends at. `layer_bottom` is the
 // bottom of the object layer that carries the overhang (`print_z - height`): where that layer's material
 // starts, and therefore the plane `support_top_z_distance` is measured from. `grid_top` is the top of the
@@ -1271,16 +1283,17 @@ TEST_CASE("An organic top gap keeps a variable layer height profile's support la
     }
 }
 
-// Slices two_tier_mesh() with `profile` as the object's layer height profile and the settings a tree print
-// of a 0.2 mm profile carries. `with_support` false slices the same profile with support off: the reference
-// for the object's own stack.
+// Slices `mesh` - two_tier_mesh() when none is given - with `profile` as the object's layer height profile
+// and the settings a tree print of a 0.2 mm profile carries. `with_support` false slices the same profile
+// with support off: the reference for the object's own stack.
 void slice_with_layer_height_profile(Slic3r::Print &print, const std::vector<double> &profile, double gap,
-                                     bool with_support = true)
+                                     bool with_support = true, const TriangleMesh *mesh = nullptr)
 {
     Slic3r::Model  model;
     ModelObject   *object = model.add_object();
     object->name          = "tshape.stl";
-    object->add_volume(two_tier_mesh());
+    const TriangleMesh part = mesh != nullptr ? *mesh : two_tier_mesh();
+    object->add_volume(part);
     object->add_instance();
     object->layer_height_profile.set(profile);
     object->ensure_on_bed();
@@ -3251,6 +3264,90 @@ TEST_CASE("An exact top contact never ends inside the object layer that owns the
     REQUIRE(! motion.support_moves.empty());
     INFO("contact z " << contact->print_z << " extrusion " << motion.extrusion_at(contact->print_z));
     CHECK(motion.extrusion_at(contact->print_z) > 0.);
+}
+
+// generate_support_layers() groups the support layers whose print_z are within the geometric EPSILON and
+// prints the whole group at their average Z (SupportCommon.cpp). An exact contact Z that lands just below
+// the next object layer top therefore shares a group with the layer printed at that top: it is lifted by up
+// to EPSILON / 2, and the air gap it was placed to finish comes out narrower than requested. That is the
+// one remaining way the exact-gap feature can narrow the gap instead of widening it, so such a remainder
+// has to be refused and left on the whole layer below.
+//
+// The Z window is what decides the fixture. Refusing it is only observable when the exact contact really
+// lands inside it, i.e. when the requested gap is up to EPSILON narrower than the layer height under the
+// plate. Over the 0.2 mm layers the rest of these cases use, a gap that close to the layer height cannot
+// reach the generator at all: Print::apply only copies the options whose values differ, and
+// ConfigOptionFloat compares them with is_approx(), a 1e-4 mm tolerance (Config.hpp / libslic3r.h), so a
+// 0.20005 arrives as the config's default 0.2 and the contact sits on the layer top. A flat 0.1 mm section
+// under the plate makes the window reachable: the layer under it is 0.1 mm high, and 0.10005 differs from
+// the 0.2 mm default by far more than that tolerance, so it survives the apply. The section is flat from
+// z = 12 up (the profile ramps between consecutive control points), so the stack under the plate is a clean
+// 0.1 mm grid instead of the graded one a transition near the plate would leave. The profile has to end at
+// the object's top: PrintObject::update_layer_height_profile() throws away one that does not, and the slice
+// then falls back to a uniform 0.2 mm stack - hence 27.0, the top of the 24 mm plate. That extra 70 mm plate
+// also keeps a support tree running through every grid layer under the 16 mm plate, including the grid top
+// one layer above the contact - the layer the exact contact would be merged into - so the merge this case is
+// about really happens.
+TEST_CASE("An exact top contact is not lifted onto the object layer above it by the EPSILON layer grouping",
+          "[TreeSupportOrganicGap][TreeSupportOrganicGapExact]")
+{
+    // 0.1 mm from z = 12 upwards: the 16 mm plate's underside is the bottom of a 0.1 mm layer.
+    const std::vector<double> profile { 0., 0.2, 12.0, 0.1, 14.0, 0.1, 27.0, 0.1 };
+    constexpr double          gap     = 0.10005;
+    const TriangleMesh        mesh    = two_tier_mesh_with_support_above();
+
+    Slic3r::Print print;
+    slice_with_layer_height_profile(print, profile, gap, true, &mesh);
+    const PrintObject &po = *print.objects().front();
+    REQUIRE_THAT(po.config().support_top_z_distance.value, Catch::Matchers::WithinAbs(gap, 0.));
+
+    const double layer_bottom = plate_underside_z(po);
+    // The grid is the variable profile's, so the plate's underside need not land exactly on a grid
+    // boundary; the layer that carries it starts within a tenth of a millimetre of the mesh face, and that
+    // bottom - not the face - is the plane the gap is measured from.
+    REQUIRE_THAT(layer_bottom, Catch::Matchers::WithinAbs(16.0, 0.01));
+    const double target = layer_bottom - gap;
+
+    // The case under test: the exact Z is inside the layer above the contact layer, but only just - less
+    // than EPSILON below its top, which is exactly the distance generate_support_layers() averages away.
+    const Layer *contact_layer = top_contact_layer(po, layer_bottom, gap);
+    REQUIRE(contact_layer != nullptr);
+    const Layer *next_layer = layer_above(po, *contact_layer);
+    REQUIRE(next_layer != nullptr);
+    INFO("gap " << gap << " target " << target << " contact layer top " << contact_layer->print_z
+                << " next layer top " << next_layer->print_z);
+    // The remainder is printable on this profile, so the old code does add the thin layer: the refusal
+    // below is the grouping rule's, not the minimum layer height's.
+    REQUIRE(target > contact_layer->print_z + po.slicing_parameters().min_layer_height);
+    REQUIRE(next_layer->print_z - target > 0.);
+    REQUIRE(next_layer->print_z - target <= EPSILON);
+
+    // No support layer may sit inside that window. Every support layer is either an object layer at that
+    // layer's height, or an exact contact that stands at least EPSILON below the next object layer top.
+    for (const SupportLayer *layer : po.support_layers()) {
+        INFO("support layer print_z " << layer->print_z << " height " << layer->height
+                                      << " bottom " << layer->bottom_z());
+        if (const Layer *object_layer = object_layer_at(po, layer->print_z)) {
+            CHECK_THAT(layer->height, Catch::Matchers::WithinAbs(object_layer->height, 1e-6));
+            continue;
+        }
+        const Layer *above = object_layer_above(po, layer->print_z);
+        REQUIRE(above != nullptr);
+        CHECK(above->print_z - layer->print_z >= EPSILON);
+    }
+
+    // The merge partner is really there and really prints: the grid layer at the next top is still printed
+    // at its own top instead of being pulled down to the average with the exact contact.
+    const SupportLayer *next_layer_support = support_layer_at(po, next_layer->print_z);
+    REQUIRE(next_layer_support != nullptr);
+    REQUIRE(next_layer_support->has_extrusions());
+
+    // The exact layer was refused, so the contact stays on the whole layer below: the air gap under the
+    // plate is one 0.1 mm layer wider than requested instead of a sub-micron lift that narrows it.
+    const SupportLayer *contact_support = support_layer_at(po, contact_layer->print_z);
+    REQUIRE(contact_support != nullptr);
+    CHECK(contact_support->has_extrusions());
+    CHECK(layer_bottom - contact_support->print_z >= gap - 1e-9);
 }
 
 // A raft moves the object's whole stack up, and with it the bottom of the layer that carries the overhang;

@@ -1293,19 +1293,23 @@ struct ExactContactLayer
 // several support layers a few microns apart. Sharing a `print_z` means sharing the contact layer as
 // well: the contact layer is `idx_floor(print_z)` and consecutive grid layers are at least a minimum layer
 // height apart, far more than that rounding, so the first entry's `bottom_z` and `height` are the right
-// ones for every area merged into it. A remainder thinner than `min_height` is refused: such a layer
-// cannot be printed on this profile, and the contact then stays on the whole layer below, which leaves a
-// gap wider than requested rather than narrower. That is the only degradation of the exact gap this
-// feature has; the caller reports it instead of silently widening the gap.
+// ones for every area merged into it. A remainder that cannot stand as its own layer on this profile is
+// refused: one thinner than `min_height`, and one that ends within `EPSILON` below `next_top_z`, where
+// generate_support_layers() would group it with the layer printed at that top and average its Z upwards.
+// The contact then stays on the whole layer below, which leaves a gap wider than requested rather than
+// narrower. That is the only degradation of the exact gap this feature has; the caller reports it instead
+// of silently widening (or, for the grouping case, silently narrowing) the gap.
 enum class ExactContactResult
 {
     None,    // the gap already ends on a layer top; no extra layer is needed
     Added,   // a thin contact layer finishes the requested Z
-    Refused  // the remainder is below the minimum layer height and cannot be printed
+    Refused  // the remainder cannot be its own layer on this profile: below the minimum layer height, or
+             // within the layer grouping tolerance below the next grid top
 };
 
 ExactContactResult add_exact_contact_area(std::map<double, ExactContactLayer> &layers, const double bottom_z,
-                                          const double contact_top_z, const double min_height, const Polygons &polygons)
+                                          const double next_top_z, const double contact_top_z,
+                                          const double min_height, const Polygons &polygons)
 {
     if (polygons.empty() || contact_top_z <= bottom_z + EPSILON)
         return ExactContactResult::None;
@@ -1318,6 +1322,13 @@ ExactContactResult add_exact_contact_area(std::map<double, ExactContactLayer> &l
     const double print_z = std::floor(contact_top_z * 1e6) / 1e6;
     if (print_z <= bottom_z + EPSILON)
         return ExactContactResult::None;
+    // generate_support_layers() groups support layers whose print_z are within EPSILON of the group's first
+    // one and prints the whole group at their average Z. An exact contact within EPSILON below the next grid
+    // top would join the layer printed at that top and be lifted by up to EPSILON / 2, which makes the
+    // printed air gap narrower than requested. There is no exact layer to reach there: keep the contact on
+    // the whole layer below instead.
+    if (print_z + EPSILON >= next_top_z)
+        return ExactContactResult::Refused;
     const double height = print_z - bottom_z;
     if (height < min_height - EPSILON)
         return ExactContactResult::Refused;
@@ -1800,7 +1811,9 @@ static void generate_initial_areas(
         for (const RichInterfacePlacer::PendingRoof &roof : placement.roofs)
             if (roof.dtt_roof == 0 && roof.contact_top_z > 0.)
                 if (add_exact_contact_area(exact_contacts,
-                        config.layer_grid.z(LayerIndex(roof.layer_idx)), roof.contact_top_z,
+                        config.layer_grid.z(LayerIndex(roof.layer_idx)),
+                        config.layer_grid.z(LayerIndex(roof.layer_idx) + 1),
+                        roof.contact_top_z,
                         print_object.slicing_parameters().min_layer_height, roof.polygons) == ExactContactResult::Refused) {
                     // The gap cannot be printed on this profile. Count it and remember the first Z so the
                     // caller can report the whole mesh group once instead of once per mesh.
@@ -4008,10 +4021,11 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
                     << "Organic support: support_top_z_distance " << processing.first.settings.support_top_z_distance_mm
                     << " mm cannot be printed exactly under " << exact_gap_refused
                     << " overhang area(s) of this group (the first one ends at Z " << first_refused_contact_z
-                    << "). The remainder above the contact layer is thinner than the profile's minimum layer "
+                    << "). A remainder above the contact layer that is thinner than the profile's minimum layer "
                     << "height (" << print.get_object(processing.second.front())->slicing_parameters().min_layer_height
-                    << " mm), so those areas end on the whole layer below and their air gap is wider than "
-                    << "requested, never narrower.";
+                    << " mm), or that would be grouped with the next object layer by the support layer "
+                    << "grouping tolerance, cannot be printed as a support layer of its own, so those areas "
+                    << "end on the whole layer below and their air gap is wider than requested, never narrower.";
             auto t_gen = std::chrono::high_resolution_clock::now();
 
 
