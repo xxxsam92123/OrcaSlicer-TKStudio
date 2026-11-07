@@ -186,6 +186,7 @@ void FillPlanePath::_fill_surface_single(
 
     if (polyline.size() >= 2) {
         polylines = intersection_pl(std::move(polylines), expolygon);
+        join_cut_outlines(polylines, params);
         if (!polylines.empty()) {
             // Drop the tiny tangency slivers the spiral leaves along the faceted rim (ported from
             // BambuStudio). Clipping makes every piece start and end on a fresh boundary crossing,
