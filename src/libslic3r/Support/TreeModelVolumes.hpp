@@ -49,12 +49,15 @@ public:
     explicit TreeModelVolumes(const PrintObject &print_object, const BuildVolume &build_volume,
         coord_t max_move, coord_t max_move_slow, size_t current_mesh_idx, 
         // The layer grid the organic generator generated its support layers on: one entry per object
-        // layer (raft layers first), never a Z of its own. The top contact of an overhang is the highest
-        // whole layer that keeps at least `support_top_z_distance` of air under the face, so the gap is
-        // quantised upwards and no layer height becomes a gap remainder. The collision volumes have to
-        // use the same Zs; `obj_bottom_z` additionally carries where the object's material inside a
-        // layer really starts, which is the face when that layer's slice reaches an overhang. Null keeps
-        // the plain object layer grid.
+        // layer (raft layers first), never a Z of its own. The top contact of an overhang is a whole
+        // layer plus, where the gap ends between two layers, one dedicated thin layer printing the
+        // remainder; the gap is measured from the bottom of the object layer that owns the overhang, so
+        // it is exact up to that remainder. No object layer - its print_z, height or material start - is
+        // rewritten for it. The collision volumes have to use the same Zs; `obj_bottom_z` is where the
+        // object's material inside a layer starts, which build_layer_grid() initialises to the layer
+        // bottom and the organic contact does not raise, so the clearance sees every printed layer from
+        // its bottom up.
+        // Null keeps the plain object layer grid.
         const TreeSupportLayerGrid *layer_grid = nullptr,
 #ifdef SLIC3R_TREESUPPORTS_PROGRESS
         double progress_multiplier, 

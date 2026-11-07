@@ -371,23 +371,22 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 }
 #endif
 
-// Z of the lowest overhang face an area can have, searched in the Z window [z_lo, z_hi].
+// Z of the lowest down facing face an area can have, searched in the Z window [z_lo, z_hi].
 //
-// The layer stack only records *where* the slicer first sees an overhang, which is the layer whose
-// slice reaches into it. On a variable layer height that layer can start a whole layer above the face
-// itself - the contract T-shape's plate starts at 12.0 inside the layer 11.8691 .. 12.0691 - so
-// measuring the gap from the layer boundary would leave the support 0.069 mm too close to the object,
-// and for a smaller gap it ends up inside the object. The face is a down facing facet of the mesh, so
-// take the lowest of those reaching into the window. A sloped face contributes the window bottom, which
-// can only widen the gap, never close it.
+// This is the overhang's own surface, reported on the contact next to the layer it belongs to. It is not
+// the plane `support_top_z_distance` is measured from: the slicer prints a layer's whole slab, so the
+// object's printed material starts at the layer bottom even where that face sits above it, and a
+// variable layer height can put the layer bottom a whole layer above the face. See
+// place_overhang_contact(). The face is a down facing facet of the mesh, so take the lowest of those
+// reaching into the window. A sloped face contributes the window bottom, a lower bound of the surface.
 //
 // The search runs once per overhang area, so the facet Z ranges are collected once per mesh instead of
 // being recomputed - together with a full walk over the triangles - for every area. A facet is a candidate
 // as soon as its Z range overlaps the window at all, so a sloped or large triangle whose lowest vertex
 // sits below the window is still found: the part of it inside the window is at or above the window bottom,
 // and that bottom is what it contributes. Indexing the facets by their lowest vertex alone would drop
-// exactly such a facet, and an area that also holds a higher downward facet would then measure the gap
-// from the higher one: 0.23 mm of air under the slope where 0.4 was asked for.
+// exactly such a facet, and an area that also holds a higher downward facet would then report a surface
+// above the real one for the lower part of the area.
 void OverhangFacetZIndex::build(const TriangleMesh &mesh)
 {
     const indexed_triangle_set &its        = mesh.its;
@@ -479,8 +478,8 @@ void OverhangFacetZIndex::build(const TriangleMesh &mesh)
     const indexed_triangle_set &its = mesh.its;
     for (const size_t facet : facets_overlapping(facet_z, z_lo, z_hi)) {
         // A facet that starts below the window cannot hold a face below the window, so the window bottom
-        // is the lowest Z it contributes. That is at or below the face it really holds there, so a gap
-        // measured from it can come out wider than requested but never narrower.
+        // is the lowest Z it contributes. That is at or below the face it really holds there, so it is a
+        // lower bound of the surface - which is all this search has to report.
         const double reference = std::max(facet_z.z_min[facet], z_lo);
         // Strictly lower wins, so the retained Z is the minimum over the candidates and can never sit
         // above it: a candidate within the geometric EPSILON above the minimum used to be skipped, which
@@ -511,36 +510,38 @@ OverhangContact place_overhang_contact(TreeSupportLayerGrid &grid, const LayerIn
                                         const double top_z_distance)
 {
     // The window is [bottom_z(layer_idx - 1), z(layer_idx)] of the grid, which on a uniform grid is two
-    // layer heights tall: a layer's slices are taken at its own mid-plane, so material that first appears
-    // in layer `layer_idx` starts below that mid-plane, i.e. inside the layer below or inside this one,
-    // and a face exactly on either boundary counts - that is the case a uniform grid hits. A face further
-    // down is a different overhang and would drop the contact by a whole layer for no reason.
+    // layer heights tall: a layer's slices are taken at its own mid-plane, so a down facing face that
+    // shows up in layer `layer_idx` starts below that mid-plane, i.e. inside the layer below or inside
+    // this one, and a face exactly on either boundary counts - that is the case a uniform grid hits. A
+    // face further down belongs to a different overhang and would report this area with the wrong surface.
+    //
+    // The face found here is reported on the contact, but it does not place the gap. The slicer prints a
+    // layer's whole slab, so the object's printed material over this area starts at this layer's bottom,
+    // wherever the raw mesh face happens to sit inside that slab. Measuring from the face moved the
+    // printed gap by up to half a layer height either way - a 0.1 request came out as 0.072 on a face
+    // 0.0277 above the layer bottom - and raising the material start to the face hid the material below
+    // it from the collision clearance. The same boundary is what the layer synchronised support engines
+    // measure their gap against (SupportMaterial::sync_gap_with_object_layer()).
     //
     // No frame conversion happens here. `mesh` is passed already in the grid's frame: the caller applies
     // `trafo_sliced()` and, on a raft, lifts it by `object_print_z_min`. The grid holds the print frame too
     // - build_layer_grid() copies each object layer's print_z minus `belt_global_z_offset()`, which
     // PrintObject::slice() adds to `Layer::print_z` only after the slicing. The belt offset therefore
     // belongs to the layer stack only - feeding it into this search moves the window off the face (upwards
-    // for the negative offset a lifted belt mesh has) and can place the contact above it. A raft, on the
+    // for the negative offset a lifted belt mesh has) and can report the wrong face. A raft, on the
     // other hand, does move the object's layers (print_z includes it) and has to move the face with them.
     const std::optional<double> face_z = overhang_face_z(mesh, facet_z, area,
         grid.bottom_z(layer_idx - 1), grid.z(layer_idx));
-    // Z the air gap is measured from, in that same frame. Without a facet at all - a support enforcer
-    // adds areas with no down facing facet behind them - it is the bottom of the window that was just
-    // searched rather than this layer's bottom: the overhang area is the material of this layer's slice
-    // that the layer below does not support, so the face over it lies above the mid-plane slice of the
-    // layer below and that bottom is a lower bound of it. A contact placed under it therefore keeps
-    // `actual gap >= top_z_distance` either way, while measuring from this layer's bottom put the contact
-    // up to half a layer too close to a face that sits below it.
-    const double reference_z = face_z ? *face_z : grid.bottom_z(layer_idx - 1);
-    // Highest whole layer that keeps at least `top_z_distance` of air under that reference; see
+    // Z the air gap is measured from: the bottom of the object layer that carries this overhang area
+    // (`print_z - height`), which is where that layer's printed material starts. The mesh face above is
+    // only reported, never subtracted from: a face anywhere inside the layer's slab - and, on a slope, up
+    // to half a layer below it - does not move where the object is printed. There is no fallback to the
+    // layer below either: an area with no down facing facet behind it (a support enforcer adds those)
+    // starts its material at the same boundary as one with a face.
+    const double reference_z = grid.bottom_z(layer_idx);
+    // Highest whole layer that keeps at least `top_z_distance` of air under that boundary; see
     // TreeSupportLayerGrid::place_top_contact(), which also keeps the contact out of the raft.
     const LayerIndex contact_layer = grid.place_top_contact(reference_z, top_z_distance);
-    // The contact layer's clearance is measured against the face, not against this layer's bottom,
-    // which sits below it on a variable layer height. `set_obj_bottom_z()` only moves the material start
-    // up, so the lower bound of a facet that reaches into the window from below leaves it where it was.
-    if (face_z)
-        grid.set_obj_bottom_z(layer_idx, *face_z);
     OverhangContact contact{ contact_layer, face_z, 0. };
     if (contact_layer >= 0) {
         // Where the support may really end. Clamped to the top of the chosen layer so the caller never
@@ -3892,9 +3893,10 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             // Raw millimetres: the lowest Z a contact may reach under the overhang.
             const double          top_z  = processing.first.settings.support_top_z_distance_mm;
             // The mesh in the frame the layers were sliced in, which is the frame the grid holds: the
-            // overhang face itself is not a layer boundary (see overhang_face_z), and neither the mesh nor
-            // the grid carries the belt global Z offset - build_layer_grid() removes it from the object
-            // layers, PrintObject::slice() adds it to `Layer::print_z` only after slicing.
+            // overhang face is only reported on the contact (it is not a layer boundary, see
+            // overhang_face_z), and neither the mesh nor the grid carries the belt global Z offset -
+            // build_layer_grid() removes it from the object layers, PrintObject::slice() adds it to
+            // `Layer::print_z` only after slicing.
             TriangleMesh     mesh;
             OverhangFacetZIndex facet_index;
             if (std::any_of(overhangs.begin(), overhangs.end(), [](const Polygons &overhang) { return ! overhang.empty(); })) {

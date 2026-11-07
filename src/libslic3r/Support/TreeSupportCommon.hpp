@@ -54,8 +54,9 @@ using LayerIndex = int;
  * exactly as it was.
  *
  * Every entry is a plain copy of an object layer: its Z and its height are never rewritten here. The
- * top contact of an overhang is *placed* on one of these layers. When the requested gap ends between two
- * of them, the top contact area is finished by one additional thin support layer at the exact Z (see
+ * top contact of an overhang is *placed* on one of these layers, measured from that layer's bottom - the
+ * Z its printed material starts at, not a mesh face inside its slab. When the requested gap ends between
+ * two of them, the top contact area is finished by one additional thin support layer at the exact Z (see
  * ExactContactLayer in TreeSupport3D.cpp); that layer's height is the remainder it really prints, so its
  * Flow matches its material. No object layer and no grid entry moves, and `support_top_z_distance` is
  * honoured exactly unless the remainder is below the profile's minimum layer height - then the contact
@@ -77,10 +78,12 @@ struct TreeSupportLayerGrid
         double     print_z  { 0. };
         // Z of the bottom of the layer, equals the print_z of the layer below (0 for the first one).
         double     bottom_z { 0. };
-        // Z where the object layer this entry belongs to really starts. Differs from bottom_z when the
-        // object's material inside the layer starts above its bottom, e.g. a layer whose slice reaches
-        // an overhang; collision clearances are measured against that rather than against the layer
-        // bottom.
+        // Z where the object layer this entry belongs to really starts: the layer bottom. The slicer
+        // prints a layer's whole slab, `[bottom_z, print_z]`, whatever a mesh face inside that slab does,
+        // so nothing the support generator computes moves it. Kept as its own value because the
+        // collision clearance reads the material start per layer; build_layer_grid() initialises it to
+        // the layer bottom and the organic top contact does not move it, so it stays equal to bottom_z
+        // unless a caller deliberately raises it through the setter below.
         double     obj_bottom_z { 0. };
         // print_z - bottom_z, the object layer's height. Support layers print this height; the top
         // contact of an overhang never writes a gap remainder into it.
@@ -95,7 +98,7 @@ struct TreeSupportLayerGrid
     // Tolerance of the Z comparison that places a top contact, millimetres.
     //
     // It only has to absorb the round-off of the doubles involved: the layer Zs are sums of layer heights
-    // and the reference is a face Z minus the gap. 1e-9 mm is far above that round-off and five orders of
+    // and the reference is a layer bottom minus the gap. 1e-9 mm is far above that round-off and five orders
     // magnitude below the 1e-4 mm geometric EPSILON the rest of the file uses, which is a length the
     // printer cannot express anyway (3 decimals, 1e-3 mm). Applying the geometric EPSILON here instead let
     // a contact end up 1e-4 mm closer to the object than the requested gap.
@@ -137,12 +140,11 @@ struct TreeSupportLayerGrid
 
     double bottom_z(LayerIndex layer_idx) const { return z(layer_idx) - h(layer_idx); }
 
-    // Move the Z where the object's material inside `layer_idx` really starts. A layer whose slice
-    // reaches an overhang starts above the face when the face falls inside the layer below, and the
-    // clearance of the contact layer below has to be measured against the face, not against the
-    // layer's bottom: the contact top sits at least `top_z_distance` under the face, so that layer is
-    // not within the clearance and must not be treated as an obstacle there.
-    // Moving it is only ever upwards - the layer's slices do start at its bottom everywhere else.
+    // Move the Z where the object's material inside `layer_idx` starts. This is a plain helper for a
+    // caller that knows the material of a layer begins above its bottom; nothing in the organic
+    // generator calls it. build_layer_grid() initialises every entry with the layer bottom and the top
+    // contact is measured from that bottom, so the field stays equal to `bottom_z` here. The value is
+    // only ever moved upwards.
     void set_obj_bottom_z(LayerIndex layer_idx, const double obj_bottom_z_req)
     {
         if (layer_idx < 0 || layer_idx >= LayerIndex(entries.size()))
@@ -150,8 +152,10 @@ struct TreeSupportLayerGrid
         entries[layer_idx].obj_bottom_z = std::max(entries[layer_idx].obj_bottom_z, obj_bottom_z_req);
     }
 
-    // Z where the object inside this layer really starts. Only the overhang face ever raises it; the
-    // support stack above cannot move it, as the top contact is one of the existing layers.
+    // Z where the object inside this layer really starts. build_layer_grid() fills it with the layer
+    // bottom, and an overhang contact does not raise it: the layer prints its whole slab, so the bottom
+    // is where its material starts even where the overhang face falls inside the slab (or, on a slope,
+    // below it). The collision clearance therefore sees every printed layer from its bottom up.
     double obj_bottom_z(LayerIndex layer_idx) const
     {
         if (entries.empty())
@@ -260,11 +264,13 @@ struct TreeSupportLayerGrid
         return std::max<LayerIndex>(0, LayerIndex(it - entries.begin()) - 1);
     }
 
-    // Layer that carries the top contact of an overhang whose lower face is at `overhang_bottom_z`.
+    // Layer that carries the top contact of an overhang whose object layer starts at `layer_bottom_z`.
     //
-    // `support_top_z_distance` is a distance in millimetres. The support area cannot be cut half way up a
-    // layer - a 2D polygon per layer has one top, at the layer's print_z - so this returns the *highest
-    // layer whose top is at or below* `overhang_bottom_z - top_z_distance`, the same rule the layer
+    // `support_top_z_distance` is a distance in millimetres, measured down from the bottom of the object
+    // layer that owns the overhang - where that layer's printed material starts, see
+    // place_overhang_contact(). The support area cannot be cut half way up a layer - a 2D polygon per
+    // layer has one top, at the layer's print_z - so this returns the *highest
+    // layer whose top is at or below* `layer_bottom_z - top_z_distance`, the same rule the layer
     // synchronised generators use (SupportMaterial.cpp, sync_gap_with_object_layer()). The caller finishes
     // the remainder between that top and the requested Z with a support layer of exactly that height (see
     // ExactContactLayer in TreeSupport3D.cpp), which makes the air gap exact without moving an object
@@ -276,12 +282,12 @@ struct TreeSupportLayerGrid
     // it to gain distance from, so the contact never lands in either of them; a contact that would have
     // to be drawn there is refused instead of being pulled up (which would shrink the gap). Returns -1
     // when no layer is left to carry it.
-    LayerIndex place_top_contact(const double overhang_bottom_z, const double top_z_distance)
+    LayerIndex place_top_contact(const double layer_bottom_z, const double top_z_distance)
     {
         const LayerIndex lowest = std::max<LayerIndex>(1, LayerIndex(raft_layers));
         if (entries.size() < size_t(lowest) + 1)
             return -1;
-        const LayerIndex layer_idx = idx_floor(std::max(0., overhang_bottom_z - top_z_distance), z_roundoff);
+        const LayerIndex layer_idx = idx_floor(std::max(0., layer_bottom_z - top_z_distance), z_roundoff);
         return layer_idx >= lowest ? layer_idx : -1;
     }
 };
@@ -339,8 +345,8 @@ struct TreeSupportMeshGroupSettings {
         this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
         this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
         // Raw millimetres for the organic generator: it measures the air gap under an overhang from the
-        // overhang face itself instead of from a layer boundary, and takes the highest layer inside that
-        // gap (see TreeSupportLayerGrid::place_top_contact()). Only the organic paths read these.
+        // bottom of the object layer that carries it, and takes the highest layer inside that gap (see
+        // TreeSupportLayerGrid::place_top_contact()). Only the organic paths read these.
         this->support_top_z_distance_mm    = config.support_top_z_distance.value;
         this->support_bottom_z_distance_mm = config.support_bottom_z_distance.value;
         this->support_roof_enable       = config.support_interface_top_layers.value > 0;
@@ -645,9 +651,9 @@ public:
         // The layer Zs of this group: the object's own layers, one entry each, copied so the grid the
         // generator places its contacts on is the one this settings object counts layers in. Nothing in
         // that grid is ever rewritten - the top contact area is *placed* on the highest whole layer that
-        // keeps at least `support_top_z_distance` of air under the face; a remainder that can be printed
-        // finishes it in one additional thin support layer (ExactContactLayer in TreeSupport3D.cpp), and
-        // every object layer keeps its own Z and height.
+        // keeps at least `support_top_z_distance` of air under the object layer's bottom; a remainder that
+        // can be printed finishes it in one additional thin support layer (ExactContactLayer in
+        // TreeSupport3D.cpp), and every object layer keeps its own Z and height.
         layer_grid = mesh_group_settings.layer_grid;
         raft_layers.clear();
         for (size_t i = 0; i < layer_grid.raft_layers; ++ i)

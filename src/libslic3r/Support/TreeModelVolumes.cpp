@@ -547,10 +547,12 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                     // where the clearance starts.
                     const double z = grid.z(layer_idx);
                     // A layer above counts while the object inside it is still less than the clearance
-                    // away. The object's own bottom is used rather than the layer bottom: a layer whose
-                    // slice reaches an overhang starts at the face, which sits above the layer bottom,
-                    // and measuring against the layer bottom would drag the overhang layer into the
-                    // clearance range and leave no room for the contact tips.
+                    // away. This loop only builds the whole-layer collision range: the material is taken
+                    // from the object layer's bottom, because the slicer prints the whole slab and the
+                    // organic top contact does not raise `obj_bottom_z`. A gap that ends between two
+                    // layers is finished by a separate exact-contact remainder layer in
+                    // TreeSupport3D.cpp, so this range does not mean every support ends on the top of
+                    // this whole-layer grid.
                     while (layer_idx + num_layers_above[layer_idx] + 1 < LayerIndex(outlines.size()) &&
                            grid.obj_bottom_z(layer_idx + num_layers_above[layer_idx] + 1) < z + top_distance - EPSILON)
                         ++ num_layers_above[layer_idx];
