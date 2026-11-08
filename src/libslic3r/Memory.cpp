@@ -1,6 +1,7 @@
 #include "Memory.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 
