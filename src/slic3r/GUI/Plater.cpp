@@ -5,6 +5,7 @@
 #include "CalibUtils.hpp"
 #include "Flashforge.hpp"
 #include "libslic3r/Config.hpp"
+#include "libslic3r/Memory.hpp"
 #include "libslic3r_version.h"
 
 #include <boost/assert/source_location.hpp>
@@ -11224,6 +11225,12 @@ void Plater::priv::reset(bool apply_presets_change, bool reload_presets)
         }
         wxGetApp().app_config->set("window_layout", layout.utf8_string());
     }
+
+    // The project this window held is gone: its model, its plates and every slice result, including
+    // the ones the preview was reading, have just been destroyed. Nothing below this point in the
+    // reset re-reads them, so the pages they occupied can go back now instead of staying in the
+    // working set of an empty window.
+    Slic3r::trim_process_memory();
 }
 
 void Plater::priv::center_selection()
@@ -13554,7 +13561,7 @@ void Plater::priv::release_finished_plate_resources(int plate_index)
         return;
     }
 
-    if (plate->release_finished_slice_resources())
+    if (plate->release_finished_slice_resources() == SliceResourceRelease::Complete)
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% slice resources released, %2%") % plate_index % log_memory_info();
 }
 
@@ -13924,6 +13931,10 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         this->preview->reload_print(false);
         q->mark_plate_toolbar_image_dirty();
         q->SetDropTarget(new PlaterDropTarget(*main_frame, *q));
+        // The job is over and the preview has rebuilt what it draws from the current plate's
+        // result: the slicing working sets of the run are unreferenced, and the process is about to
+        // sit idle waiting for the user. This is the point the peak of the run is still resident.
+        Slic3r::trim_process_memory();
     }
     else
     {

@@ -23,6 +23,7 @@
 #include <map>
 #include <vector>
 #include "libslic3r/PrintBase.hpp"
+#include "libslic3r/Memory.hpp"
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <cerrno>
 #include <utility>
@@ -1196,8 +1197,59 @@ static void apply_discrete_gpu_preference()
 }
 #endif
 
+// The first-layer boxes of one plate's objects, measured while its PrintObjects are still alive.
+// --slice-all releases a plate's sliced objects as soon as its G-code has been exported, and the
+// 3MF export measures the boxes afterwards: a Print whose slicing state was released has no
+// objects, so measuring there would write a zero box for every plate. The caller measures before
+// the release and the export reuses the measurement.
+struct PlateFirstLayerBBoxes
+{
+    bool                  captured = false;
+    std::vector<BBoxData> objects;
+    BoundingBoxf          all;
+};
+
+static PlateFirstLayerBBoxes measure_first_layer_bboxes(Slic3r::GUI::PartPlate &part_plate)
+{
+    PlateFirstLayerBBoxes    out;
+    PrintBase               *print_base    = nullptr;
+    Slic3r::GUI::GCodeResult *gcode_result = nullptr;
+    int                      print_index   = 0;
+    part_plate.get_print(&print_base, &gcode_result, &print_index);
+    Print *print = dynamic_cast<Print *>(print_base);
+    if (print == nullptr)
+        return out;
+    for (PrintObject *obj : print->objects()) {
+        BBoxData data;
+        auto     bb_scaled = obj->get_first_layer_bbox(data.area, data.layer_height, data.name);
+        auto     bb        = unscaled(bb_scaled);
+        out.all.merge(bb);
+        data.area *= (SCALING_FACTOR * SCALING_FACTOR); // unscale area
+        data.id   = obj->id().id;
+        data.bbox = {bb.min.x(), bb.min.y(), bb.max.x(), bb.max.y()};
+        out.objects.emplace_back(std::move(data));
+    }
+    out.captured = !out.objects.empty();
+    return out;
+}
+
+// Name of a release outcome for the per-plate log lines. Spelled out instead of logging the enum
+// value so the log stays readable and grep-able for the one case that matters: a full release.
+static const char *slice_resource_release_name(Slic3r::GUI::SliceResourceRelease release)
+{
+    switch (release) {
+    case Slic3r::GUI::SliceResourceRelease::Complete:    return "complete";
+    case Slic3r::GUI::SliceResourceRelease::PayloadOnly: return "payload only";
+    case Slic3r::GUI::SliceResourceRelease::Nothing:     break;
+    }
+    return "nothing";
+}
+
 int CLI::run(int argc, char **argv)
 {
+    // Before the first slice allocates: the allocator thresholds only apply to allocations made
+    // after they are set, and a batch run is the case they exist for.
+    Slic3r::initialize_memory_allocator();
     // Mark the main thread for the debugger and for runtime checks.
     set_current_thread_name("orcaslicer_main");
     // Save the thread ID of the main thread.
@@ -6281,7 +6333,11 @@ int CLI::run(int argc, char **argv)
     }
 
     // loop through action options
-    bool export_to_3mf = false, load_slicedata = false, export_slicedata = false, export_slicedata_error = false;
+    // Whether this run also packs a project, worked out before the actions run: --export-3mf may
+    // come after --slice on the command line, and the slice pass needs to know that the 3MF export
+    // will measure the first-layer boxes it has to capture before releasing its objects.
+    bool export_to_3mf = std::find(m_actions.begin(), m_actions.end(), "export_3mf") != m_actions.end();
+    bool load_slicedata = false, export_slicedata = false, export_slicedata_error = false;
     bool no_check = false;
     std::string export_3mf_file, load_slice_data_dir, export_slice_data_dir, export_stls_dir;
     std::vector<ThumbnailData*> calibration_thumbnails;
@@ -6289,6 +6345,9 @@ int CLI::run(int argc, char **argv)
     int max_slicing_time_per_plate = 0, max_triangle_count_per_plate = 0, sliced_plate = -1;
     std::vector<bool> plate_has_skips(partplate_list.get_plate_count(), false);
     std::vector<std::vector<size_t>> plate_skipped_objects(partplate_list.get_plate_count());
+    // First-layer boxes measured before --slice-all releases a plate's sliced objects, indexed by
+    // plate; see measure_first_layer_bboxes(). Empty when the plate was not released here.
+    std::vector<PlateFirstLayerBBoxes> plate_first_layer_bboxes;
 
     global_current_time = (long long)Slic3r::Utils::get_current_time_utc();
     sliced_info.prepare_time = (size_t) (global_current_time - global_begin_time);
@@ -6421,7 +6480,9 @@ int CLI::run(int argc, char **argv)
             if (! this->export_models(IO::AMF))
                 return 1;
         } */else if (opt_key == "export_3mf") {
-            export_to_3mf = true;
+            // export_to_3mf itself was resolved before this loop ran: the slice pass has to know
+            // that the 3MF export will need the first-layer boxes, and --export-3mf may come after
+            // --slice on the command line.
             export_3mf_file = m_config.opt_string(opt_key);
         }else if(opt_key=="no_check"){
             no_check = m_config.opt_bool(opt_key);
@@ -7290,6 +7351,15 @@ int CLI::run(int argc, char **argv)
                                 record_exit_reson(outfile_dir, CLI_SLICING_ERROR, index+1, cli_errors[CLI_SLICING_ERROR], sliced_info);
                                 flush_and_exit(CLI_SLICING_ERROR);
                             }
+                            // The 3MF export below measures each plate's first-layer bboxes from
+                            // its live PrintObjects, and this plate's are about to be released:
+                            // measure them now, while they still exist, and let that pass reuse
+                            // the measurement.
+                            if (export_to_3mf) {
+                                if (plate_first_layer_bboxes.size() <= size_t(index))
+                                    plate_first_layer_bboxes.resize(index + 1);
+                                plate_first_layer_bboxes[index] = measure_first_layer_bboxes(*part_plate);
+                            }
                             // Slice all: this plate's G-code is exported and its file is on disk,
                             // so the preview payload of the result and the sliced objects of its
                             // print are derived data from here on - both are read back from that
@@ -7298,11 +7368,35 @@ int CLI::run(int argc, char **argv)
                             // with the plate count until an allocation fails. Release is an
                             // optimisation and never fails a slice: whatever it cannot verify it
                             // leaves resident.
+                            //
+                            // The release is the only point where its effect on the process
+                            // footprint can be seen, so the run reports current and peak resident
+                            // set on both sides of it. These are info records: they only reach a
+                            // file when the caller asked for one with --logfile at a level that
+                            // keeps info, so the default CLI output is not changed.
+                            BOOST_LOG_TRIVIAL(info) << boost::format("plate %1%: RSS %2% MiB, peak RSS %3% MiB before releasing slice resources")
+                                % (index + 1) % (Slic3r::current_process_rss_bytes() >> 20) % (Slic3r::peak_process_rss_bytes() >> 20);
+                            Slic3r::GUI::SliceResourceRelease released = Slic3r::GUI::SliceResourceRelease::Nothing;
                             try {
-                                part_plate->release_finished_slice_resources();
+                                released = part_plate->release_finished_slice_resources();
                             } catch (const std::exception &ex) {
                                 BOOST_LOG_TRIVIAL(warning) << "plate " << index + 1 << ": slice resources were not released: " << ex.what();
                             }
+                            // How much of the plate is gone decides how much of the process
+                            // footprint may be handed back. A complete release leaves nothing of
+                            // this plate's run alive, so the whole footprint is trimmed - the same
+                            // strong trim PartPlate::release_finished_slice_resources() does. A
+                            // partial release (the payload went, the print kept its PrintObjects)
+                            // must not evict the working set: those objects are still live and this
+                            // plate may still read them, so only the allocator caches are trimmed,
+                            // exactly like PartPlate does for the same outcome.
+                            if (released == Slic3r::GUI::SliceResourceRelease::Complete)
+                                Slic3r::trim_process_memory();
+                            else if (released == Slic3r::GUI::SliceResourceRelease::PayloadOnly)
+                                Slic3r::trim_allocator_caches();
+                            BOOST_LOG_TRIVIAL(info) << boost::format("plate %1%: RSS %2% MiB, peak RSS %3% MiB after releasing slice resources (%4%)")
+                                % (index + 1) % (Slic3r::current_process_rss_bytes() >> 20) % (Slic3r::peak_process_rss_bytes() >> 20)
+                                % slice_resource_release_name(released);
                         }
                     }
                     if (pre_check&& (partplate_list.get_plate_count() > 1))
@@ -8034,20 +8128,23 @@ int CLI::run(int argc, char **argv)
             if (opt_nozzle_diameters != nullptr)
                 plate_bbox->nozzle_diameter = float(opt_nozzle_diameters->get_at(plate_bbox->first_extruder));
 
-            auto objects = print->objects();
             auto orig = part_plate->get_origin();
             Vec2d orig2d = { orig[0], orig[1] };
 
-            for (auto obj : objects)
-            {
-                BBoxData data;
-                auto bb_scaled = obj->get_first_layer_bbox(data.area, data.layer_height, data.name);
-                auto bb = unscaled(bb_scaled);
-                bbox_all.merge(bb);
-                data.area *= (SCALING_FACTOR * SCALING_FACTOR); // unscale area
-                data.id = obj->id().id;
-                data.bbox = { bb.min.x(),bb.min.y(),bb.max.x(),bb.max.y() };
-                id_bboxes.emplace_back(std::move(data));
+            // --slice-all releases this plate's PrintObjects right after its G-code export, and a
+            // released print has no objects left to measure: use the boxes captured at that point
+            // instead. Measuring here is only possible for a plate that was not released.
+            PlateFirstLayerBBoxes live;
+            const PlateFirstLayerBBoxes *measured = nullptr;
+            if (i < (int) plate_first_layer_bboxes.size() && plate_first_layer_bboxes[i].captured)
+                measured = &plate_first_layer_bboxes[i];
+            else {
+                live     = measure_first_layer_bboxes(*part_plate);
+                measured = &live;
+            }
+            if (measured->captured) {
+                id_bboxes = measured->objects;
+                bbox_all.merge(measured->all);
             }
             // add wipe tower bounding box
             if (print->has_wipe_tower()) {

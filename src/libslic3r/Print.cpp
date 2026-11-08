@@ -61,6 +61,7 @@
 #include "IMEXHelpers.hpp"
 #include "IMEXZones.hpp"
 #include "Print.hpp"
+#include "Memory.hpp"
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
 #include "ClipperUtils.hpp"
@@ -3700,6 +3701,11 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                 if (obj->set_started(posSlice)) obj->set_done(posSlice);   // shared/duplicate — no hook
             }
         }
+        // Milestone trim: slice() has just handed the per-volume first-layer slices and the
+        // per-layer raw slices to the layer objects and dropped its own copies. Nothing below
+        // reads those copies again, and the next phase allocates perimeters and infill over the
+        // same layers - the working set stays, only the allocators' unused pages go back.
+        trim_allocator_caches();
         for (PrintObject *obj : m_objects) {
             if (need_slicing_objects.count(obj) != 0) {
                 const bool was_done = obj->is_step_done(posPerimeters);
@@ -3720,6 +3726,10 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     obj->set_done(posEstimateCurledExtrusions);
             }
         }
+        // Milestone trim: perimeters and their curled-extrusion estimates are done; the temporary
+        // polygon sets they built are the last phase's peak and nothing holds them now. Allocator
+        // caches only: the layers themselves are read again below.
+        trim_allocator_caches();
         for (PrintObject *obj : m_objects) {
             if (need_slicing_objects.count(obj) != 0) {
                 // split prepare_infill (fill-surface prep) from infill (make_fills) so a
@@ -3765,6 +3775,10 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     obj->set_done(posContouring);
             }
         }
+        // Milestone trim: infill, ironing and Z-contouring have each built and dropped their
+        // working sets; support generation below is the next large allocator. Allocator caches
+        // only - support reads the same layers.
+        trim_allocator_caches();
 
         // SlicingPipeline: support runs in the parallel block below; the hook must fire in a
         // sequential loop afterward. Snapshot per-object done-state just before the parallel_for.
@@ -3810,6 +3824,10 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
                     obj->set_done(posDetectOverhangsForLift);
             }
         }
+        // Milestone trim: support material and the lift-overhang pass are the largest working
+        // sets of this half of the pipeline and both are complete here. Allocator caches only:
+        // skirt and brim below still walk the layers.
+        trim_allocator_caches();
     }
     else {
         for (PrintObject *obj : m_objects) {
@@ -4164,6 +4182,9 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
         this->finalize_first_layer_convex_hull();
         this->set_done(psSkirtBrim);
         if (m_pipeline_plugin_active) run_pipeline_hook(SlicingPipelineStepPlugin::psSkirtBrim, nullptr);
+        // Milestone trim: every slicing step is done. What is left (paths, orderings, the G-code
+        // export) needs the layers, not the working sets the steps built to produce them.
+        trim_allocator_caches();
 
         if (time_cost_with_cache) {
             end_time = (long long)Slic3r::Utils::get_current_time_utc();
@@ -4221,6 +4242,11 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
     }
 
     BOOST_LOG_TRIVIAL(info) << "Slicing process finished." << log_memory_info();
+    // The print keeps its layers and PrintObjects, but the temporary containers created and
+    // dropped while producing them are the peak this run reached. Give the allocator's copies of
+    // that peak back before the caller starts the G-code export, which allocates its own preview
+    // buffers; the layers the export reads stay in the working set.
+    trim_allocator_caches();
 
     {
         LifecycleEventContext ctx;

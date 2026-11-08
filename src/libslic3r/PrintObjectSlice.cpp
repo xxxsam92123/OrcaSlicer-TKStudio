@@ -582,7 +582,10 @@ static bool doesVolumeIntersect(const VolumeSlices& vs1, const std::vector<Bound
 }
 
 //BBS: grouping the volumes of an object according to their connection relationship
-bool groupingVolumes(std::vector<VolumeSlices> objSliceByVolume, std::vector<groupedVolumeSlices>& groups, double resolution, int firstLayerReplacedBy)
+// Takes the slices by reference-to-rvalue: the caller has built them for this call only, and the
+// per-layer offset copies below rewrite every element in place, so a by-value parameter would
+// copy the whole first layer's geometry before touching it.
+static bool groupingVolumes(std::vector<VolumeSlices> &&objSliceByVolume, std::vector<groupedVolumeSlices>& groups, double resolution, int firstLayerReplacedBy)
 {
     std::vector<int> groupIndex(objSliceByVolume.size(), -1);
     double offsetValue = 0.05 / SCALING_FACTOR;
@@ -668,11 +671,17 @@ bool groupingVolumes(std::vector<VolumeSlices> objSliceByVolume, std::vector<gro
 }
 
 //BBS: filter the members of "objSliceByVolume" such that only "model_part" are included
-std::vector<VolumeSlices> findPartVolumes(const std::vector<VolumeSlices>& objSliceByVolume, ModelVolumePtrs model_volumes) {
+static std::vector<VolumeSlices> findPartVolumes(const std::vector<VolumeSlices>& objSliceByVolume, ModelVolumePtrs model_volumes) {
     std::vector<VolumeSlices> outPut;
+    outPut.reserve(objSliceByVolume.size());
     for (const auto& vs : objSliceByVolume) {
         for (const auto& mv : model_volumes) {
-            if (vs.volume_id == mv->id() && mv->is_model_part()) outPut.push_back(vs);
+            // The id is unique, so a match is the only match: without the break the volume is
+            // copied once per model volume the object has.
+            if (vs.volume_id == mv->id() && mv->is_model_part()) {
+                outPut.push_back(vs);
+                break;
+            }
         }
     }
     return outPut;
@@ -874,7 +883,7 @@ void groupingVolumesForBrim(PrintObject* object, LayerPtrs& layers, int firstLay
 
     const auto           scaled_resolution = scaled<double>(object->print()->config().resolution.value);
     auto partsObjSliceByVolume = findPartVolumes(object->firstLayerObjSliceMod(), object->model_object()->volumes);
-    groupingVolumes(partsObjSliceByVolume, object->firstLayerObjGroupsMod(), scaled_resolution, firstLayerReplacedBy);
+    groupingVolumes(std::move(partsObjSliceByVolume), object->firstLayerObjGroupsMod(), scaled_resolution, firstLayerReplacedBy);
     applyNegtiveVolumes(object->model_object()->volumes, object->firstLayerObjSliceMod(), object->firstLayerObjGroupsMod(), scaled_resolution);
 
     // BBS: the actual first layer slices stored in layers are re-sorted by volume group and will be used to generate brim
@@ -945,6 +954,12 @@ void PrintObject::slice()
 
     // BBS: the actual first layer slices stored in layers are re-sorted by volume group and will be used to generate brim
     groupingVolumesForBrim(this, m_layers, firstLayerReplacedBy);
+    // The per-volume first-layer slices were the input of the grouping above; the groups
+    // (firstLayerObjGroups), which brim generation reads, are what survives it. Keeping the
+    // volumes as well holds a second copy of the first layer's slices for every volume of the
+    // object, for a whole slice, and nothing reads it again.
+    firstLayerObjSliceByVolume.clear();
+    firstLayerObjSliceByVolume.shrink_to_fit();
 
     // Update bounding boxes, back up raw slices of complex models.
     tbb::parallel_for(
