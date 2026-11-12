@@ -19,9 +19,13 @@
 # Writes key-inputs, wait-for, wait-since and cache-ref to $GITHUB_OUTPUT.
 set -uo pipefail
 
+# build_check_cache.yml names the workflow whose push builds save the caches it
+# wants; a caller that only has github.workflow_ref passes that instead, and the
+# file name is what the runs API takes.
 workflow=${WORKFLOW_REF:-}
 workflow=${workflow%%@*}
 workflow=${WORKFLOW:-${workflow##*/}}
+workflow=${workflow:?}
 
 # Must match the job names in build_all.yml, build_check_cache.yml and build_deps.yml.
 job=${JOB:-build_macos_arch (${ARCH:-})}
