@@ -25,6 +25,9 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/pemerr.h>
+// OpenSSL 3 moved the BIO, X509 and pem_password_cb typedefs out of bio.h, x509.h and
+// pem.h into types.h, so naming those types needs this header directly.
+#include <openssl/types.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <cmath>
