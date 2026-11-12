@@ -25,6 +25,10 @@ bool is_variant_column_option(const DynamicPrintConfig &config, const std::strin
 // Reads value idx of a vector option as a display string. Returns false and leaves out untouched when opt is
 // empty or idx is outside of it.
 bool variant_column_value(const ConfigOptionVectorBase &opt, int idx, std::string &out);
+
+// Gives a per-tool process a column per variant for each printer tool it has none for, copied from tool 1's column of
+// that variant. Returns whether it added any. See docs/HLSD/per-nozzle-settings.md.
+bool add_process_columns_for_new_tools(DynamicPrintConfig &process_config, const DynamicPrintConfig &printer_config);
 } // namespace Slic3r
 
 #endif // slic3r_Parameter_Utils_hpp_
