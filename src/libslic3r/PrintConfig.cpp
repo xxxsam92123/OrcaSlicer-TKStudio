@@ -5457,6 +5457,56 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comExpert;
     def->set_default_value(new ConfigOptionFloat(0.05));
 
+    // Orca: per-role speeds for the Z contoured paths. 0 (or a missing value in an older profile)
+    // keeps the role printed at its normal speed.
+    def = this->add("zaa_outer_wall_speed", coFloats);
+    def->label = L("ZAA outer wall");
+    def->category = L("Quality");
+    def->tooltip = L("Printing speed of the Z contoured outer walls.\n"
+                     "Only applies to walls shaped by Z contouring (Z anti-aliasing).\n"
+                     "Set to 0 to use the normal outer wall speed.");
+    def->sidetext = L("mm/s");	// millimeters per second, CIS languages need translation
+    def->min = 0;
+    def->mode = comExpert;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{0});
+
+    def = this->add("zaa_inner_wall_speed", coFloats);
+    def->label = L("ZAA inner wall");
+    def->category = L("Quality");
+    def->tooltip = L("Printing speed of the Z contoured inner walls.\n"
+                     "Only applies to walls shaped by Z contouring (Z anti-aliasing).\n"
+                     "Set to 0 to use the normal inner wall speed.");
+    def->sidetext = L("mm/s");	// millimeters per second, CIS languages need translation
+    def->min = 0;
+    def->mode = comExpert;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{0});
+
+    def = this->add("zaa_top_surface_speed", coFloats);
+    def->label = L("ZAA top surface");
+    def->category = L("Quality");
+    def->tooltip = L("Printing speed of the Z contoured top surfaces.\n"
+                     "Only applies to surfaces shaped by Z contouring (Z anti-aliasing).\n"
+                     "Set to 0 to use the normal top surface speed.");
+    def->sidetext = L("mm/s");	// millimeters per second, CIS languages need translation
+    def->min = 0;
+    def->mode = comExpert;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{0});
+
+    def = this->add("zaa_ironing_speed", coFloats);
+    def->label = L("ZAA ironing");
+    def->category = L("Quality");
+    def->tooltip = L("Printing speed of the Z contoured ironing lines.\n"
+                     "Only applies to ironing shaped by Z contouring (Z anti-aliasing).\n"
+                     "Set to 0 to use the normal ironing speed.");
+    def->sidetext = L("mm/s");	// millimeters per second, CIS languages need translation
+    def->min = 0;
+    def->mode = comExpert;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{0});
+
     def = this->add("layer_change_gcode", coString);
     def->label = L("Layer change G-code");
     def->tooltip = L("This G-code is inserted at every layer change after the Z lift.");
