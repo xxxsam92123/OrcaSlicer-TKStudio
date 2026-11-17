@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <boost/log/trivial.hpp>
+#include <boost/format.hpp>
 #include <cassert>
 #include <cfloat>
 #include <utility>
