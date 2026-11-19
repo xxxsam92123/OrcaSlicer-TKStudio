@@ -243,7 +243,6 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
     // First calculate width of all the texts that are could possibly be shown. We will decide set the dialog width based on that:
-    const float space_size = m_imgui->get_style_scaling() * 8;
     const float cursor_slider_left      = m_imgui->calc_text_size(m_desc.at("cursor_size")).x + m_imgui->scaled(1.5f);
     const float gap_fill_slider_left    = m_imgui->calc_text_size(m_desc.at("gap_fill")).x + m_imgui->scaled(1.5f);
     const float highlight_slider_left   = m_imgui->calc_text_size(m_desc.at("highlight_by_angle")).x + m_imgui->scaled(1.5f);
@@ -266,13 +265,12 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     total_text_max += caption_max + m_imgui->scaled(1.f);
     caption_max += m_imgui->scaled(1.f);
 
-    const float sliders_left_width = std::max(gap_area_txt_width, std::max(smart_fill_angle_txt_width, std::max(cursor_slider_left, std::max(highlight_slider_left, gap_fill_slider_left))));
+    const float sliders_left_width = ImGui::GetStyle().WindowPadding.x + std::max(gap_area_txt_width, std::max(smart_fill_angle_txt_width, std::max(cursor_slider_left, std::max(highlight_slider_left, gap_fill_slider_left))));
+    const float sliders_width = m_imgui->scaled(7.0f);
     const float slider_icon_width  = m_imgui->get_slider_icon_size().x;
     const float max_tooltip_width = ImGui::GetFontSize() * 20.0f;
 
-    const float sliders_width = m_imgui->scaled(7.0f);
-    const float drag_left_width = ImGui::GetStyle().WindowPadding.x + sliders_width - space_size;
-
+    const float drag_left_width = ImGui::GetStyle().WindowPadding.x + sliders_width - m_imgui->get_style_scaling() * 8;
     float drag_pos_times     = 0.7;
 
     ImGui::AlignTextToFramePadding();

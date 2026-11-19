@@ -152,7 +152,6 @@ void GLGizmoSeam::on_render_input_window(float x, float y, float bottom_limit)
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
     // First calculate width of all the texts that are could possibly be shown. We will decide set the dialog width based on that:
-    const float space_size = m_imgui->get_style_scaling() * 8;
     const float cursor_size_slider_left = m_imgui->calc_text_size(m_desc.at("cursor_size")).x + m_imgui->scaled(1.f);
     const float empty_button_width      = m_imgui->calc_button_size("").x;
 
@@ -163,12 +162,11 @@ void GLGizmoSeam::on_render_input_window(float x, float y, float bottom_limit)
         total_text_max = std::max(total_text_max, m_imgui->calc_text_size(m_desc[t]).x);
     }
 
-    const float sliders_left_width = cursor_size_slider_left;
+    const float sliders_left_width = ImGui::GetStyle().WindowPadding.x + cursor_size_slider_left;
+    const float sliders_width = m_imgui->scaled(7.0f);
     const float slider_icon_width  = m_imgui->get_slider_icon_size().x;
 
-    const float sliders_width = m_imgui->scaled(7.0f);
-    const float drag_left_width = ImGui::GetStyle().WindowPadding.x + sliders_width - space_size;
-
+    const float drag_left_width = ImGui::GetStyle().WindowPadding.x + sliders_width - m_imgui->get_style_scaling() * 8;
     const float max_tooltip_width = ImGui::GetFontSize() * 20.0f;
 
     ImGui::AlignTextToFramePadding();
