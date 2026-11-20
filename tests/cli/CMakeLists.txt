@@ -86,3 +86,12 @@ set_tests_properties(cli_nozzle_volume_type PROPERTIES
     LABELS "CLI;RequiresApp"
     SKIP_RETURN_CODE 77
     TIMEOUT 900)
+
+# An empty "logfile" used to put boost::log on its default 00000.log name in the working
+# directory; a run from a directory that cannot hold that file died before slicing.
+add_test(NAME cli_logfile_cwd
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_logfile_cwd.sh $<TARGET_FILE:OrcaSlicer> ${ORCA_CLI_TEST_PYTHON})
+set_tests_properties(cli_logfile_cwd PROPERTIES
+    LABELS "CLI;RequiresApp"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 900)
