@@ -8,6 +8,7 @@
 #include "GCodeProcessor.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/log/trivial.hpp>
@@ -890,7 +891,24 @@ float CoolingBuffer::estimate_layer_time(const std::string &gcode, const std::ve
     m_layer_timer.initialize_result_moves();
     m_layer_timer.apply_config(m_layer_timer_config);
     m_layer_timer.process_buffer(timed);
-    return float(m_layer_timer.get_time(PrintEstimatedStatistics::ETimeMode::Normal));
+    const float estimated_time = float(m_layer_timer.get_time(PrintEstimatedStatistics::ETimeMode::Normal));
+
+    // Diagnostic only: the estimate is computed from `timed`, not from the g-code handed in, so log
+    // what the timer actually saw. An inflated estimate can then be traced back to the buffer it was
+    // derived from. Rate limited to a handful of lines per process.
+    static std::atomic<size_t> s_estimate_log_count{ 0 };
+    if (s_estimate_log_count.fetch_add(1, std::memory_order_relaxed) < size_t(10)) {
+        std::string head = timed.substr(0, std::min<size_t>(timed.size(), 200));
+        boost::algorithm::replace_all(head, "\n", "\\n");
+        BOOST_LOG_TRIVIAL(trace) << "ARCDIAG estimate"
+                                 << " estimated_time=" << estimated_time
+                                 << " timed_size=" << timed.size()
+                                 << " timed_from=" << m_timed_from
+                                 << " slowed_lines=" << slowed.size()
+                                 << " timed_head=\"" << head << "\"";
+    }
+
+    return estimated_time;
 }
 
 float CoolingBuffer::slow_down_layer(const std::string &gcode, std::vector<PerExtruderAdjustments> &per_extruder_adjustments)

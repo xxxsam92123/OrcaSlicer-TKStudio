@@ -108,6 +108,14 @@ static const Slic3r::Vec3f DEFAULT_EXTRUDER_OFFSET = Slic3r::Vec3f::Zero();
 
 namespace Slic3r {
 
+// Diagnostic only: bounds how many ARCDIAG trace lines one call site emits, so that a 900 layer
+// print cannot flood the log. Returns true for the first `limit` calls, false afterwards. The
+// relaxed atomic keeps the check cheap enough for the per-move sites it guards.
+static bool arc_diag_should_log(std::atomic<size_t>& counter, const size_t limit)
+{
+    return counter.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
 static int physical_extruder_id_for_tool(int tool_number,
                                          const std::vector<int>& filament_maps,
                                          const std::vector<int>& physical_extruder_map)
@@ -724,6 +732,29 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
         }
 
         time += block_time;
+
+        // Diagnostic only: the per block numbers the layer time is summed from. `distance` against
+        // `cruise` is where an inflated layer time shows up first.
+        {
+            static std::atomic<size_t> s_block_time_log_count{ 0 };
+            if (arc_diag_should_log(s_block_time_log_count, 10)) {
+                BOOST_LOG_TRIVIAL(trace) << "ARCDIAG block_time"
+                                         << " mode=" << static_cast<int>(mode)
+                                         << " move_id=" << block.move_id
+                                         << " layer_id=" << block.layer_id
+                                         << " move_type=" << static_cast<int>(block.move_type)
+                                         << " distance=" << block.distance
+                                         << " cruise=" << block.feedrate_profile.cruise
+                                         << " entry_speed=" << block.feedrate_profile.entry
+                                         << " exit_speed=" << block.feedrate_profile.exit
+                                         << " acceleration=" << block.acceleration
+                                         << " max_entry_speed=" << block.max_entry_speed
+                                         << " safe_feedrate=" << block.safe_feedrate
+                                         << " motion_time=" << motion_time
+                                         << " block_time=" << block_time
+                                         << " time_total=" << time;
+            }
+        }
         // Orca: accumulate per-SkipType time spent inside SKIPPABLE regions, folded into this single
         // calculate_time write site. Fires fleet-wide (the shipping time_lapse_gcode template stamps
         // blocks stTimelapse), but writes only skippable_part_time, which has no g-code-emitting
@@ -5660,6 +5691,22 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
     EMoveType type = move_type(delta_pos);
     const float delta_xyz = std::sqrt(sqr(delta_pos[X]) + sqr(delta_pos[Y]) + sqr(delta_pos[Z]));
 
+    // Diagnostic only: the discretised arc segments arrive here as synthetic G1 moves whose raw
+    // axes and resolved positions decide the block length the layer time is built from.
+    if (origin == G1DiscretizationOrigin::G2G3) {
+        static std::atomic<size_t> s_g2g3_g1_log_count{ 0 };
+        if (arc_diag_should_log(s_g2g3_g1_log_count, 10)) {
+            BOOST_LOG_TRIVIAL(trace) << "ARCDIAG g2g3_g1"
+                                     << " global_positioning=" << static_cast<int>(m_global_positioning_type)
+                                     << " units=" << static_cast<int>(m_units)
+                                     << " start=(" << m_start_position[X] << "," << m_start_position[Y] << "," << m_start_position[Z] << ")"
+                                     << " end=(" << m_end_position[X] << "," << m_end_position[Y] << "," << m_end_position[Z] << ")"
+                                     << " delta=(" << delta_pos[X] << "," << delta_pos[Y] << "," << delta_pos[Z] << ")"
+                                     << " delta_xyz=" << delta_xyz
+                                     << " feedrate=" << m_feedrate;
+        }
+    }
+
     // Arc fitting can leave a top-level G1 extrusion whose XY displacement is below EPSILON while
     // its E is still positive. The extruded volume is then divided by a path the head never
     // travelled, which reports a bead cross section of tens of mm2 for a move no nozzle made.
@@ -6584,6 +6631,26 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
             arc.angle -= 2.0 * PI;
     }
 
+    // Diagnostic only: the geometry the discretisation is about to work from. A radius or a center
+    // that is off by orders of magnitude here explains an inflated segment count downstream.
+    static std::atomic<size_t> s_arc_geom_log_count{ 0 };
+    if (arc_diag_should_log(s_arc_geom_log_count, 10)) {
+        BOOST_LOG_TRIVIAL(trace) << "ARCDIAG arc_geom"
+                                 << " fitting=" << static_cast<int>(fitting)
+                                 << " angle=" << arc.angle
+                                 << " start=(" << arc.start.x() << "," << arc.start.y() << "," << arc.start.z() << ")"
+                                 << " end=(" << arc.end.x() << "," << arc.end.y() << "," << arc.end.z() << ")"
+                                 << " center=(" << arc.center.x() << "," << arc.center.y() << "," << arc.center.z() << ")"
+                                 << " rel_center=(" << rel_center.x() << "," << rel_center.y() << "," << rel_center.z() << ")"
+                                 << " rel_center_norm=" << rel_center.norm()
+                                 << " start_radius=" << arc.start_radius()
+                                 << " units=" << static_cast<int>(m_units)
+                                 << " global_positioning=" << static_cast<int>(m_global_positioning_type)
+                                 << " e_positioning=" << static_cast<int>(m_e_local_positioning_type)
+                                 << " origin=(" << m_origin[X] << "," << m_origin[Y] << ")"
+                                 << " start_position=(" << m_start_position[X] << "," << m_start_position[Y] << ")";
+    }
+
     const double travel_length = arc.travel_length();
     if (travel_length < 0.001)
         return;
@@ -6621,6 +6688,9 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
           process_G1(g1_axes, g1_feedrate, G1DiscretizationOrigin::G2G3, remaining_internal_g1_lines);
     };
 
+    // Diagnostic only: bounds the arc segmentation traces shared by both discretisation branches.
+    static std::atomic<size_t> s_arc_segments_log_count{ 0 };
+
     if (m_flavor == gcfMarlinFirmware) {
         // calculate arc segments
         // reference:
@@ -6636,6 +6706,19 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
         const float segment_mm = std::clamp(std::min(std::sqrt(8.0f * radius_mm * MAX_ARC_DEVIATION), feedrate_mm_s * (1.0f / MIN_ARC_SEGMENTS_PER_SEC)), MIN_ARC_SEGMENT_MM, MAX_ARC_SEGMENT_MM);
         const float flat_mm = radius_mm * std::abs(arc.angle);
         const size_t segments = std::max<size_t>(flat_mm / segment_mm + 0.8f, 1);
+
+        // Diagnostic only: the inputs and the result of the segment count. `segments` bounds how many
+        // synthetic G1 moves each arc turns into, hence the resolution the layer time is measured at.
+        if (arc_diag_should_log(s_arc_segments_log_count, 10)) {
+            BOOST_LOG_TRIVIAL(trace) << "ARCDIAG arc_segments"
+                                     << " flavor=marlin"
+                                     << " radius_mm=" << radius_mm
+                                     << " flat_mm=" << flat_mm
+                                     << " segment_mm=" << segment_mm
+                                     << " segments=" << segments
+                                     << " feedrate_mm_s=" << feedrate_mm_s
+                                     << " angle=" << arc.angle;
+        }
 
         AxisCoords prev_target = m_start_position;
 
@@ -6703,6 +6786,18 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
         static const double gcode_arc_tolerance = 0.0125;
         const size_t segments = Geometry::ArcWelder::arc_discretization_steps(arc.start_radius(), std::abs(arc.angle), gcode_arc_tolerance);
 #endif
+
+        // Diagnostic only: the same fields as the Marlin branch, for the Prusa/Firmware discretisation.
+        if (arc_diag_should_log(s_arc_segments_log_count, 10)) {
+            BOOST_LOG_TRIVIAL(trace) << "ARCDIAG arc_segments"
+                                     << " flavor=other"
+                                     << " radius_mm=" << arc.start_radius()
+                                     << " flat_mm=" << (arc.start_radius() * std::abs(arc.angle))
+                                     << " segment_mm=" << (travel_length / double(segments))
+                                     << " segments=" << segments
+                                     << " feedrate_mm_s=" << (feedrate.has_value() ? *feedrate : m_feedrate)
+                                     << " angle=" << arc.angle;
+        }
 
         const double inv_segment = 1.0 / double(segments);
         const double theta_per_segment = arc.angle * inv_segment;
