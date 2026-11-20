@@ -125,6 +125,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/nowide/fstream.hpp>
+#include <boost/nowide/iostream.hpp>
 #include <boost/nowide/convert.hpp>
 #include <boost/nowide/cstdio.hpp>
 
@@ -160,6 +161,11 @@ namespace boost::posix_time { class ptime; }
 namespace Slic3r {
 
 static boost::log::trivial::severity_level logSeverity = boost::log::trivial::error;
+
+// Declared up here so that set_logging_file() can keep the sink it installs: flush_logs() and
+// the shutdown path both look at these.
+boost::shared_ptr<boost::log::sinks::synchronous_sink<boost::log::sinks::text_file_backend>> g_log_sink;
+boost::shared_ptr<boost::log::sinks::asynchronous_sink<boost::log::sinks::text_ostream_backend>> g_console_log_sink;
 
 static boost::log::trivial::severity_level level_to_boost(unsigned level)
 {
@@ -200,7 +206,29 @@ void set_logging_level(unsigned int level)
 
 void set_logging_file(const std::string &file)
 {
-	boost::log::add_file_log(file);
+    // Orca: an empty name keeps boost's default "%5N.log" pattern, i.e. it logs into the cwd.
+    if (file.empty())
+        return;
+    try {
+        g_log_sink = boost::log::add_file_log(file);
+        // Orca: boost opens and rotates the file inside the sink, on the first record, so a bad
+        // location never fails here - it unwinds whichever thread logged and kills the process
+        // (CLI runs from an unwritable cwd died with 0xe06d7363). The sink handler covers the
+        // whole lifetime: open, rotation, full disk, a dropped network share.
+        if (g_log_sink)
+            g_log_sink->set_exception_handler([file]() {
+                static std::atomic<bool> reported{false};
+                if (reported.exchange(true))
+                    return;
+                // Straight to cerr: the log core would route this back into the failed sink.
+                boost::nowide::cerr << "warning: log file \"" << file
+                                    << "\" cannot be written, continuing without a log file" << std::endl;
+            });
+    } catch (const std::exception &ex) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": failed to install the file sink \"" << file << "\": " << ex.what();
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": failed to install the file sink \"" << file << "\"";
+    }
 }
 
 unsigned int level_string_to_boost(std::string level)
@@ -241,9 +269,6 @@ unsigned get_logging_level()
     default: return 1;
     }
 }
-
-boost::shared_ptr<boost::log::sinks::synchronous_sink<boost::log::sinks::text_file_backend>> g_log_sink;
-boost::shared_ptr<boost::log::sinks::asynchronous_sink<boost::log::sinks::text_ostream_backend>> g_console_log_sink;
 
 // Force set_logging_level(<=error) after loading of the DLL.
 // This is currently only needed if libslic3r is loaded as a shared library into Perl interpreter

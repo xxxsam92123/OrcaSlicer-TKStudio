@@ -1613,7 +1613,12 @@ int CLI::run(int argc, char **argv)
         set_logging_level(2);
     }
     const ConfigOptionString* opt_logfile = m_config.opt<ConfigOptionString>("logfile");
-    if (opt_logfile) {
+    // Orca: only install the file sink when a log file was actually requested. The "logfile"
+    // option always exists and defaults to an empty string, and an empty name leaves boost's
+    // file_name at its default "%5N.log" pattern, which resolves against the cwd: CLI runs used
+    // to drop a 00000.log next to the models and, when that directory was not writable, die with
+    // an uncaught C++ exception (0xe06d7363).
+    if (opt_logfile && !opt_logfile->value.empty()) {
         set_logging_file(opt_logfile->value);
     }
 
