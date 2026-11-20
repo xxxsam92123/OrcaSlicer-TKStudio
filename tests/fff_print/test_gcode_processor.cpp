@@ -8,6 +8,7 @@
 
 #include "test_utils.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <initializer_list>
@@ -39,7 +40,63 @@ float processed_belt_tilt(const std::string &gcode)
 
 constexpr const char *body = "G1 X10 Y10 Z0.2 F3000\nG1 X20 Y10 E1 F1200\n";
 
+// Time of a piece of G-code as the preview estimates it, in seconds.
+double processed_time(const std::string &gcode)
+{
+    ScopedTemporaryFile temp(".gcode");
+    {
+        std::ofstream os(temp.string());
+        os << gcode;
+    }
+    GCodeProcessor proc;
+    proc.apply_config(FullPrintConfig{});
+    proc.process_file(temp.string());
+    return proc.get_time(PrintEstimatedStatistics::ETimeMode::Normal);
+}
+
+// A 13.6 mm tube's perimeter as four G3 arcs, printed where `G92` says the head is. The raw coordinates are
+// absolute, so moving the tube on the bed moves every coordinate in the file and leaves the geometry alone.
+std::string arc_circle_gcode(double x, double y)
+{
+    constexpr double radius = 6.796;
+    constexpr double half_turn = 0.5 * 3.14159265358979323846;
+    constexpr double center_dy = radius; // the circle sits above the stated head position
+    const double center_x = x;
+    const double center_y = y + center_dy;
+
+    std::string out = "G90\nM83\nG1 Z0.2 F6000\n";
+    out += "G92 X" + std::to_string(x) + " Y" + std::to_string(y) + " Z0.2 E0\n";
+    double extrusion = 0.;
+    for (int loop = 0; loop < 2; ++loop) {
+        for (int quadrant = 0; quadrant < 4; ++quadrant) {
+            const double a0 = half_turn * quadrant;
+            const double a1 = half_turn * (quadrant + 1);
+            const double start_x = center_x + radius * std::cos(a0);
+            const double start_y = center_y + radius * std::sin(a0);
+            const double end_x   = center_x + radius * std::cos(a1);
+            const double end_y   = center_y + radius * std::sin(a1);
+            extrusion += 0.35;
+            out += "G3 X" + std::to_string(end_x) + " Y" + std::to_string(end_y) + " I" + std::to_string(center_x - start_x) +
+                   " J" + std::to_string(center_y - start_y) + " E" + std::to_string(extrusion) + " F6600\n";
+        }
+    }
+    return out;
+}
+
 } // namespace
+
+// A G92 origin must not change the time of an arc: the arc's discretised segments are handed back to
+// process_G1(), which applies the origin to the values it is given, so process_G2_G3() has to undo it first.
+// Miss that and the first segment of every arc starts from -m_origin, i.e. an arc printed at the bed centre is
+// timed as a travel across the whole bed -- a 13.6 mm tube at (170, 160) came out at 200~300 s per layer
+// instead of 1.2 s, which made "slow down if layer print time is below" switch itself off.
+TEST_CASE("An arc's time does not depend on the G92 origin", "[GCodeProcessor][arc][Regression]")
+{
+    const double at_bed_centre = processed_time(arc_circle_gcode(170., 160.));
+    const double at_the_origin = processed_time(arc_circle_gcode(0., 0.));
+    REQUIRE(at_the_origin > 0.);
+    CHECK_THAT(at_bed_centre, Catch::Matchers::WithinRel(at_the_origin, 0.01));
+}
 
 TEST_CASE("The config block's belt angle does not mark G-code as belt G-code", "[GCodeProcessor][belt]")
 {

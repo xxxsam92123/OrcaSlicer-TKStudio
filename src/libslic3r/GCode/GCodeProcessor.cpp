@@ -6589,14 +6589,25 @@ void GCodeProcessor::process_G2_G3(const GCodeReader::GCodeLine& line, bool cloc
         return;
 
     auto adjust_target = [this](const AxisCoords& target, const AxisCoords& prev_position) {
+        // target[] holds positions that are already resolved: arc.start comes from m_start_position and
+        // arc.end / arc.center from extract_absolute_position_on_axis(), i.e. the G92 origin (m_origin) is
+        // applied. process_G1() below applies it again to whatever it is handed, so undo it here first --
+        // otherwise the first segment of every arc starts from -m_origin instead of from the previous point,
+        // and an arc printed away from the origin is timed as a travel across the whole bed.
         AxisCoords ret = target;
         if (m_global_positioning_type == EPositioningType::Relative) {
             for (unsigned char a = X; a <= E; ++a) {
                 ret[a] -= prev_position[a];
             }
         }
-        else if (m_e_local_positioning_type == EPositioningType::Relative)
-            ret[E] -= prev_position[E];
+        else {
+            for (unsigned char a = X; a <= Z; ++a)
+                ret[a] -= m_origin[a];
+            if (m_e_local_positioning_type == EPositioningType::Relative)
+                ret[E] -= prev_position[E];
+            else
+                ret[E] -= m_origin[E];
+        }
 
         // if (m_use_volumetric_e)
         //     ret[E] *= area_filament_cross_section;
