@@ -16,6 +16,10 @@
 #include <wx/utils.h>
 #include "slic3r/GUI/Event.hpp"
 
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>
+#endif
+
 class wxWindow;
 
 namespace pt = boost::property_tree;
@@ -29,6 +33,13 @@ ParamsDialog::ParamsDialog(wxWindow * parent)
 	: DPIDialog(parent, wxID_ANY,  "", wxDefaultPosition,
 		wxDefaultSize, wxCAPTION | wxCLOSE_BOX | wxRESIZE_BORDER)
 {
+#ifdef __WXMSW__
+    // wxWidgets ignores the still-hidden main window when choosing a dialog owner at creation.
+    // Set the native owner so the dialog stays above the main window while a drop-down is open.
+    if (auto *owner = wxGetTopLevelParent(parent))
+        ::SetWindowLongPtr(static_cast<HWND>(GetHandle()), GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner->GetHandle()));
+#endif
+
 	m_panel = new ParamsPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBK_LEFT | wxTAB_TRAVERSAL);
 	auto* topsizer = new wxBoxSizer(wxVERTICAL);
 	topsizer->Add(m_panel, 1, wxALL | wxEXPAND, 0, NULL);
