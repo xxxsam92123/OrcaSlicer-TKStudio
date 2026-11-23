@@ -4198,6 +4198,69 @@ void PrintObject::bridge_over_infill()
         }
     });
     
+    // Orca: An internal bridge printed on a layer that is already fully covered by the internal
+    // bridge of the layer directly below it is not a bridge: it is supported solid infill. Such a
+    // repeat is what the user sees as two identical bridging layers on the same footprint.
+    //
+    // Only eblInternalBridgeOnly / eblApplyToAll legitimately print a second internal bridge layer:
+    // those modes run the "second internal bridge layer" pass further below, which raises
+    // stSecondInternalBridge and then re-classifies it to stInternalBridge on the layer above. That
+    // doubling is the feature the user selected. eblDisabled and eblExternalBridgeOnly never run
+    // that pass (it is gated on InternalBridgeOnly || ApplyToAll), so for them nothing may double an
+    // internal bridge, and an overlap with the bridge below can only be a bleed of the same bridge
+    // shape onto two consecutive layers. Remove it there, bottom-up, so each layer is compared
+    // against the bridge faces the layer below actually keeps, not against candidates that were
+    // themselves removed.
+    const bool extra_internal_bridge_layer =
+        this->m_config.enable_extra_bridge_layer == eblInternalBridgeOnly ||
+        this->m_config.enable_extra_bridge_layer == eblApplyToAll;
+    if (!extra_internal_bridge_layer) {
+        for (size_t lidx = 1; lidx < this->layers().size(); ++lidx) {
+            // ORCA: Serial pass over every layer, so honour cancellation like the surrounding code.
+            m_print->throw_if_canceled();
+            ExPolygons lower_bridge;
+            for (const LayerRegion *lower_region : this->get_layer(lidx - 1)->regions())
+                for (const Surface &surface : lower_region->fill_surfaces.surfaces)
+                    if (surface.surface_type == stInternalBridge)
+                        lower_bridge.emplace_back(surface.expolygon);
+            if (lower_bridge.empty())
+                continue;
+            lower_bridge = union_ex(lower_bridge);
+
+            for (LayerRegion *region : this->get_layer(lidx)->regions()) {
+                bool rebuilt = false;
+                Surfaces new_surfaces;
+                for (const Surface &surface : region->fill_surfaces.surfaces) {
+                    if (surface.surface_type != stInternalBridge) {
+                        new_surfaces.emplace_back(surface);
+                        continue;
+                    }
+                    ExPolygons covered = intersection_ex(surface.expolygon, lower_bridge);
+                    if (covered.empty()) {
+                        new_surfaces.emplace_back(surface);
+                        continue;
+                    }
+                    rebuilt = true;
+                    // What the layer below leaves uncovered is a real span over sparse infill and
+                    // stays a bridge, including its angle and its contact with the anchors.
+                    for (const ExPolygon &expoly : diff_ex(surface.expolygon, lower_bridge))
+                        new_surfaces.emplace_back(surface, expoly);
+                    // The covered part prints as the internal solid infill it would have been
+                    // without the bridge, so the area is neither lost nor printed twice.
+                    Surface solid{surface, {}};
+                    solid.surface_type = stInternalSolid;
+                    solid.bridge_angle = -1.;
+                    for (const ExPolygon &expoly : covered)
+                        new_surfaces.emplace_back(solid, expoly);
+                }
+                if (rebuilt) {
+                    region->fill_surfaces.surfaces.clear();
+                    region->fill_surfaces.append(new_surfaces);
+                }
+            }
+        }
+    }
+
     // ======================================================================================================================================
     // === ORCA: Create a second internal bridge layer above the first bridge layer. ========================================================
     // ======================================================================================================================================
