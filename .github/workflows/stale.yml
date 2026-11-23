@@ -71,11 +71,14 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          HAS_ISSUES: ${{ github.event.repository.has_issues }}
         run: |
           {
-            gh issue list -R "$GITHUB_REPOSITORY" --label stale --state open --limit 5000 \
-              --json number,assignees,milestone \
-              --jq '.[] | select((.assignees | length > 0) or .milestone != null) | .number'
+            if [[ "$HAS_ISSUES" == "true" ]]; then
+              gh issue list -R "$GITHUB_REPOSITORY" --label stale --state open --limit 5000 \
+                --json number,assignees,milestone \
+                --jq '.[] | select((.assignees | length > 0) or .milestone != null) | .number'
+            fi
             gh pr list -R "$GITHUB_REPOSITORY" --label stale --state open --limit 1000 \
               --json number,isDraft,assignees,milestone,labels \
               --jq '.[] | select(.isDraft or (.assignees | length > 0) or .milestone != null
