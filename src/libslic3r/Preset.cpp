@@ -3193,6 +3193,12 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
             }
             return nullptr;
         }, &keys);
+    // A compatibility key the project has no value for is not applied over the existing preset: the
+    // preset keeps the restriction it already carries - its own list or its parent's - instead of the
+    // project's empty stand-in. A key the project owns stays in "keys", so the list it recorded is
+    // applied below.
+    for (const std::string &key : projectless_compat_keys)
+        keys.erase(std::remove(keys.begin(), keys.end(), key), keys.end());
     std::string                 &inherits = Preset::inherits(cfg);
 
 

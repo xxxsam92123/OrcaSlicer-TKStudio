@@ -392,6 +392,18 @@ TEST_CASE("Printer extruder count tolerates missing nozzle diameter", "[Preset][
     CHECK(bundle.get_printer_extruder_count() == 2);
 }
 
+TEST_CASE("A preset bundle builds its full config before its presets load", "[Preset][Bundle][Regression]")
+{
+    PresetBundle bundle;
+    REQUIRE(bundle.filament_presets.empty());
+    bundle.filaments.get_edited_preset().config.set_key_value("filament_type", new ConfigOptionStrings({ "PETG" }));
+
+    const DynamicPrintConfig config = bundle.full_config();
+
+    REQUIRE(config.has("filament_type"));
+    CHECK(config.option<ConfigOptionStrings>("filament_type")->values == std::vector<std::string>{ "PETG" });
+}
+
 // A per-variant key that no profile in the chain sets keeps the length of the one-nozzle root. The
 // inherited printer must still have a value for every variant in its own variant list.
 TEST_CASE("An inherited printer's per-variant values cover every variant it lists", "[Preset][Bundle][Regression]")
@@ -1263,6 +1275,41 @@ TEST_CASE("A project filament storing one value for a per-variant key applies it
     REQUIRE(loaded != nullptr);
     CHECK(loaded->config.option<ConfigOptionStrings>("adaptive_pressure_advance_model")->values == std::vector<std::string>{model, model});
     check_double_vector(loaded->config.option<ConfigOptionFloats>("pressure_advance")->values, {0.016, 0.016});
+}
+
+TEST_CASE("A project's edited filament keeps the preset's compatible printers and processes", "[Preset][Bundle][Regression]")
+{
+    enum class Load { FirstSlotSelected, FirstSlotParentSelected, LaterSlotEmbedded, LaterSlotCopied };
+    const Load load = GENERATE(Load::FirstSlotSelected, Load::FirstSlotParentSelected, Load::LaterSlotEmbedded, Load::LaterSlotCopied);
+    CAPTURE(load);
+    const bool first_slot = load == Load::FirstSlotSelected || load == Load::FirstSlotParentSelected;
+    // For FirstSlotParentSelected only the parent the project inherits from is loaded, so it is the one selected.
+    const std::string preset_name = load == Load::FirstSlotParentSelected ? "Parent PLA" : "My PLA";
+    PresetCollection filaments(Preset::TYPE_FILAMENT, Preset::filament_options(),
+                               static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
+    Preset &user = add_inmemory_preset(filaments, preset_name);
+    user.is_project_embedded = load == Load::LaterSlotEmbedded;
+    user.config.option<ConfigOptionStrings>("compatible_printers", true)->values = {"My Printer"};
+    user.config.option<ConfigOptionStrings>("compatible_prints", true)->values   = {"My Process"};
+    user.config.option<ConfigOptionInts>("nozzle_temperature", true)->values     = {210};
+
+    DynamicPrintConfig project(user.config);
+    project.option<ConfigOptionStrings>("compatible_printers")->values.clear();
+    project.option<ConfigOptionStrings>("compatible_prints")->values.clear();
+    project.option<ConfigOptionInts>("nozzle_temperature")->values = {225};
+    if (load == Load::FirstSlotParentSelected)
+        project.option<ConfigOptionString>(BBL_JSON_KEY_INHERITS)->value = preset_name;
+
+    const Preset *loaded = filaments.load_external_preset("test.3mf", "test.3mf", "My PLA", project, {},
+                                                          first_slot ? PresetCollection::LoadAndSelect::Always :
+                                                                       PresetCollection::LoadAndSelect::OnlyIfModified).first;
+    REQUIRE(loaded != nullptr);
+
+    const Preset &result = first_slot ? filaments.get_edited_preset() : *loaded;
+    REQUIRE(result.name == (load == Load::LaterSlotCopied ? "My PLA(test.3mf)" : preset_name));
+    CHECK(result.config.option<ConfigOptionInts>("nozzle_temperature")->values == std::vector<int>{225});
+    CHECK(result.config.option<ConfigOptionStrings>("compatible_printers")->values == std::vector<std::string>{"My Printer"});
+    CHECK(result.config.option<ConfigOptionStrings>("compatible_prints")->values == std::vector<std::string>{"My Process"});
 }
 
 TEST_CASE("Repeated loads of a user preset directory produce the same presets", "[Preset][Bundle]")
@@ -7520,6 +7567,47 @@ TEST_CASE("Loading a project applies the compatibility lists the project recorde
     const Preset *stored = bundle.filaments.find_preset("Child ABS", false, true);
     REQUIRE(stored != nullptr);
     CHECK(stored->config.option<ConfigOptionStrings>("compatible_printers")->values == std::vector<std::string>{ "Parent Printer" });
+}
+
+// The two compatibility lists are owned independently: recording one must not make the reader
+// replace the other with the project's empty stand-in.
+TEST_CASE("A project that records one compatibility list keeps the other preset list", "[Preset][Bundle]")
+{
+    PresetBundle bundle;
+
+    Preset &parent = add_inmemory_preset(bundle.filaments, "Parent ABS");
+    parent.config.option<ConfigOptionStrings>("compatible_printers", true)->values = { "Parent Printer" };
+    parent.config.option<ConfigOptionStrings>("compatible_prints", true)->values   = { "Parent Print" };
+
+    Preset &child = add_inmemory_preset(bundle.filaments, "Child ABS", "Parent ABS");
+    child.config.option<ConfigOptionStrings>("compatible_printers", true)->values = { "Parent Printer" };
+    child.config.option<ConfigOptionStrings>("compatible_prints", true)->values   = { "Parent Print" };
+    bundle.filament_presets = { "Child ABS" };
+
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.opt<ConfigOptionFloats>("filament_diameter")->values             = { 1.75 };
+    config.opt<ConfigOptionInts>("filament_self_index")->values             = { 1 };
+    config.opt<ConfigOptionStrings>("filament_extruder_variant")->values    = { "Direct Drive Standard" };
+    config.opt<ConfigOptionStrings>("filament_colour")->values              = { "#FF0000" };
+    config.opt<ConfigOptionStrings>("filament_type")->values                = { "ABS" };
+    config.option<ConfigOptionString>("print_settings_id", true)->value     = "Project Print";
+    config.option<ConfigOptionString>("printer_settings_id", true)->value   = "Project Printer";
+    config.option<ConfigOptionStrings>("filament_settings_id", true)->values = { "Child ABS" };
+    config.option<ConfigOptionStrings>("inherits_group", true)->values      = { "", "Parent ABS", "" };
+    config.option<ConfigOptionStrings>("filament_compatible_printers", true)->values =
+        { "\"Parent Printer\";\"Printer B\"" };
+    config.option<ConfigOptionStrings>("different_settings_to_system", true)->values = { "", "", "" };
+
+    bundle.load_config_model("test.3mf", std::move(config));
+
+    const Preset &edited = bundle.filaments.get_edited_preset();
+    REQUIRE(edited.name == "Child ABS");
+    REQUIRE(edited.config.option<ConfigOptionStrings>("compatible_printers") != nullptr);
+    CHECK(edited.config.option<ConfigOptionStrings>("compatible_printers")->values ==
+          std::vector<std::string>{ "Parent Printer", "Printer B" });
+    REQUIRE(edited.config.option<ConfigOptionStrings>("compatible_prints") != nullptr);
+    CHECK(edited.config.option<ConfigOptionStrings>("compatible_prints")->values ==
+          std::vector<std::string>{ "Parent Print" });
 }
 
 // A project that records no list for a filament ("All" in the Dependencies tab) makes the project the owner

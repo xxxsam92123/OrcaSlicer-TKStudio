@@ -1931,8 +1931,7 @@ void InputIpAddressDialog::on_ok(wxMouseEvent& evt)
         std::string port;
         Http::get_host_from_url(str_ip, &port);
         config.opt_string("print_host") = str_ip;
-        if (!port.empty())
-            config.opt_string("printhost_port") = port;
+        config.opt_string("printhost_port") = port;
         if (!is_bbl_agent() && Http::ca_file_supported())
             config.opt_string("printhost_cafile") = m_input_cafile->GetValue().ToStdString();
     }
@@ -2251,7 +2250,7 @@ void InputIpAddressDialog::on_text(wxCommandEvent &evt)
     m_button_ok->Enable(enable_btns);
 
     if (current_input_index == 1)
-        m_button_ok->Enable(!str_name.IsEmpty() && str_sn.length() == 15);
+        m_button_ok->Enable(!str_name.IsEmpty() && (str_sn.length() == 15 || str_sn.length() == 18)); // A2L serials have 18 characters
 
 }
 
