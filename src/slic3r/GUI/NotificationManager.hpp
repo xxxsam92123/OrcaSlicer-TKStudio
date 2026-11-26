@@ -198,7 +198,6 @@ enum class NotificationType
     // Active preset references a capability the installed+loaded plugin does not provide (outdated
     // plugin). Informational; cannot be auto-resolved; persistent, blocks slicing.
     OrcaPluginCapabilityUnavailableError,
-    RemoteAPIChange,
     // One aggregate notice that installed OrcaCloud plugins have updates. "More" opens the
     // Plugins dialog, where the updates can be installed.
     OrcaCloudPluginUpdateAvailable,

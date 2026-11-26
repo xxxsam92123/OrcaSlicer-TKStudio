@@ -1,6 +1,5 @@
 //#include "slic3r/Utils/Serial.hpp"
 #include "Tab.hpp"
-#include "RemoteAPI/RemoteAPIController.hpp"
 #include "PresetHints.hpp"
 #include "libslic3r/IMEXHelpers.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -1608,7 +1607,6 @@ void Tab::on_roll_back_value(const bool to_sys /*= true*/)
 // comparing the selected preset config with $self->{config}.
 void Tab::update_dirty()
 {
-    RemoteAPI::Controller::notify_config_changed(static_cast<int>(m_type));
     if (m_postpone_update_ui)
         return;
 

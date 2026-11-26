@@ -82,7 +82,6 @@
 #include "slic3r/Utils/NetworkAgent.hpp"
 #include "NetworkPluginDialog.hpp"
 #include "DownloadProgressDialog.hpp"
-#include "RemoteAPI/RemoteAPIConfig.hpp"
 
 #ifdef __WINDOWS__
 #ifdef _MSW_DARK_MODE
@@ -2571,8 +2570,6 @@ void PreferencesDialog::create_items()
     g_sizer->AddSpacer(FromDIP(10));
     sizer_page->Add(g_sizer, 0, wxEXPAND);
 
-    create_remote_api_page(sizer_page, v_gap);
-
     /////////////////////////////////////
     //////////////////////////
 
@@ -2735,96 +2732,6 @@ wxBoxSizer* PreferencesDialog::create_debug_page()
     bSizer->Add(debug_button, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, FromDIP(15));
 
     return bSizer;
-}
-
-void PreferencesDialog::create_remote_api_page(wxBoxSizer* sizer_page, int v_gap)
-{
-    m_pref_tabs->AppendItem(_L("Remote API"));
-    f_sizers.push_back(new wxFlexGridSizer(1, 1, v_gap, 0));
-    auto* g_sizer = f_sizers.back();
-    g_sizer->AddGrowableCol(0, 1);
-
-    g_sizer->Add(create_item_title(_L("Remote Control API")), 1, wxEXPAND);
-    g_sizer->Add(create_item_checkbox(
-        _L("Enable Remote API"),
-        _L("Allow external tools, including MCP clients, to read and change slicer settings and trigger slicing."),
-        "remote_api_enabled"));
-
-    g_sizer->Add(create_item_checkbox(
-        _L("Notify on API changes"),
-        _L("Show a notification when an external tool changes settings, objects, or presets."),
-        "remote_api_notify"));
-
-    auto port_display = [this]() -> wxString {
-        try {
-            const int port = std::stoi(app_config->get("remote_api_port"));
-            if (port >= 1 && port <= 65535)
-                return wxString::Format("%d", port);
-        } catch (...) {}
-        return wxT("13130");
-    };
-
-    auto* port_sizer = new wxBoxSizer(wxHORIZONTAL);
-    auto* port_title = new wxStaticText(m_parent, wxID_ANY, _L("Port"), wxDefaultPosition, DESIGN_TITLE_SIZE, wxST_NO_AUTORESIZE);
-    port_title->SetForegroundColour(DESIGN_GRAY900_COLOR);
-    port_title->SetFont(::Label::Body_14);
-    port_title->SetToolTip(_L("TCP port for the Remote API (default 13130)"));
-    port_title->Wrap(DESIGN_TITLE_SIZE.x);
-
-    auto* port_input = new ::TextInput(m_parent, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, DESIGN_INPUT_SIZE, wxTE_PROCESS_ENTER);
-    StateColor port_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled),
-                       std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
-    port_input->SetBackgroundColor(port_bg);
-    port_input->SetToolTip(_L("TCP port for the Remote API (default 13130)"));
-    port_input->GetTextCtrl()->SetValidator(wxTextValidator(wxFILTER_DIGITS));
-    port_input->GetTextCtrl()->SetValue(port_display());
-
-    auto commit_port = [this, port_input, port_display]() {
-        long port = 0;
-        if (port_input->GetTextCtrl()->GetValue().ToLong(&port) && port >= 1 && port <= 65535)
-            app_config->set("remote_api_port", std::to_string(static_cast<int>(port)));
-        else
-            port_input->GetTextCtrl()->SetValue(port_display());
-    };
-    port_input->GetTextCtrl()->Bind(wxEVT_TEXT_ENTER, [commit_port](wxCommandEvent& event) { commit_port(); event.Skip(); });
-    port_input->GetTextCtrl()->Bind(wxEVT_KILL_FOCUS, [commit_port](wxFocusEvent& event) { commit_port(); event.Skip(); });
-
-    port_sizer->AddSpacer(FromDIP(DESIGN_LEFT_MARGIN));
-    port_sizer->Add(port_title, 0, wxALIGN_CENTER_VERTICAL);
-    port_sizer->Add(port_input, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(5));
-    g_sizer->Add(port_sizer);
-
-    auto* token_sizer = new wxBoxSizer(wxHORIZONTAL);
-    token_sizer->AddSpacer(FromDIP(DESIGN_LEFT_MARGIN));
-    auto* token_label = new wxStaticText(m_parent, wxID_ANY, _L("API token"), wxDefaultPosition, DESIGN_TITLE_SIZE, wxST_NO_AUTORESIZE);
-    token_label->SetForegroundColour(DESIGN_GRAY900_COLOR);
-    token_label->SetFont(::Label::Body_14);
-    token_label->Wrap(DESIGN_TITLE_SIZE.x);
-
-    auto cfg = RemoteAPI::Config::load();
-    auto* token_value = new wxTextCtrl(m_parent, wxID_ANY, wxString::FromUTF8(cfg.token),
-                                       wxDefaultPosition, wxSize(FromDIP(120), -1), wxTE_READONLY);
-    auto* token_button = new Button(m_parent, _L("Regenerate"));
-    token_button->SetStyle(ButtonStyle::Regular, ButtonType::Parameter);
-    token_button->Bind(wxEVT_BUTTON, [this, token_value](wxCommandEvent&) {
-        const std::string token = RemoteAPI::Config::generate_token();
-        if (token.empty())
-            return;
-        app_config->set("remote_api_token", token);
-        app_config->save();
-        token_value->SetValue(wxString::FromUTF8(token));
-        wxGetApp().stop_remote_api();
-        wxGetApp().start_remote_api();
-    });
-
-    token_sizer->Add(token_label, 0, wxALIGN_CENTER_VERTICAL);
-    token_sizer->Add(token_value, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(5));
-    token_sizer->Add(token_button, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(5));
-    token_sizer->AddSpacer(FromDIP(DESIGN_LEFT_MARGIN));
-    g_sizer->Add(token_sizer, 0, wxEXPAND);
-
-    g_sizer->AddSpacer(FromDIP(10));
-    sizer_page->Add(g_sizer, 0, wxEXPAND);
 }
 
 void PreferencesDialog::UpdateSidebarLayout()

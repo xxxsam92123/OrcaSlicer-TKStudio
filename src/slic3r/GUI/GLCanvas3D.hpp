@@ -1310,10 +1310,6 @@ public:
                                  Camera::ViewAngleType     camera_view_angle_type = Camera::ViewAngleType::Iso,
                                  bool                      for_picking  = false,
                                  bool                      ban_light    = false);
-    bool render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h,
-                                Camera::ViewAngleType camera_view_angle_type, bool frame_object);
-    bool render_gcode_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h,
-                                Camera::ViewAngleType camera_view_angle_type, bool frame_object);
     static void render_thumbnail_internal(ThumbnailData& thumbnail_data, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, ModelObjectPtrs& model_objects,
         const GLVolumeCollection& volumes, std::vector<ColorRGBA>& extruder_colors,
                                           GLShaderProgram *                  shader,
