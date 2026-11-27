@@ -1,5 +1,4 @@
 #include "Plater.hpp"
-#include "RemoteAPI/RemoteAPIController.hpp"
 #include "LazyPage.hpp"
 #include "../Utils/NetworkAgent.hpp"
 #include "IPrinterAgent.hpp"
@@ -10240,8 +10239,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             const bool has_excluded_bodies = amf_assembly && std::any_of(model.objects.begin(), model.objects.end(), [](const ModelObject* object) {
                 return std::any_of(object->instances.begin(), object->instances.end(), [](const ModelInstance* instance) { return !instance->printable; });
             });
-            if (!is_project_file && !has_excluded_bodies && model.looks_like_multipart_object() &&
-                !RemoteAPI::Controller::api_ui_task_active()) {
+            if (!is_project_file && !has_excluded_bodies && model.looks_like_multipart_object()) {
                MessageDialog msg_dlg(q, _L("This file contains several objects positioned at multiple heights.\nInstead of considering them as multiple objects, should the file be loaded as a single object with multiple parts\?") + "\n",
                     _L("Multi-part object detected"), wxICON_WARNING | wxYES | wxNO);
                 if (msg_dlg.ShowModal() == wxID_YES) {
@@ -16806,7 +16804,6 @@ void Plater::load_project(wxString const& filename2,
     sidebar().set_flushing_volume_warning(has_modify);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " load project done";
-    RemoteAPI::Controller::notify_project_opened();
 }
 
 // BBS: save logic

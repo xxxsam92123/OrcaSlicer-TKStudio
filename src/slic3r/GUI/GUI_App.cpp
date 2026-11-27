@@ -6,8 +6,6 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
 #include "libslic3r/Memory.hpp"
-#include "RemoteAPI/RemoteAPIServer.hpp"
-#include "RemoteAPI/RemoteAPIController.hpp"
 #include "GUI_App.hpp"
 #include "BBLTopbar.hpp"
 #include "Shortcuts.hpp"
@@ -1236,7 +1234,6 @@ void GUI_App::post_init()
            }
         }
     }
-    start_remote_api();
     if (m_startup_cloud_report)
         std::exchange(m_startup_cloud_report, nullptr)();
 
@@ -1272,7 +1269,6 @@ GUI_App::GUI_App()
     , m_http_server(std::make_unique<HttpServer>())
     , m_action_registry(std::make_unique<ActionRegistry>())
 {
-	m_remote_api_server = std::make_unique<RemoteAPI::Server>();
 	//app config initializes early becasuse it is used in instance checking in OrcaSlicer.cpp
     this->init_app_config();
     m_shortcuts = std::make_unique<ShortcutRegistry>();
@@ -1299,8 +1295,6 @@ void GUI_App::shutdown()
 	if (m_removable_drive_manager) {
 		removable_drive_manager()->shutdown();
 	}
-	if (!m_is_recreating_gui)
-		stop_remote_api();
 
     // destroy login dialog
     if (login_dlg != nullptr) {
@@ -5110,9 +5104,6 @@ void GUI_App::recreate_GUI(const wxString &msg_name)
 
     update_publish_status();
 
-    if (m_remote_api_controller)
-        m_remote_api_controller->bind_plater_events();
-
     m_is_recreating_gui = false;
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "recreate_GUI exit";
@@ -8475,32 +8466,6 @@ void GUI_App::start_http_server(const std::string& provider)
         m_http_server->start();
 }
 
-RemoteAPI::Server& GUI_App::remote_api_server()
-{
-    return *m_remote_api_server;
-}
-
-void GUI_App::start_remote_api()
-{
-    const RemoteAPI::Config cfg = RemoteAPI::Config::load();
-    if (!cfg.enabled)
-        return;
-
-    if (!m_remote_api_controller)
-        m_remote_api_controller = std::make_unique<RemoteAPI::Controller>();
-    m_remote_api_controller->bind_plater_events();
-    m_remote_api_server->set_handler([this](const RemoteAPI::Request& req) {
-        return m_remote_api_controller->dispatch(req);
-    });
-    m_remote_api_server->start(cfg);
-}
-
-void GUI_App::stop_remote_api()
-{
-    if (m_remote_api_server)
-        m_remote_api_server->stop();
-}
-
 void GUI_App::start_http_server(int port, const std::string& provider)
 {
     if (port <= 0) {
@@ -9278,8 +9243,6 @@ void GUI_App::open_preferences(PreferencesTab tab, const std::string& highlight_
         PreferencesDialog dlg(mainframe);
         dlg.select_tab(tab, highlight_option);
         dlg.ShowModal();
-        stop_remote_api();
-        start_remote_api();
         need_recreate_gui = dlg.recreate_GUI();
         pending_language = dlg.pending_language();
         if (!need_recreate_gui) {

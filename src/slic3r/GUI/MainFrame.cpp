@@ -1,5 +1,4 @@
 #include "MainFrame.hpp"
-#include "RemoteAPI/RemoteAPIController.hpp"
 #include "slic3r/plugin/host/PluginPages.hpp"
 
 #include <wx/event.h>
@@ -793,20 +792,9 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
                 wxPostEvent(this, wxCommandEvent(EVT_BACKUP_POST));
             }
             else if (action == 1) {
-                if (RemoteAPI::Controller::api_ui_task_active()) {
-                    Slic3r::backup_soon();
-                    return;
-                }
                 if (!m_plater->up_to_date(false, true)) {
-                    RemoteAPI::Controller::set_backup_in_progress(true);
-                    try {
-                        m_plater->export_3mf(m_plater->model().get_backup_path() + "/.3mf", SaveStrategy::Backup);
-                        m_plater->up_to_date(true, true);
-                    } catch (...) {
-                        RemoteAPI::Controller::set_backup_in_progress(false);
-                        throw;
-                    }
-                    RemoteAPI::Controller::set_backup_in_progress(false);
+                    m_plater->export_3mf(m_plater->model().get_backup_path() + "/.3mf", SaveStrategy::Backup);
+                    m_plater->up_to_date(true, true);
                 }
             }
          });
