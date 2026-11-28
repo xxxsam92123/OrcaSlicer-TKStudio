@@ -2083,6 +2083,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionInts,               textured_plate_temp_initial_layer))
     ((ConfigOptionBools,              enable_overhang_bridge_fan))
     ((ConfigOptionInts,               overhang_fan_speed))
+    ((ConfigOptionInts,               external_bridge_fan_speed)) // ORCA: per-filament fan speed for external bridges only
     ((ConfigOptionEnumsGeneric,       overhang_fan_threshold))
     ((ConfigOptionEnum<PrintSequence>,print_sequence))
     ((ConfigOptionEnum<PrintOrder>,   print_order))

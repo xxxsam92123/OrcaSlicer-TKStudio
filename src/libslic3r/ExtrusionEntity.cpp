@@ -300,6 +300,11 @@ void ExtrusionLoop::split_at(const Point &point, bool prefer_non_overhang, const
     ExtrusionPath p1(path.role(), path.mm3_per_mm, path.width, path.height);
     ExtrusionPath p2(path.role(), path.mm3_per_mm, path.width, path.height);
     p1.z_contoured = p2.z_contoured = path.z_contoured;
+    // ORCA: the fresh sub-paths are not copies, so the provenance key has to be handed over
+    // explicitly. Both halves keep the same key; the consumer re-projects the emitted sub-move
+    // onto the canonical span and refuses whatever it cannot certify, so one key on two halves
+    // is never a claim about the whole original span.
+    p1.wall_span_key = p2.wall_span_key = path.wall_span_key;
     path.polyline.split_at(p, &p1.polyline, &p2.polyline);
 
     if (this->paths.size() == 1) {

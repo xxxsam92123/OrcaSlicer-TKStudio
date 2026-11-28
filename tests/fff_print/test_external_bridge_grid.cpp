@@ -3,7 +3,9 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <set>
+#include <string>
 #include <utility>
 
 #include "libslic3r/BoundingBox.hpp"
@@ -11,6 +13,7 @@
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/ExternalBridgeGrid.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/libslic3r.h"
@@ -598,4 +601,276 @@ TEST_CASE("Internal bridge overlap is isolated from external bridge overlap", "[
         }
         REQUIRE(found_internal_bridge);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// External bridge grid shared walls and the external bridge fan
+//
+// The wall shared by two bridge cells is a real erOverhangPerimeter path, the role a bridge's own
+// overhang wall carries, so a fan rule written against the role alone cannot tell them apart. The
+// public proof of where such a path comes from is ExtrusionEntityCollection::external_bridge_grid_wall,
+// the flag the fill step sets on the batch it builds from the splitter's cell boundaries (Fill.cpp).
+// With wall_loops = 0 no perimeter is generated at all, so that flagged batch is the only source of
+// erOverhangPerimeter inside the fills, and the two kinds of wall become separable without guessing
+// from geometry. The external bridge fan has to take the bridge infill over and leave these shared
+// walls on the overhang fan they have always printed at.
+namespace {
+
+// One resolved print, both sides of the claim: what the fills hold (the source identity of the
+// walls) and what the export prints (the role and fan of every depositing move), restricted to the
+// layers that actually carry both roles.
+struct GridWallFanRun
+{
+    size_t grid_wall_collections = 0;   // collections flagged external_bridge_grid_wall
+    size_t grid_wall_paths       = 0;   // erOverhangPerimeter paths inside such a collection
+    size_t other_overhang_paths  = 0;   // erOverhangPerimeter paths outside every such collection
+    size_t bridge_paths          = 0;   // erBridgeInfill fill paths
+    size_t regions_with_both     = 0;   // regions whose fills hold both of the above
+    size_t bridge_moves          = 0;   // printed bridge infill moves on a shared layer
+    size_t wall_moves            = 0;   // printed grid wall moves on a shared layer
+    std::vector<int>       bridge_fans;
+    std::vector<int>       wall_fans;
+    std::set<unsigned int> shared_layers;
+};
+
+static void grid_wall_add_fan(std::vector<int> &fans, int fan)
+{
+    if (std::find(fans.begin(), fans.end(), fan) == fans.end())
+        fans.push_back(fan);
+}
+
+// Visit every leaf extrusion path below `entity`, telling the visitor whether it sits inside a
+// collection the fill step flagged as an external bridge grid wall.
+template<typename Visitor>
+static void visit_grid_paths(const ExtrusionEntity *entity, bool inside_grid_wall, Visitor &visitor)
+{
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity)) {
+        const bool flagged = inside_grid_wall || collection->external_bridge_grid_wall;
+        for (const ExtrusionEntity *child : collection->entities)
+            visit_grid_paths(child, flagged, visitor);
+        return;
+    }
+    if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+        visitor(*path, inside_grid_wall);
+        return;
+    }
+    if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(entity)) {
+        for (const ExtrusionPath &path : multi->paths)
+            visitor(path, inside_grid_wall);
+        return;
+    }
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity)) {
+        for (const ExtrusionPath &path : loop->paths)
+            visitor(path, inside_grid_wall);
+    }
+}
+
+// Slice `bridge_with_hole` on the grid fixture the other grid cases use, read the fills of every
+// layer region and then export, so the same source entities are checked on both sides.
+static GridWallFanRun grid_wall_fan_run(const DynamicPrintConfig &config)
+{
+    Print print;
+    TriangleMesh model_mesh = Test::mesh(Test::TestMesh::bridge_with_hole);
+    model_mesh.scale(Vec3f(1.f, 2.f, 1.f));
+    Test::init_and_process_print({ std::move(model_mesh) }, print, config);
+
+    GridWallFanRun run;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        for (const LayerRegion *region : layer->regions()) {
+            for (const ExtrusionEntity *entity : region->fills.entities) {
+                const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity);
+                if (collection == nullptr || ! collection->external_bridge_grid_wall)
+                    continue;
+                ++run.grid_wall_collections;
+                // The flag is a claim about the role: it must mark overhang-perimeter paths, and it
+                // must mark at least one.
+                REQUIRE(collection->role() == erOverhangPerimeter);
+                REQUIRE(! collection->entities.empty());
+            }
+
+            size_t region_grid_walls   = 0;
+            size_t region_bridge_paths = 0;
+            const auto account = [&run, &region_grid_walls, &region_bridge_paths](const ExtrusionPath &path, bool inside_grid_wall) {
+                if (path.role() == erOverhangPerimeter) {
+                    if (inside_grid_wall) {
+                        ++run.grid_wall_paths;
+                        ++region_grid_walls;
+                    } else {
+                        ++run.other_overhang_paths;
+                    }
+                } else if (path.role() == erBridgeInfill) {
+                    ++run.bridge_paths;
+                    ++region_bridge_paths;
+                }
+            };
+            for (const ExtrusionEntity *entity : region->fills.entities)
+                visit_grid_paths(entity, false, account);
+            // No ordinary wall can contribute to the same-role fan readings in this zero-wall fixture.
+            REQUIRE(region->perimeters.entities.empty());
+            if (region_grid_walls > 0 && region_bridge_paths > 0)
+                ++run.regions_with_both;
+        }
+    }
+
+    GCodeProcessorResult result;
+    Test::gcode(print, &result);
+
+    // Group the printed moves by layer, so a bridge and a wall only count when they really share a
+    // layer of this print.
+    std::map<unsigned int, std::vector<int>> bridge_fans_by_layer;
+    std::map<unsigned int, std::vector<int>> wall_fans_by_layer;
+    for (const GCodeProcessorResult::MoveVertex &move : result.moves) {
+        if (move.type != EMoveType::Extrude)
+            continue;
+        // M106 addresses the fan in whole percents and the Preview turns them back into a
+        // percentage, so rounding recovers exactly the percentage the slicer commanded.
+        const int fan = int(std::lround(move.fan_speed));
+        if (move.extrusion_role == erBridgeInfill)
+            bridge_fans_by_layer[move.layer_id].push_back(fan);
+        else if (move.extrusion_role == erOverhangPerimeter)
+            wall_fans_by_layer[move.layer_id].push_back(fan);
+    }
+    for (const auto &bridge_layer : bridge_fans_by_layer) {
+        const auto wall_layer = wall_fans_by_layer.find(bridge_layer.first);
+        if (wall_layer == wall_fans_by_layer.end())
+            continue;
+        run.shared_layers.insert(bridge_layer.first);
+        for (const int fan : bridge_layer.second) {
+            ++run.bridge_moves;
+            grid_wall_add_fan(run.bridge_fans, fan);
+        }
+        for (const int fan : wall_layer->second) {
+            ++run.wall_moves;
+            grid_wall_add_fan(run.wall_fans, fan);
+        }
+    }
+    std::sort(run.bridge_fans.begin(), run.bridge_fans.end());
+    std::sort(run.wall_fans.begin(), run.wall_fans.end());
+    return run;
+}
+
+// The cooling a grid wall case starts from: a flat 60% layer fan, the overhang fan at 100% with a
+// threshold that is really on, and kick-start, speed-up and the PWM floor off, so a move prints at
+// exactly the percentage the slicer decided and 100% is the plain overhang value.
+static DynamicPrintConfig grid_wall_fan_config(int external_bridge_fan_speed, bool grid_enabled = true)
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({
+        { "close_fan_the_first_x_layers",    0 },
+        { "enable_arc_fitting",              "disabled" },
+        // The switch the overhang fan and the external bridge fan both answer to.
+        { "enable_overhang_bridge_fan",      true },
+        { "external_bridge_fan_speed",       external_bridge_fan_speed },
+        { "external_bridge_grid_enable",     grid_enabled ? "1" : "0" },
+        { "external_bridge_grid_cells_x",    "2" },
+        { "external_bridge_grid_cells_y",    "2" },
+        { "external_bridge_grid_angle_step", "15" },
+        // No layer-time interpolation: both ends of the fan curve are 60%.
+        { "fan_cooling_layer_time",          1000. },
+        { "fan_kickstart",                   0. },
+        { "fan_max_speed",                   60. },
+        { "fan_min_speed",                   60. },
+        { "fan_speedup_time",                0. },
+        { "full_fan_speed_layer",            0 },
+        { "initial_layer_fan_speed",         -1 },
+        { "overhang_fan_speed",              100 },
+        { "overhang_fan_threshold",          "10%" },
+        { "part_cooling_fan_min_pwm",        0 },
+        { "slow_down_for_layer_cooling",     false },
+        { "slow_down_layer_time",            0. },
+        // No perimeter walls at all, so a grid wall batch is the only overhang-perimeter source.
+        { "wall_loops",                      0 },
+    });
+    return config;
+}
+
+static std::string grid_wall_fan_list(const std::vector<int> &fans)
+{
+    std::string text;
+    for (const int fan : fans)
+        text += (text.empty() ? "" : ",") + std::to_string(fan);
+    return text;
+}
+
+} // namespace
+
+TEST_CASE("External bridge grid shared walls keep the overhang fan when external bridges take one",
+          "[ExternalBridgeGrid][ExternalBridgeFan]")
+{
+    // Without the key the two runs would slice identically and compare equal for the wrong reason.
+    REQUIRE(print_config_def.has("external_bridge_fan_speed"));
+
+    const DynamicPrintConfig inherited_config  = grid_wall_fan_config(-1);
+    const DynamicPrintConfig explicit_30_config = grid_wall_fan_config(30);
+    const DynamicPrintConfig explicit_0_config  = grid_wall_fan_config(0);
+
+    // Pin the values the expected fans are derived from: a 60% layer fan over a switched-on
+    // overhang fan of 100% that a real threshold cannot suppress, and no perimeter walls.
+    REQUIRE(inherited_config.opt<ConfigOptionFloats>("fan_min_speed")->get_at(0) == Catch::Approx(60.));
+    REQUIRE(inherited_config.opt<ConfigOptionFloats>("fan_max_speed")->get_at(0) == Catch::Approx(60.));
+    REQUIRE(inherited_config.opt<ConfigOptionInts>("overhang_fan_speed")->get_at(0) == 100);
+    REQUIRE(inherited_config.opt<ConfigOptionBools>("enable_overhang_bridge_fan")->get_at(0));
+    REQUIRE(inherited_config.opt<ConfigOptionInts>("overhang_fan_threshold")->get_at(0) == int(Overhang_threshold_1_4));
+    REQUIRE(inherited_config.opt<ConfigOptionInt>("wall_loops")->value == 0);
+    REQUIRE(inherited_config.opt<ConfigOptionInts>("external_bridge_fan_speed")->get_at(0) == -1);
+    REQUIRE(explicit_30_config.opt<ConfigOptionInts>("external_bridge_fan_speed")->get_at(0) == 30);
+    REQUIRE(explicit_0_config.opt<ConfigOptionInts>("external_bridge_fan_speed")->get_at(0) == 0);
+
+    const GridWallFanRun inherited   = grid_wall_fan_run(inherited_config);
+    const GridWallFanRun explicit_30 = grid_wall_fan_run(explicit_30_config);
+    const GridWallFanRun explicit_0  = grid_wall_fan_run(explicit_0_config);
+
+    const std::array<const GridWallFanRun *, 3> runs { &inherited, &explicit_30, &explicit_0 };
+    for (const GridWallFanRun *run : runs) {
+        INFO("grid walls " << run->grid_wall_paths << " in " << run->grid_wall_collections
+                           << " flagged collections, " << run->other_overhang_paths << " other overhang paths, "
+                           << run->bridge_paths << " bridge paths, " << run->wall_moves << " printed wall moves, "
+                           << run->bridge_moves << " printed bridge moves, on " << run->shared_layers.size() << " shared layer(s)");
+        // The fills prove the identity: every overhang-perimeter path of this print comes from a
+        // collection the fill step flagged as a grid wall, and a bridge infill sits in the same region.
+        REQUIRE(run->grid_wall_collections > 0);
+        REQUIRE(run->grid_wall_paths > 0);
+        REQUIRE(run->other_overhang_paths == 0);
+        REQUIRE(run->bridge_paths > 0);
+        REQUIRE(run->regions_with_both > 0);
+        // The export proves both roles really print, on one shared layer.
+        REQUIRE(run->shared_layers.size() > 0);
+        REQUIRE(run->wall_moves > 0);
+        REQUIRE(run->bridge_moves > 0);
+    }
+
+    INFO("inherited bridge " << grid_wall_fan_list(inherited.bridge_fans) << " walls " << grid_wall_fan_list(inherited.wall_fans));
+    INFO("explicit 30 bridge " << grid_wall_fan_list(explicit_30.bridge_fans) << " walls " << grid_wall_fan_list(explicit_30.wall_fans));
+    INFO("explicit 0 bridge " << grid_wall_fan_list(explicit_0.bridge_fans) << " walls " << grid_wall_fan_list(explicit_0.wall_fans));
+
+    // The baseline keeps the old behaviour for both: the bridge infill and the grid walls print at
+    // the overhang fan speed.
+    REQUIRE(inherited.bridge_fans == std::vector<int> { 100 });
+    REQUIRE(inherited.wall_fans == std::vector<int> { 100 });
+
+    // An explicit value takes the bridge infill over, and only the bridge infill: the grid shared
+    // walls stay on the overhang fan their erOverhangPerimeter role has always printed at.
+    REQUIRE(explicit_30.bridge_fans == std::vector<int> { 30 });
+    REQUIRE(explicit_30.wall_fans == std::vector<int> { 100 });
+    REQUIRE(explicit_0.bridge_fans == std::vector<int> { 0 });
+    REQUIRE(explicit_0.wall_fans == std::vector<int> { 100 });
+
+    // Same source entities, and only the bridge's fan moved: a takeover that also dropped or added
+    // moves would show up in the counts or the layers.
+    CHECK(explicit_30.wall_moves == inherited.wall_moves);
+    CHECK(explicit_0.wall_moves == inherited.wall_moves);
+    CHECK(explicit_30.bridge_moves == inherited.bridge_moves);
+    CHECK(explicit_0.bridge_moves == inherited.bridge_moves);
+    CHECK(explicit_30.shared_layers == inherited.shared_layers);
+    CHECK(explicit_0.shared_layers == inherited.shared_layers);
+    CHECK(explicit_30.wall_fans == inherited.wall_fans);
+    CHECK(explicit_0.wall_fans == inherited.wall_fans);
+
+    // Without the grid the same fill pipeline emits no overhang-perimeter path at all, which is what
+    // makes the flagged batch the sole source of the role asserted above.
+    const GridWallFanRun without_grid = grid_wall_fan_run(grid_wall_fan_config(-1, false));
+    REQUIRE(without_grid.grid_wall_collections == 0);
+    REQUIRE(without_grid.grid_wall_paths == 0);
+    REQUIRE(without_grid.other_overhang_paths == 0);
+    REQUIRE(without_grid.bridge_paths > 0);
 }

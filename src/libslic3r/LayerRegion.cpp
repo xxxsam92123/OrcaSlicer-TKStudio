@@ -169,6 +169,12 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         g.upper_slices_same_region = &this->layer()->upper_layer->get_region(region_id)->slices;
 
     g.layer_id              = (int)this->layer()->id();
+    // ORCA: observational external bridge seam provenance target (metadata only). The walls of a
+    // merged group are emitted by this region, so this is the region the G-code consumer sees; the
+    // id recorded here is the very same PrintRegion::print_region_id() the emitter passes to
+    // ExternalBridgeSeams::contains(), and the consumer rejects a record whose id differs.
+    g.seam_layer            = this->layer();
+    g.seam_region_id        = this->region().print_region_id();
     g.ext_perimeter_flow    = this->flow(frExternalPerimeter);
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);

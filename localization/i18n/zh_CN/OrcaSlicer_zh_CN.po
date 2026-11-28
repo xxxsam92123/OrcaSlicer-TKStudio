@@ -16633,18 +16633,41 @@ msgstr "悬垂/桥接强制冷却"
 msgid "Enable this option to allow adjustment of the part cooling fan speed for specifically for overhangs, internal and external bridges. Setting the fan speed specifically for these features can improve overall print quality and reduce warping."
 msgstr "启用此选项以允许单独针对悬垂、内部桥接和外部桥接调整部件冷却风扇的速度。针对这些特性设置风扇速度可以提高整体打印质量并减少翘曲。"
 
-msgid "Overhangs and external bridges fan speed"
-msgstr "悬垂和外部桥接风扇速度"
+msgid "Overhangs fan speed"
+msgstr "悬垂风扇速度"
 
 # AI Translated
 msgid ""
-"Use this part cooling fan speed when printing bridges or overhang walls with an overhang threshold that exceeds the value set in the 'Overhangs cooling threshold' parameter above. Increasing the cooling specifically for overhangs and bridges can improve the overall print quality of these features.\n"
+"Use this part cooling fan speed when printing overhang walls with an overhang threshold that exceeds the value set in the 'Overhangs cooling threshold' parameter above. Increasing the cooling specifically for overhangs can improve the overall print quality of these features.\n"
 "\n"
-"Please note, this fan speed is clamped on the lower end by the minimum fan speed threshold set above. It is also adjusted upwards up to the maximum fan speed threshold when the minimum layer time threshold is not met."
+"Please note, this fan speed is clamped on the lower end by the minimum fan speed threshold set above. It is also adjusted upwards up to the maximum fan speed threshold when the minimum layer time threshold is not met.\n"
+"\n"
+"External bridges follow this fan speed too, unless 'External bridges fan speed' is set."
 msgstr ""
-"当打印桥接结构或悬垂墙时，如果悬垂程度超过上述“悬垂冷却激活阈值”所设定的值，则使用此部件冷却风扇速度。专门针对悬垂和桥接加大冷却力度，有助于提升这些特征整体的打印质量。\n"
+"当打印悬垂墙时，如果悬垂程度超过上述“悬垂冷却激活阈值”所设定的值，则使用此部件冷却风扇速度。专门针对悬垂加大冷却力度，有助于提升这些特征整体的打印质量。\n"
 "\n"
-"请注意，此风扇速度的下限受前面设置的最小风扇速度阈值限制；当打印层时间未达到最小层时间阈值时，会相应上调至最大风扇速度阈值。"
+"请注意，此风扇速度的下限受前面设置的最小风扇速度阈值限制；当打印层时间未达到最小层时间阈值时，会相应上调至最大风扇速度阈值。\n"
+"\n"
+"未设置“外部桥接风扇速度”时，外部桥接也使用此风扇速度。"
+
+# AI Translated
+# Needs human review: 确认新标签「外部桥接风扇速度」与本地化词汇表一致
+msgid "External bridges fan speed"
+msgstr "外部桥接风扇速度"
+
+# AI Translated
+msgid ""
+"Use this part cooling fan speed for external bridges alone. Unlike the overhang fan speed it is used as it is: a value below the regular fan speed reaches the bridge, and 0 prints the bridge with the part cooling fan off.\n"
+"\n"
+"Set to -1 (the default) to keep cooling external bridges at the overhang fan speed.\n"
+"\n"
+"The same gates apply as for the overhang fan speed: 'Force cooling for overhangs and bridges' off leaves bridges on the regular fan speed, 'No cooling for the first' layers keep the fan off, and a belt printer's band above the belt stays off. While the fan ramps up to 'Full fan speed at layer' the value is ramped with it, but 0 stays 0."
+msgstr ""
+"仅用于外部桥接的部件冷却风扇速度。与悬垂风扇速度不同，此值按原样使用：低于常规风扇速度的值也会作用到桥接，设为 0 则在关闭部件冷却风扇的情况下打印桥接。\n"
+"\n"
+"设置为 -1（默认值）时，外部桥接继续使用悬垂风扇速度。\n"
+"\n"
+"与悬垂风扇速度受相同的限制：关闭“悬垂/桥接强制冷却”后，桥接使用常规风扇速度；冷却被关闭的最初几层中风扇保持关闭；传送带打印机位于传送带上方的层带也保持关闭。风扇逐层升至满速的过程中，此值随同一条曲线升速，但 0 始终保持为 0。"
 
 msgid "Overhang cooling activation threshold"
 msgstr "悬垂冷却激活阈值"
@@ -16652,7 +16675,7 @@ msgstr "悬垂冷却激活阈值"
 # AI Translated
 #, no-c-format, no-boost-format
 msgid "When the overhang exceeds this specified threshold, force the cooling fan to run at the 'Overhang Fan Speed' set below. This threshold is expressed as a percentage, indicating the portion of each line's width that is unsupported by the layer beneath it. Setting this value to 0% forces the cooling fan to run for all outer walls, regardless of the overhang degree."
-msgstr "当悬垂超过此阈值时，强制部件冷却风扇以下方设置的“悬垂和外部桥接风扇速度”运转。该阈值以百分比表示，指每条线宽度中未被下层支撑的比例。设为0%时，无论悬垂程度如何，所有外墙都会强制开启冷却风扇。"
+msgstr "当悬垂超过此阈值时，强制部件冷却风扇以下方设置的“悬垂风扇速度”运转。该阈值以百分比表示，指每条线宽度中未被下层支撑的比例。设为0%时，无论悬垂程度如何，所有外墙都会强制开启冷却风扇。"
 
 msgid "External bridge infill direction"
 msgstr "外部桥接填充方向"

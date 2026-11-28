@@ -269,6 +269,8 @@ set(lisbslic3r_sources
     GCode/ExclusionVolumePathCheck.hpp
     GCode/ExclusionVolumeTravelAvoidance.cpp
     GCode/ExclusionVolumeTravelAvoidance.hpp
+    GCode/ExternalBridgeSeams.cpp
+    GCode/ExternalBridgeSeams.hpp
     GCode/TimelapsePosPicker.cpp
     GCode/TimelapsePosPicker.hpp
     GCode.cpp

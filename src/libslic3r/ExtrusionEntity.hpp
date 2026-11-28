@@ -187,6 +187,15 @@ public:
     float height;
     double smooth_speed = 0;
     bool z_contoured = false;
+    // ORCA: Observational external-bridge-seam provenance. Zero means "no provenance".
+    // A non-zero value is a generation-scoped lookup key, `(generation << 32) | record id`, into
+    // the owning Layer's read-only seam wall span table (Layer::seam_wall_span()). The generation
+    // half makes a key of a previous perimeter pass of the same layer unusable, so a bare per-layer
+    // counter restarting at 1 can never alias another generation. It is value metadata only: it
+    // never changes geometry, roles, flow, overlap or ordering, and it is preserved verbatim across
+    // copy/move/split/reverse so that a downstream consumer can refuse a move it cannot certify.
+    // The layer id and the print region are validated separately against the record.
+    uint64_t wall_span_key = 0;
 
     ExtrusionPath() : mm3_per_mm(-1), width(-1), height(-1), m_role(erNone), m_no_extrusion(false) {}
     ExtrusionPath(ExtrusionRole role) : mm3_per_mm(-1), width(-1), height(-1), m_role(role), m_no_extrusion(false) {}
@@ -201,6 +210,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , wall_span_key(rhs.wall_span_key)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -214,6 +224,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , wall_span_key(rhs.wall_span_key)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -227,6 +238,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , wall_span_key(rhs.wall_span_key)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -240,6 +252,7 @@ public:
         , height(rhs.height)
         , smooth_speed(rhs.smooth_speed)
         , z_contoured(rhs.z_contoured)
+        , wall_span_key(rhs.wall_span_key)
         , m_can_reverse(rhs.m_can_reverse)
         , m_role(rhs.m_role)
         , m_no_extrusion(rhs.m_no_extrusion)
@@ -254,6 +267,7 @@ public:
         this->height = rhs.height;
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
+        this->wall_span_key = rhs.wall_span_key;
         this->overhang_degree = rhs.overhang_degree;
         this->curve_degree = rhs.curve_degree;
         this->polyline = rhs.polyline;
@@ -268,6 +282,7 @@ public:
         this->height = rhs.height;
         this->smooth_speed = rhs.smooth_speed;
         this->z_contoured = rhs.z_contoured;
+        this->wall_span_key = rhs.wall_span_key;
         this->overhang_degree = rhs.overhang_degree;
         this->curve_degree = rhs.curve_degree;
         this->polyline = std::move(rhs.polyline);

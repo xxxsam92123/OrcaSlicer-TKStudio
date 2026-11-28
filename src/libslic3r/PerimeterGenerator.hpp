@@ -128,6 +128,11 @@ public:
 
     bool                                            has_fuzzy_skin = false;
     bool                                            has_fuzzy_hole = false;
+    // ORCA: observational external bridge seam provenance. Set by the owning LayerRegion right
+    // after construction; when left null nothing is recorded. Publishing only writes
+    // ExtrusionPath::wall_span_key and the layer's read-only span table, never geometry.
+    Layer                                          *seam_layer = nullptr;
+    int                                             seam_region_id = -1;
     // Preserve construction order so overlap precedence remains deterministic.
     std::vector<std::pair<FuzzySkinConfig, ExPolygons>> regions_by_fuzzify;
     // Area resting on the layer below, where fuzzy skin is allowed. Unset means no restriction.
@@ -186,7 +191,10 @@ public:
 
 private:
     std::vector<Polygons>     generate_lower_polygons_series(float width);
-    void split_top_surfaces(const ExPolygons &orig_polygons, ExPolygons &top_fills, ExPolygons &non_top_polygons, ExPolygons &fill_clip) const;
+    // ORCA: publish the observational seam provenance of the ordinary overhang walls this generator
+    // just produced into `seam_layer`. Called once at the end of each generation pass.
+    void        publish_overhang_wall_spans();
+    void        split_top_surfaces(const ExPolygons &orig_polygons, ExPolygons &top_fills, ExPolygons &non_top_polygons, ExPolygons &fill_clip) const;
     void apply_extra_perimeters(ExPolygons& infill_area);
     void process_no_bridge(Surfaces& all_surfaces, coord_t perimeter_spacing, coord_t ext_perimeter_width);
 

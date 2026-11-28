@@ -57,6 +57,60 @@ LayerRegion* Layer::add_region(const PrintRegion *print_region)
     return m_regions.back();
 }
 
+// ORCA: external-bridge-seam provenance. Purely a sidecar: nothing here is read by any slicing or
+// printing algorithm, and the whole table is discarded and rebuilt with the perimeter pass.
+void Layer::clear_seam_wall_spans()
+{
+    m_seam_wall_spans.clear();
+    m_next_seam_wall_span_id = 1;
+    m_next_seam_wall_id      = 1;
+    m_seam_stats              = SeamProvenanceStats();
+    // Advancing the generation is what invalidates every key of the previous pass, even when the
+    // new pass publishes nothing at all. 0 is reserved for "no provenance", so skip it on wrap.
+    if (++ m_seam_wall_generation == 0)
+        m_seam_wall_generation = 1;
+}
+
+uint64_t Layer::add_seam_wall_span(SeamWallSpan span)
+{
+    // Never publish a record a consumer could not use: an unknown side or a degenerate line is a
+    // conservative miss, and a miss must never consume a key.
+    if (span.line.points.size() < 2 || span.side == SeamWallSide::Unknown) {
+        ++ m_seam_stats.spans_rejected;
+        return 0;
+    }
+    // Overflow guard: the record id is 32-bit and 0 means "no record", so stop publishing instead of
+    // wrapping onto an existing slot.
+    if (m_next_seam_wall_span_id == 0) {
+        ++ m_seam_stats.spans_rejected;
+        return 0;
+    }
+    // The record carries its own generation, layer and region, so the consumer validates three
+    // independent facts instead of trusting a bare per-layer counter.
+    span.id          = m_next_seam_wall_span_id ++;
+    span.generation  = m_seam_wall_generation;
+    span.layer_id    = int(this->id());
+    m_seam_wall_spans.emplace_back(std::move(span));
+    ++ m_seam_stats.spans_published;
+    return seam_wall_key(m_seam_wall_spans.back().generation, m_seam_wall_spans.back().id);
+}
+
+const SeamWallSpan* Layer::seam_wall_span(uint64_t key) const
+{
+    if (key == 0)
+        return nullptr;
+    const uint32_t generation = uint32_t(key >> 32);
+    const uint32_t id         = uint32_t(key & 0xffffffffu);
+    // A key of a previous generation of this very layer can never resolve, even if its slot number
+    // is still in range: ids restart at 1 on every pass.
+    if (generation == 0 || generation != m_seam_wall_generation || id == 0 ||
+        size_t(id) > m_seam_wall_spans.size())
+        return nullptr;
+    const SeamWallSpan &span = m_seam_wall_spans[size_t(id) - 1];
+    // Records are only appended and ids only grow, so the slot check is the last staleness guard.
+    return span.id == id && span.generation == generation ? &span : nullptr;
+}
+
 // merge all regions' slices to get islands
 void Layer::make_slices()
 {
@@ -390,6 +444,10 @@ static void remove_extrusions_over(ExtrusionEntityCollection &collection, const 
 void Layer::make_perimeters()
 {
     BOOST_LOG_TRIVIAL(trace) << "Generating perimeters for layer " << this->id();
+
+    // ORCA: the seam provenance of a previous generation must not survive into this one, even if
+    // this pass ends up producing no walls at all.
+    this->clear_seam_wall_spans();
 
     const auto clear_generated_extrusions = [](LayerRegion *layer_region) {
         layer_region->perimeters.clear();

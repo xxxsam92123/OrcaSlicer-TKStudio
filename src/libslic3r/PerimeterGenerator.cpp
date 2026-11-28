@@ -135,6 +135,221 @@ static void append_innermost_overhang_boundaries(const ExtrusionEntityCollection
     }
 }
 
+// ORCA: observational external bridge seam provenance.
+//
+// These helpers never change geometry, order, roles, flow or overlap. They only label the
+// ExtrusionPaths of wall runs the generator has already produced and register the matching
+// read-only span records on the layer, while the contour/hole identity and the final ring
+// orientation are still known here. One span is one contiguous run of erOverhangPerimeter paths of
+// one generated loop, so a later certified move can only belong to the wall instance it was
+// generated on - never to a nearby wall of another island or another region.
+//
+// Scope of this producer (do not overstate it):
+//   * Classic generator: supported. The innermost overhang loops are published.
+//   * Arachne generator: only the erOverhangPerimeter paths that live inside an ExtrusionLoop of
+//     the innermost overhang inset are published. Open Arachne fragments (plain ExtrusionPath /
+//     ExtrusionMultiPath output, the `inset_idx < 0` fallback of the boundary helper) have no ring
+//     and therefore no provable single material side. They are deliberately left unkeyed and are
+//     counted in SeamProvenanceStats::open_fragment_paths / unkeyed_overhang_paths. This is a
+//     conservative miss, NOT support: nothing here claims the fan works on Arachne open walls.
+static void collect_innermost_overhang_loops(ExtrusionEntityCollection &collection, int inset_idx,
+                                             std::vector<ExtrusionLoop *> &out)
+{
+    for (ExtrusionEntity *entity : collection.entities) {
+        if (auto *loop = dynamic_cast<ExtrusionLoop *>(entity)) {
+            if (loop->inset_idx == inset_idx && has_overhang_path(*loop))
+                out.push_back(loop);
+        } else if (auto *nested = dynamic_cast<ExtrusionEntityCollection *>(entity)) {
+            collect_innermost_overhang_loops(*nested, inset_idx, out);
+        }
+    }
+}
+
+// Material side of a closed ring relative to its own directed centreline: the material of a contour
+// is inside the ring, the material of a hole outside it. The loop already carries its final printing
+// orientation at this point (wall_direction and overhang_reverse have been applied), so this records
+// the side that is physically printed, not the one the source polygon happened to have.
+static SeamWallSide seam_side_of_ring(bool is_contour, bool is_ccw)
+{
+    return (is_contour == is_ccw) ? SeamWallSide::Left : SeamWallSide::Right;
+}
+
+// One contiguous run of overhang paths of one loop: the canonical line plus the width window and
+// the path index range that carries its key.
+struct SeamRun
+{
+    Polyline line;
+    double   half_min  = std::numeric_limits<double>::max();
+    double   half_max  = 0.0;
+    size_t   path_begin = 0;    // first path index of the run
+    size_t   path_end   = 0;    // one past the last path index of the run
+    bool     closed     = false;
+};
+
+// True when `path` starts exactly where `run` currently ends, i.e. when appending it describes one
+// continuous wall face. When it does not, the run must be cut: the gap between the two paths is not
+// wall and must never become a segment of the canonical line.
+static bool seam_run_continues(const Polyline &run, const Polyline3 &path)
+{
+    if (run.points.empty())
+        return true;
+    if (path.points.empty())
+        return false;
+    return run.points.back() == path.points.front().to_point();
+}
+
+// Appends `path` to `run`, dropping the duplicated junction point. Never invents a point.
+static void append_seam_run_points(Polyline &run, const Polyline3 &path)
+{
+    for (const Point3 &point : path.points) {
+        const Point p = point.to_point();
+        if (! run.points.empty() && run.points.back() == p)
+            continue;
+        run.points.emplace_back(p);
+    }
+}
+
+static void publish_seam_run(Layer &layer, ExtrusionLoop &loop, int region_id, uint32_t wall_id,
+                             bool is_contour, bool ring_closed, SeamWallSide side, SeamRun &run)
+{
+    if (run.line.points.size() < 2 || !(run.half_max > 0.0) || run.path_end <= run.path_begin) {
+        ++ layer.seam_provenance_stats().spans_rejected;
+        return;
+    }
+    SeamWallSpan span;
+    span.diagnostic_wall_id = wall_id;
+    span.print_region_id    = region_id;
+    span.inset_idx          = loop.inset_idx;
+    span.is_contour         = is_contour;
+    // A run whose canonical line returns to its own start has a *circular* parameterisation: its end
+    // parameter is its start parameter and equals the total arc length. Consumers need this flag to
+    // orient a move correctly instead of comparing two projections that are both 0. A run that
+    // covers every path of a closed ring is that ring even when the duplicated closing point was
+    // dropped while appending.
+    const bool line_closed = run.line.points.size() >= 4 && run.line.points.front() == run.line.points.back();
+    span.closed            = line_closed ||
+                             (ring_closed && run.path_begin == 0 && run.path_end >= loop.paths.size());
+    span.side               = side;
+    span.min_half_width     = run.half_min;
+    span.max_half_width     = run.half_max;
+    span.line               = std::move(run.line);
+    const uint64_t key = layer.add_seam_wall_span(std::move(span));
+    if (key != 0)
+        for (size_t i = run.path_begin; i < run.path_end; ++ i)
+            loop.paths[i].wall_span_key = key;
+}
+
+static void publish_loop_seam_spans(Layer &layer, ExtrusionLoop &loop, int region_id)
+{
+    if (loop.paths.empty())
+        return;
+    // elrHole is a bit flag: compare the bit, never the whole mask (elrInternal | elrHole is a hole).
+    const Polygon      ring        = loop.polygon();
+    const bool         is_contour  = (loop.loop_role() & elrHole) == 0;
+    const bool         is_ccw      = ring.is_counter_clockwise();
+    const bool         ring_closed = ring.points.size() >= 4 && ring.points.front() == ring.points.back();
+    const SeamWallSide side        = seam_side_of_ring(is_contour, is_ccw);
+    const uint32_t     wall_id     = layer.next_seam_diagnostic_wall_id();
+
+    SeamRun run;
+    for (size_t i = 0; i <= loop.paths.size(); ++ i) {
+        const ExtrusionPath *path = i < loop.paths.size() ? &loop.paths[i] : nullptr;
+        const bool is_overhang = path != nullptr && path->role() == erOverhangPerimeter;
+        const bool usable      = is_overhang && path->width > 0.f && path->polyline.points.size() >= 2;
+        if (usable && path->polyline.points.size() >= 2) {
+            if (run.line.points.empty()) {
+                run.path_begin = i;
+                run.line       = path->polyline.to_polyline();
+                const double half = 0.5 * double(path->width) / SCALING_FACTOR;
+                run.half_min = run.half_max = half;
+                continue;
+            }
+            if (seam_run_continues(run.line, path->polyline)) {
+                append_seam_run_points(run.line, path->polyline);
+                const double half = 0.5 * double(path->width) / SCALING_FACTOR;
+                run.half_min = std::min(run.half_min, half);
+                run.half_max = std::max(run.half_max, half);
+                continue;
+            }
+            // Discontinuity: this path starts somewhere the run does not end. Cut the run here,
+            // publish it, and start a new run at this path so no missing segment is ever stored.
+            ++ layer.seam_provenance_stats().runs_split;
+            run.path_end = i;
+            publish_seam_run(layer, loop, region_id, wall_id, is_contour, ring_closed, side, run);
+            run = SeamRun();
+            run.path_begin = i;
+            run.line       = path->polyline.to_polyline();
+            const double half = 0.5 * double(path->width) / SCALING_FACTOR;
+            run.half_min = run.half_max = half;
+            continue;
+        }
+        // End of the run: a non-overhang path, a degenerate overhang path, or the end of the loop.
+        if (! run.line.points.empty()) {
+            if (is_overhang && ! usable)
+                ++ layer.seam_provenance_stats().degenerate_paths;
+            run.path_end = i;
+            publish_seam_run(layer, loop, region_id, wall_id, is_contour, ring_closed, side, run);
+            run = SeamRun();
+        } else if (is_overhang && ! usable) {
+            ++ layer.seam_provenance_stats().degenerate_paths;
+        }
+    }
+}
+
+// Counts every erOverhangPerimeter path this pass deliberately left without a key. This is the
+// audit trail for the conservative gap between "an ordinary overhang wall exists" and "the fan may
+// mark it": unkeyed walls exist (open Arachne fragments, insets outside the innermost set, cache
+// imports) and must be visible as data instead of silently disappearing.
+static void count_unkeyed_overhang_paths(ExtrusionEntityCollection &collection, SeamProvenanceStats &stats)
+{
+    for (ExtrusionEntity *entity : collection.entities) {
+        if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+            if (path->role() == erOverhangPerimeter) {
+                if (path->wall_span_key == 0)
+                    ++ stats.unkeyed_overhang_paths;
+                // A plain (non-loop) overhang path: the Arachne open-fragment shape.
+                ++ stats.open_fragment_paths;
+            }
+        } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(entity)) {
+            for (const ExtrusionPath &path : multipath->paths)
+                if (path.role() == erOverhangPerimeter) {
+                    if (path.wall_span_key == 0)
+                        ++ stats.unkeyed_overhang_paths;
+                    ++ stats.open_fragment_paths;
+                }
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity)) {
+            for (const ExtrusionPath &path : loop->paths)
+                if (path.role() == erOverhangPerimeter && path.wall_span_key == 0)
+                    ++ stats.unkeyed_overhang_paths;
+        } else if (auto *nested = dynamic_cast<ExtrusionEntityCollection *>(entity)) {
+            count_unkeyed_overhang_paths(*nested, stats);
+        }
+    }
+}
+
+void PerimeterGenerator::publish_overhang_wall_spans()
+{
+    Layer *layer = this->seam_layer;
+    if (layer == nullptr || this->loops == nullptr)
+        return;
+    // Same wall set the existing external bridge wall boundary describes: the innermost generated
+    // overhang walls of this pass. Open Arachne fragments have no provable single side and are left
+    // unlabelled on purpose (a miss, never a guess).
+    const int inset_idx = innermost_overhang_inset(*this->loops);
+    if (inset_idx >= 0) {
+        std::vector<ExtrusionLoop *> seam_loops;
+        collect_innermost_overhang_loops(*this->loops, inset_idx, seam_loops);
+        for (ExtrusionLoop *loop : seam_loops)
+            publish_loop_seam_spans(*layer, *loop, this->seam_region_id);
+    } else {
+        // The boundary helper falls back to "all overhang boundaries" here. That set is not a ring
+        // set, so no span can be published: record the fallback so the miss is auditable instead of
+        // looking like "this layer simply had no seam".
+        ++ layer->seam_provenance_stats().inset_fallback;
+    }
+    count_unkeyed_overhang_paths(*this->loops, layer->seam_provenance_stats());
+}
+
 // The lower layer arrives as a flat ring set, so a point over one of its voids is inside the outer
 // contour alone and a per-ring test would call it supported. Only the even-odd rule tells a void from
 // material.
@@ -2260,6 +2475,8 @@ void PerimeterGenerator::process_classic()
 
     const int innermost_inset = innermost_overhang_inset(*this->loops);
     append_innermost_overhang_boundaries(*this->loops, innermost_inset, *this->external_bridge_wall_boundary);
+    // ORCA: observational provenance for exactly the wall set the boundary above describes.
+    this->publish_overhang_wall_spans();
 }
 
 //BBS:
@@ -3381,6 +3598,8 @@ void PerimeterGenerator::process_arachne()
 
     const int innermost_inset = innermost_overhang_inset(*this->loops);
     append_innermost_overhang_boundaries(*this->loops, innermost_inset, *this->external_bridge_wall_boundary);
+    // ORCA: observational provenance for exactly the wall set the boundary above describes.
+    this->publish_overhang_wall_spans();
 }
 
 bool PerimeterGeneratorLoop::is_internal_contour() const
