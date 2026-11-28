@@ -102,6 +102,20 @@ struct CoolingLine
         // Belt printers: extrusions within the first-layer band above the belt.
         TYPE_BELT_BAND_START           = 1 << 21,
         TYPE_BELT_BAND_END             = 1 << 22,
+        // ORCA: separate external bridge fan speed.
+        TYPE_EXTERNAL_BRIDGE_FAN_START = 1 << 23,
+        TYPE_EXTERNAL_BRIDGE_FAN_END   = 1 << 24,
+        // ORCA: motion-local external bridge seam fan. The generator appends the reserved
+        // `;_EXTERNAL_BRIDGE_SEAM_FAN` suffix to the depositing move that forms the seam against an
+        // external bridge; the token opens no region and takes the fan for that move only.
+        TYPE_EXTERNAL_BRIDGE_SEAM_FAN    = 1 << 25,
+        // The line carries the suffix, so its text has to lose it whether the seam is in force or not.
+        TYPE_EXTERNAL_BRIDGE_SEAM_STRIP  = 1 << 26,
+        // A stand-in for a marked move that was folded into a speed owner and has no line of its own.
+        TYPE_EXTERNAL_BRIDGE_SEAM_ANCHOR = 1 << 27,
+        // A G1/G2/G3 that deposits material, or the speed owner of a block of deposits. Used to place
+        // the motion-local fan boundaries; it does not change how the line itself is emitted.
+        TYPE_DEPOSIT                     = 1 << 28,
     };
 
     CoolingLine(unsigned int type, size_t  line_start, size_t  line_end) :
@@ -134,6 +148,68 @@ struct CoolingLine
     // If marked with the "slowdown" flag, the line has been slowed down.
     bool    slowdown;
 };
+
+// ORCA: the reserved motion-local annotation the G-code generator appends to a seam deposit. It is the
+// only thing the cooling buffer removes from such a line; every other comment stays as it was.
+static constexpr const char EXTERNAL_BRIDGE_SEAM_FAN_TOKEN[]      = ";_EXTERNAL_BRIDGE_SEAM_FAN";
+static constexpr size_t       EXTERNAL_BRIDGE_SEAM_FAN_TOKEN_LEN  = sizeof(EXTERNAL_BRIDGE_SEAM_FAN_TOKEN) - 1;
+// The two ASCII line endings and the two separators the generator may put in front of the annotation;
+// spelled numerically to keep the text plain.
+static constexpr char         CS_SEAM_NEWLINE                     = 10;
+static constexpr char         CS_SEAM_CARRIAGE_RETURN             = 13;
+static constexpr char         CS_SEAM_SPACE                       = 32;
+static constexpr char         CS_SEAM_TAB                         = 9;
+
+// ORCA: the reserved suffix at the very end of `begin..end`, ignoring the line ending that follows it.
+// Returns the start of the token, or nullptr when the range does not end with exactly that suffix.
+static const char *external_bridge_seam_token(const char *begin, const char *end)
+{
+    if (end > begin && end[-1] == CS_SEAM_NEWLINE)
+        -- end;
+    if (end > begin && end[-1] == CS_SEAM_CARRIAGE_RETURN)
+        -- end;
+    return size_t(end - begin) >= EXTERNAL_BRIDGE_SEAM_FAN_TOKEN_LEN &&
+           std::memcmp(end - EXTERNAL_BRIDGE_SEAM_FAN_TOKEN_LEN, EXTERNAL_BRIDGE_SEAM_FAN_TOKEN,
+                       EXTERNAL_BRIDGE_SEAM_FAN_TOKEN_LEN) == 0 ?
+        end - EXTERNAL_BRIDGE_SEAM_FAN_TOKEN_LEN : nullptr;
+}
+
+// ORCA: what has to disappear for a marked line to read like the same line without the annotation: the
+// suffix and the single separator the generator wrote in front of it. Nothing else changes, so a line
+// that only carried the annotation ends exactly where it did, with no trailing blank left behind.
+static const char *external_bridge_seam_removal_begin(const char *begin, const char *token)
+{
+    return token > begin && (token[-1] == CS_SEAM_SPACE || token[-1] == CS_SEAM_TAB) ? token - 1 : token;
+}
+
+// ORCA: remove the annotation and its separator from a whole line, keeping everything else byte for byte,
+// the line ending included.
+static void strip_external_bridge_seam_token(std::string &line)
+{
+    const char *token = external_bridge_seam_token(line.data(), line.data() + line.size());
+    if (token == nullptr)
+        return;
+    const char *removal = external_bridge_seam_removal_begin(line.data(), token);
+    line.erase(size_t(removal - line.data()), size_t(token - removal) + EXTERNAL_BRIDGE_SEAM_FAN_TOKEN_LEN);
+}
+
+// ORCA: the command kinds that end a motion-local seam run. A deposit is a boundary because the fan has
+// to be resolved before it prints; the markers are boundaries because each one re-resolves the fan for
+// what follows it. Travels, waits, G92 and pure E moves are not boundaries: the speed they run at does
+// not matter, so they neither end the run nor cause a command. `;_EXTRUDE_END` is not one either: it
+// changes nothing about the fan, so the run may still be open when the next block starts.
+static constexpr size_t external_bridge_seam_boundary_mask()
+{
+    return CoolingLine::TYPE_SET_TOOL |
+           CoolingLine::TYPE_OVERHANG_FAN_START | CoolingLine::TYPE_OVERHANG_FAN_END |
+           CoolingLine::TYPE_FORCE_RESUME_FAN |
+           CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_START | CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_END |
+           CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START | CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_END |
+           CoolingLine::TYPE_IRONING_FAN_START | CoolingLine::TYPE_IRONING_FAN_END |
+           CoolingLine::TYPE_BELT_BAND_START | CoolingLine::TYPE_BELT_BAND_END |
+           CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START | CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_END |
+           CoolingLine::TYPE_DEPOSIT;
+}
 
 // Calculate the required per extruder time stretches.
 struct PerExtruderAdjustments
@@ -510,6 +586,8 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
     // Index of an existing CoolingLine of the current adjustment, which holds the feedrate setting command
     // for a sequence of extrusion moves.
     size_t            active_speed_modifier = size_t(-1);
+    // ORCA: whether the fan will still be on the motion-local seam when the next folded move prints.
+    bool              seam_anchor_open = false;
 
     // Orca: Whether we had our first extrusion in this layer.
     bool layer_had_extrusion = false;
@@ -607,11 +685,23 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                 line.type |= CoolingLine::TYPE_ADJUSTABLE;
                 active_speed_modifier = adjustment->lines.size();
             }
+            // ORCA: the seam annotation is a reserved suffix of the move it marks. It is carried by a
+            // depositing G1/G2/G3 only, and it is removed from the emitted text here and nowhere else.
+            const bool seam_token = (line.type & (CoolingLine::TYPE_G1 | CoolingLine::TYPE_G2 | CoolingLine::TYPE_G3)) != 0 &&
+                                    external_bridge_seam_token(sline.data(), sline.data() + sline.size()) != nullptr;
+            if (seam_token)
+                line.type |= CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_STRIP;
             if ((line.type & CoolingLine::TYPE_G92) == 0) {
                 //BBS: G0, G1, G2, G3. Calculate the duration.
                 float dif[4];
                 for (size_t i = 0; i < 4; ++ i)
                     dif[i] = new_pos[i] - current_pos[i];
+                // ORCA: a speed owner stands for a block of deposits, so it is a fan boundary even when
+                // its own move does not deposit. The marker itself only rides a positive deposit.
+                if (dif[3] > 0.f || (line.type & CoolingLine::TYPE_ADJUSTABLE) != 0)
+                    line.type |= CoolingLine::TYPE_DEPOSIT;
+                if (seam_token && dif[3] > 0.f)
+                    line.type |= CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN;
                 float dxy2 = 0;
                 //BBS: support to calculate length of arc
                 if (line.type & CoolingLine::TYPE_G2 || line.type & CoolingLine::TYPE_G3) {
@@ -655,6 +745,32 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
                         else
                             sm.time_max += line.time_max;
                     }
+                    // ORCA: the move is folded into its speed owner, so it has no line of its own in the
+                    // emission list and a fan boundary on it would be lost together with its text. Both
+                    // are anchored separately: the marked move gets a stand-in that spans its text and is
+                    // a deposit in its own right (so the fan is resolved before that text), and the first
+                    // ordinary deposit after an open seam run gets an empty one that only gives the fan
+                    // back. A stand-in carries no length, time or slowdown state, so the owner keeps its
+                    // accumulated timing and the line order, the slowdown spans and the feedrate branches
+                    // are all untouched.
+                    if (line.type & (CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN | CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_STRIP)) {
+                        // The stand-in spans the folded text so the emission can place the fan boundary in
+                        // front of it; a marked deposit is a deposit here too, otherwise the transition it
+                        // carries would resolve after the text and only reach the next move.
+                        size_t anchor = CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_ANCHOR |
+                                        CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_STRIP;
+                        if (line.type & CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN)
+                            anchor |= CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN | CoolingLine::TYPE_DEPOSIT;
+                        adjustment->lines.emplace_back(anchor, line.line_start, line.line_end);
+                        seam_anchor_open = (line.type & CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN) != 0;
+                    } else if (seam_anchor_open && (line.type & CoolingLine::TYPE_DEPOSIT)) {
+                        // Empty stand-in at the start of the deposit: the text stays where it is, only the
+                        // fan boundary moves in front of it.
+                        adjustment->lines.emplace_back(size_t(CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_ANCHOR |
+                                                              CoolingLine::TYPE_DEPOSIT),
+                                                       line.line_start, line.line_start);
+                        seam_anchor_open = false;
+                    }
                     // Don't store this line.
                     line.type = 0;
                 }
@@ -691,6 +807,10 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             line.type = CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START;
         } else if (boost::starts_with(sline, ";_INTERNAL_BRIDGE_FAN_END")) { // ORCA: Add support for separate internal bridge fan speed control
             line.type = CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_END;
+        } else if (boost::starts_with(sline, ";_EXTERNAL_BRIDGE_FAN_START")) { // ORCA: separate external bridge fan speed
+            line.type = CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START;
+        } else if (boost::starts_with(sline, ";_EXTERNAL_BRIDGE_FAN_END")) { // ORCA: separate external bridge fan speed
+            line.type = CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_END;
         } else if (boost::starts_with(sline, ";_SUPP_INTERFACE_FAN_START")) {
             line.type = CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_START;
         } else if (boost::starts_with(sline, ";_SUPP_INTERFACE_FAN_END")) {
@@ -715,8 +835,13 @@ std::vector<PerExtruderAdjustments> CoolingBuffer::parse_layer_gcode(const std::
             line.type = CoolingLine::TYPE_FORCE_RESUME_FAN;
         }
 
-        if (line.type != 0)
+        if (line.type != 0) {
+            // ORCA: a stored boundary line is seen by the emission, so it closes the seam run itself; a
+            // stored travel does not, so the flag has to survive it. The marked line reopens the run.
+            if (line.type & external_bridge_seam_boundary_mask())
+                seam_anchor_open = (line.type & CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN) != 0;
             adjustment->lines.emplace_back(std::move(line));
+        }
     }
 
     // A layer without extrusion is not timed.
@@ -981,7 +1106,11 @@ std::string CoolingBuffer::apply_layer_cooldown(
         for (const PerExtruderAdjustments &adj : per_extruder_adjustments)
             for (const CoolingLine &line : adj.lines)
                 lines.emplace_back(&line);
-        std::sort(lines.begin(), lines.end(), [](const CoolingLine *ln1, const CoolingLine *ln2) { return ln1->line_start < ln2->line_start; } );
+        // ORCA: the seam stand-ins are placed at their own source offsets, so no two of them share one; the
+        // end offset is the tie-break merely to keep the order of this sort total instead of unspecified.
+        std::sort(lines.begin(), lines.end(), [](const CoolingLine *ln1, const CoolingLine *ln2) {
+            return ln1->line_start != ln2->line_start ? ln1->line_start < ln2->line_start
+                                                      : ln1->line_end < ln2->line_end; } );
     }
     // Second generate the adjusted G-code.
     std::string new_gcode;
@@ -991,6 +1120,15 @@ std::string CoolingBuffer::apply_layer_cooldown(
     const unsigned int part_cooling_fan_min_pwm = static_cast<unsigned int>(std::max(0, m_config.part_cooling_fan_min_pwm.value));
     bool overhang_fan_control= false;
     int  overhang_fan_speed   = 0;
+    // ORCA: separate external bridge fan speed. -1 (the default) leaves external bridges on the
+    // overhang fan speed, so `external_bridge_fan_control` stays false and the marker never takes over.
+    // The role only exists while the filament's own "force cooling for overhangs and bridges" switch is
+    // on, the same switch the overhang markers answer to.
+    bool overhang_bridge_fan_enabled = false;
+    bool overhang_role_gated       = false;
+    bool internal_bridge_role_gated = false;
+    bool external_bridge_fan_control = false;
+    int  external_bridge_fan_speed   = 0;
     bool internal_bridge_fan_control= false; // ORCA: Add support for separate internal bridge fan speed control
     int  internal_bridge_fan_speed   = 0; // ORCA: Add support for separate internal bridge fan speed control
     bool supp_interface_fan_control= false;
@@ -999,10 +1137,12 @@ std::string CoolingBuffer::apply_layer_cooldown(
     int  ironing_fan_speed   = 0; // ORCA: Add support for ironing fan speed control
     auto change_extruder_set_fan = [ this, layer_id, layer_time, &new_gcode, part_cooling_fan_min_pwm,
         &overhang_fan_control, &overhang_fan_speed,
+        &overhang_bridge_fan_enabled, &overhang_role_gated, &internal_bridge_role_gated,
+        &external_bridge_fan_control, &external_bridge_fan_speed,
         &internal_bridge_fan_control, &internal_bridge_fan_speed,
         &supp_interface_fan_control, &supp_interface_fan_speed,
         &ironing_fan_control, &ironing_fan_speed
-    ](bool immediately_apply) {
+    ](bool apply_part_fan, bool apply_aux_fan) {
 #define EXTRUDER_CONFIG(OPT) m_config.OPT.get_at(m_current_extruder)
         // The per-variant options take the extruder variant the filament prints with on this layer
         const size_t config_index = m_gcodegen.get_filament_config_index(m_current_extruder, layer_id);
@@ -1011,6 +1151,7 @@ std::string CoolingBuffer::apply_layer_cooldown(
         //BBS
         int additional_fan_speed_new = m_config.additional_cooling_fan_speed.get_at(config_index);
         int close_fan_the_first_x_layers = EXTRUDER_CONFIG(close_fan_the_first_x_layers);
+        overhang_bridge_fan_enabled = EXTRUDER_CONFIG(enable_overhang_bridge_fan);
         // Is the fan speed ramp enabled?
         int full_fan_speed_layer = EXTRUDER_CONFIG(full_fan_speed_layer);
         // ORCA: explicit per-filament first-layer override (-1 = disabled, 0-100 = forced PWM percent on layer 0).
@@ -1036,6 +1177,9 @@ std::string CoolingBuffer::apply_layer_cooldown(
             fan_speed_new             = initial_layer_fan_speed;
             overhang_fan_speed        = initial_layer_fan_speed;
             overhang_fan_control      = false;
+            // ORCA: the layer 0 override is the fan speed of the whole layer, external bridges included.
+            external_bridge_fan_speed   = initial_layer_fan_speed;
+            external_bridge_fan_control = false;
             internal_bridge_fan_speed   = initial_layer_fan_speed;
             internal_bridge_fan_control = false;
             supp_interface_fan_speed    = initial_layer_fan_speed;
@@ -1061,6 +1205,9 @@ std::string CoolingBuffer::apply_layer_cooldown(
                 }
             //}
             overhang_fan_speed   = EXTRUDER_CONFIG(overhang_fan_speed);
+            // ORCA: an explicit external bridge fan speed is a real value, 0 and below the layer fan included.
+            external_bridge_fan_speed   = EXTRUDER_CONFIG(external_bridge_fan_speed);
+            external_bridge_fan_control = external_bridge_fan_speed >= 0 && overhang_bridge_fan_enabled;
             if (int(layer_id) >= close_fan_the_first_x_layers && int(layer_id) + 1 < full_fan_speed_layer) {
                 if (has_initial_layer_override && close_fan_the_first_x_layers == 0 && full_fan_speed_layer > 1) {
                     // ORCA: Option-B anchored ramp. When the first-layer override is configured and there's
@@ -1075,17 +1222,28 @@ std::string CoolingBuffer::apply_layer_cooldown(
                     const float t      = float(int(layer_id)) / denom;
                     fan_speed_new      = std::clamp(int(anchor + t * (float(fan_speed_new) - anchor) + 0.5f), 0, 255);
                     overhang_fan_speed = std::clamp(int(anchor + t * (float(overhang_fan_speed) - anchor) + 0.5f), 0, 255);
+                    // ORCA: the external bridge value rides the same anchored curve. 0 is a request for no
+                    // cooling, not "unset", so the anchor must not lift it off zero.
+                    if (external_bridge_fan_speed > 0)
+                        external_bridge_fan_speed = std::clamp(int(anchor + t * (float(external_bridge_fan_speed) - anchor) + 0.5f), 0, 255);
                 } else {
                     // Ramp up the fan speed from close_fan_the_first_x_layers to full_fan_speed_layer.
                     float factor = float(int(layer_id + 1) - close_fan_the_first_x_layers) / float(full_fan_speed_layer - close_fan_the_first_x_layers);
                     fan_speed_new    = std::clamp(int(float(fan_speed_new) * factor + 0.5f), 0, 255);
                     overhang_fan_speed = std::clamp(int(float(overhang_fan_speed) * factor + 0.5f), 0, 255);
+                    // ORCA: same ramp as the overhang fan speed, except that 0 stays 0.
+                    if (external_bridge_fan_speed > 0)
+                        external_bridge_fan_speed = std::clamp(int(float(external_bridge_fan_speed) * factor + 0.5f), 0, 255);
                 }
             }
             supp_interface_fan_speed = EXTRUDER_CONFIG(support_material_interface_fan_speed);
             supp_interface_fan_control = supp_interface_fan_speed >= 0;
 
             overhang_fan_control = overhang_fan_speed > fan_speed_new;
+            // The same role, also answering to this filament's "force cooling for overhangs and bridges"
+            // switch. Only used in a layer an external bridge has been taken over in: everywhere else the
+            // rules stay exactly what they have always been.
+            overhang_role_gated = overhang_bridge_fan_enabled && overhang_fan_control;
             
             // ORCA: Add support for separate internal bridge fan speed control
             internal_bridge_fan_speed   = EXTRUDER_CONFIG(internal_bridge_fan_speed);
@@ -1095,6 +1253,7 @@ std::string CoolingBuffer::apply_layer_cooldown(
                 internal_bridge_fan_speed = overhang_fan_speed;
                 internal_bridge_fan_control = overhang_fan_control;
             }
+            internal_bridge_role_gated = overhang_bridge_fan_enabled && internal_bridge_fan_control;
 
             // ORCA: Add support for ironing fan speed control
             ironing_fan_speed   = EXTRUDER_CONFIG(ironing_fan_speed);
@@ -1106,6 +1265,8 @@ std::string CoolingBuffer::apply_layer_cooldown(
             overhang_fan_speed   = 0;
             fan_speed_new      = 0;
             additional_fan_speed_new = 0;
+            external_bridge_fan_control = false;
+            external_bridge_fan_speed   = 0;
             supp_interface_fan_control = false; 
             supp_interface_fan_speed   = 0;
             internal_bridge_fan_control = false; // ORCA: Add support for separate internal bridge fan speed control
@@ -1115,28 +1276,34 @@ std::string CoolingBuffer::apply_layer_cooldown(
         }
         // A tool change may keep the same configured base fan speed while the physical fan is
         // still running at the previous filament's overhang speed. Restore the base speed before
-        // emitting G-code for the new tool in that case.
-        if (fan_speed_new != m_fan_speed || (immediately_apply && m_current_fan_speed != fan_speed_new)) {
+        // emitting G-code for the new tool in that case. `apply_part_fan` is false only for a tool change
+        // that lands inside a role region: there the caller resolves the role speed instead, and the base
+        // speed is recorded without being written out, so no base speed is pulsed into the role.
+        if (fan_speed_new != m_fan_speed || (apply_part_fan && m_current_fan_speed != fan_speed_new)) {
             m_fan_speed = fan_speed_new;
-            m_current_fan_speed = fan_speed_new;
-            if (immediately_apply)
+            // The base speed `m_fan_speed` is remembered either way; only the emission is optional, so a
+            // caller that resolves a role speed afterwards still knows what leaving the role returns to.
+            if (apply_part_fan) {
+                m_current_fan_speed = fan_speed_new;
                 new_gcode  += GCodeWriter::set_fan(m_config.gcode_flavor, m_fan_speed, part_cooling_fan_min_pwm);
+            }
         }
         //BBS
         if (additional_fan_speed_new != m_additional_fan_speed) {
             m_additional_fan_speed = additional_fan_speed_new;
-            if (immediately_apply && m_config.auxiliary_fan.value)
+            if (apply_aux_fan && m_config.auxiliary_fan.value)
                 new_gcode += GCodeWriter::set_additional_fan(m_additional_fan_speed);
         }
     };
 
     const char         *pos               = gcode.c_str();
     int                 current_feedrate  = 0;
-    change_extruder_set_fan(true);
+    change_extruder_set_fan(true, true);
 
     // Orca: Reduce set fan commands by deferring the GCodeWriter::set_fan calls. Inspired by SuperSlicer
     // define fan_speed_change_requests and initialize it with all possible types fan speed change requests
     std::unordered_map<int, bool> fan_speed_change_requests = {{CoolingLine::TYPE_OVERHANG_FAN_START, false},
+                                                               {CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START, false}, // ORCA: separate external bridge fan speed
                                                                {CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START, false}, // ORCA: Add support for separate internal bridge fan speed control
                                                                {CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_START, false},
                                                                {CoolingLine::TYPE_IRONING_FAN_START, false}, // ORCA: Add support for ironing fan speed control
@@ -1144,41 +1311,182 @@ std::string CoolingBuffer::apply_layer_cooldown(
     // Belt printers: a band still open from the previous layer has to take the fan back from
     // the layer-level speed issued just above.
     bool need_set_fan = m_belt_band_active;
+    // Whether an explicit external bridge fan speed took a bridge over anywhere in this layer. Only then
+    // does a tool change resolve a role instead of writing the base speed, so a print that never uses the
+    // new key keeps the tool change behaviour it had.
+    bool layer_external_bridge_used = false;
+    // ORCA: the motion-local external bridge seam fan. `;_EXTERNAL_BRIDGE_SEAM_FAN` marks one depositing
+    // move; the fan it asks for is in force for that move only and handed back at the next deposit or at
+    // the next role, tool, belt or block boundary. The token never opens a bridge region, never sets the
+    // layer's bridge state and never raises a role request: those stay with the start/end markers.
+    bool seam_fan_active = false;
+    // Resolve the part cooling fan from the pending requests and write it when it changed. The order is
+    // the one the deferred block below always had, with the motion-local seam between the belt mask and
+    // the legacy roles. It is a lambda because a seam boundary has to be resolved before the deposit it
+    // applies to prints, while every other request keeps being flushed after its own (textless) marker.
+    const auto apply_fan_requests = [&]() {
+        const auto set_fan = [&](int speed) {
+            if (m_current_fan_speed != speed) {
+                new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, speed, part_cooling_fan_min_pwm);
+                m_current_fan_speed = speed;
+            }
+        };
+        if (m_belt_band_active) {
+            // Belt printers: a tilted layer runs from the belt to the top of the part, so
+            // "the first layers" are a band along the belt rather than the first slicing
+            // layers. Extrusions GCode::_extrude() marks as inside that band print with the
+            // fan off, whatever overhang, bridge or resume request is pending, as the first
+            // layers of a flat bed do. Leaving the band falls through to the branches below.
+            set_fan(0);
+            fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] = false;
+        } else if (seam_fan_active && external_bridge_fan_control) { // ORCA: motion-local external bridge seam fan
+            // The seam outranks the overhang request the same wall may also have raised, but it is not
+            // the bridge take-over: the layer's bridge state and the start/end requests are untouched.
+            set_fan(external_bridge_fan_speed);
+        } else if (external_bridge_fan_control && fan_speed_change_requests[CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START]){ // ORCA: separate external bridge fan speed
+            // An external bridge that took itself over outranks the overhang request its path also raised.
+            set_fan(external_bridge_fan_speed);
+        } else if ((! layer_external_bridge_used || overhang_role_gated) &&
+                   fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START]){
+            // Once the layer is under the feature, a request opened by the previous filament outlives a
+            // tool change only while this filament still cools overhangs itself; otherwise the layer fan
+            // is the right answer for it.
+            set_fan(overhang_fan_speed);
+        } else if ((! layer_external_bridge_used || internal_bridge_role_gated) &&
+                   fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]){ // ORCA: Add support for separate internal bridge fan speed control
+            set_fan(internal_bridge_fan_speed);
+        }
+        else if (fan_speed_change_requests[CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_START]){
+            set_fan(supp_interface_fan_speed);
+        }
+        else if (fan_speed_change_requests[CoolingLine::TYPE_IRONING_FAN_START]){
+            set_fan(ironing_fan_speed);
+        }
+        else if(fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] && m_current_fan_speed != -1){
+            new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, m_current_fan_speed, part_cooling_fan_min_pwm);
+            fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] = false;
+        }
+        else {
+            set_fan(m_fan_speed);
+        }
+        need_set_fan = false;
+    };
 
     for (const CoolingLine *line : lines) {
         const char *line_start  = gcode.c_str() + line->line_start;
         const char *line_end    = gcode.c_str() + line->line_end;
+        // ORCA: Until this layer's first external bridge takeover the overhang and internal bridge roles
+        // follow the rules they always had. From that takeover on they also answer to the filament printing
+        // them, so a filament that forces no bridge cooling neither starts nor keeps them. Read per line so
+        // a tool change takes effect at once.
+        const bool overhang_starts = layer_external_bridge_used ? overhang_role_gated : overhang_fan_control;
+        const bool internal_starts = layer_external_bridge_used ? internal_bridge_role_gated : internal_bridge_fan_control;
         if (line_start > pos)
             new_gcode.append(pos, line_start - pos);
+        // The source position advances on the raw G-code, before any line view below is rebuilt.
+        pos = line_end;
+        // ORCA: the reserved seam annotation never reaches the output, and taking only the token away would
+        // leave the separator in front of it behind. A marked line is therefore rebuilt once here, without
+        // the annotation and its separator, so every branch below - the feedrate rewrite, the comment
+        // rewrite and the plain copy - sees exactly the line the generator would have written without it,
+        // byte for byte, with or without the seam in force.
+        std::string seam_stripped_line;
+        if (line->type & CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_STRIP) {
+            seam_stripped_line.assign(line_start, line_end - line_start);
+            strip_external_bridge_seam_token(seam_stripped_line);
+            line_start = seam_stripped_line.data();
+            line_end   = line_start + seam_stripped_line.size();
+        }
+        // ORCA: motion-local seam fan. A marked deposit takes the external bridge fan for its own move;
+        // the next deposit, or the next marker that re-resolves the fan, gives it back. A deposit is
+        // resolved here, before its own text, because a fan command written after it would only reach the
+        // move after it. A stand-in that only had to drop the annotation also ends an open run: it exists
+        // because the generator marked a move this buffer does not deposit for, and the fan must not wait
+        // for the next stored boundary. Everything else keeps the deferred resolution it always had.
+        const bool  seam_marked     = (line->type & CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_FAN) != 0;
+        const size_t seam_strip_only = CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_ANCHOR | CoolingLine::TYPE_EXTERNAL_BRIDGE_SEAM_STRIP;
+        if (seam_fan_active != seam_marked &&
+            (seam_marked || (line->type & seam_strip_only) == seam_strip_only ||
+             (line->type & external_bridge_seam_boundary_mask()) != 0)) {
+            seam_fan_active = seam_marked;
+            if (line->type & CoolingLine::TYPE_BELT_BAND_START) {
+                // The band writes its own (off) fan just below; resolving again here would pulse the
+                // previous speed in between.
+            } else if (line->type & CoolingLine::TYPE_DEPOSIT) {
+                // Only when the filament actually has an external bridge fan to give: with -1, with the
+                // force-overhang switch off or under a layer gate the seam is inert and must not write.
+                if (external_bridge_fan_control) {
+                    need_set_fan = true;
+                    apply_fan_requests();
+                }
+            } else if (external_bridge_fan_control) {
+                // A marker resolves after its own text, exactly as it always did. An inert seam never wrote
+                // a command of its own, so there is nothing to take back and nothing to flush.
+                need_set_fan = true;
+            }
+        }
         if (line->type & CoolingLine::TYPE_SET_TOOL) {
             unsigned int new_extruder = 0;
             auto ret = std::from_chars(line_start + m_toolchange_prefix.size(), line_end, new_extruder);
             if (std::errc::invalid_argument != ret.ec) {
                 if (new_extruder != m_current_extruder) {
+                    // The requests belong to the generator's markers, which keep a role region open across a
+                    // tool change, so they are left exactly as they are: only what the fan does with them
+                    // changes with the filament. In a layer where an external bridge was taken over, resolve
+                    // the role once for the new filament instead of writing the base speed and pulsing it
+                    // through the region; every other layer keeps the old tool change behaviour.
+                    const bool roles_open = layer_external_bridge_used &&
+                        (fan_speed_change_requests[CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START] ||
+                         fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START] ||
+                         fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]);
                     m_current_extruder = new_extruder;
-                    change_extruder_set_fan(true);
-                    if (m_belt_band_active)
+                    if (roles_open) {
+                        change_extruder_set_fan(false, true);
                         need_set_fan = true;
+                    } else {
+                        change_extruder_set_fan(true, true);
+                        if (m_belt_band_active)
+                            need_set_fan = true;
+                    }
                 }
             }
             new_gcode.append(line_start, line_end - line_start);
         } else if (line->type & CoolingLine::TYPE_OVERHANG_FAN_START) {
-            if (overhang_fan_control && !fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START]) {
+            if (overhang_starts && !fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START]) {
                 need_set_fan = true;
                 fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START] = true;
            }
         } else if (line->type & CoolingLine::TYPE_OVERHANG_FAN_END) {
-            if (overhang_fan_control && fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START]) {
+            // The marker closes the region the generator opened. Once the layer is under the feature it
+            // releases the request even when the filament printing the closing path could not have used the
+            // role (a request left open by a previous filament would otherwise outlive the region and
+            // outrank the layer fan); before that it keeps the condition it always had.
+            if ((layer_external_bridge_used || overhang_fan_control) &&
+                fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START]) {
                 fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START] = false;
             }
             need_set_fan = true;
+        } else if (line->type & CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START) { // ORCA: separate external bridge fan speed
+            if (external_bridge_fan_control && !fan_speed_change_requests[CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START]) {
+                need_set_fan = true;
+                fan_speed_change_requests[CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START] = true;
+                layer_external_bridge_used = true;
+            }
+        } else if (line->type & CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_END) { // ORCA: separate external bridge fan speed
+            // Only an open request can be closed, and only closing one has to re-emit the fan: a bridge
+            // that was never taken over leaves the fan where the other requests put it.
+            if (fan_speed_change_requests[CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START]) {
+                fan_speed_change_requests[CoolingLine::TYPE_EXTERNAL_BRIDGE_FAN_START] = false;
+                need_set_fan = true;
+            }
         } else if (line->type & CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START) { // ORCA: Add support for separate internal bridge fan speed control
-            if (internal_bridge_fan_control && !fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]) {
+            if (internal_starts && !fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]) {
                 need_set_fan = true;
                 fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START] = true;
            }
         } else if (line->type & CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_END) { // ORCA: Add support for separate internal bridge fan speed control
-            if (internal_bridge_fan_control && fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]) {
+            if ((layer_external_bridge_used || internal_bridge_fan_control) &&
+                fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]) {
                 fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START] = false;
             }
             need_set_fan = true;
@@ -1303,42 +1611,8 @@ std::string CoolingBuffer::apply_layer_cooldown(
             new_gcode.append(line_start, line_end - line_start);
         }
 
-        if (need_set_fan) {
-            const auto set_fan = [&](int speed) {
-                if (m_current_fan_speed != speed) {
-                    new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, speed, part_cooling_fan_min_pwm);
-                    m_current_fan_speed = speed;
-                }
-            };
-            if (m_belt_band_active) {
-                // Belt printers: a tilted layer runs from the belt to the top of the part, so
-                // "the first layers" are a band along the belt rather than the first slicing
-                // layers. Extrusions GCode::_extrude() marks as inside that band print with the
-                // fan off, whatever overhang, bridge or resume request is pending, as the first
-                // layers of a flat bed do. Leaving the band falls through to the branches below.
-                set_fan(0);
-                fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] = false;
-            } else if (fan_speed_change_requests[CoolingLine::TYPE_OVERHANG_FAN_START]){
-                set_fan(overhang_fan_speed);
-            } else if (fan_speed_change_requests[CoolingLine::TYPE_INTERNAL_BRIDGE_FAN_START]){ // ORCA: Add support for separate internal bridge fan speed control
-                set_fan(internal_bridge_fan_speed);
-            }
-            else if (fan_speed_change_requests[CoolingLine::TYPE_SUPPORT_INTERFACE_FAN_START]){
-                set_fan(supp_interface_fan_speed);
-            }
-            else if (fan_speed_change_requests[CoolingLine::TYPE_IRONING_FAN_START]){
-                set_fan(ironing_fan_speed);
-            }
-            else if(fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] && m_current_fan_speed != -1){
-                new_gcode += GCodeWriter::set_fan(m_config.gcode_flavor, m_current_fan_speed, part_cooling_fan_min_pwm);
-                fan_speed_change_requests[CoolingLine::TYPE_FORCE_RESUME_FAN] = false;
-            }
-            else {
-                set_fan(m_fan_speed);
-            }
-            need_set_fan = false;
-        }
-        pos = line_end;
+        if (need_set_fan)
+            apply_fan_requests();
     }
     const char *gcode_end = gcode.c_str() + gcode.size();
     if (pos < gcode_end)

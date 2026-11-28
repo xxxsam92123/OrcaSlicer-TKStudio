@@ -59,6 +59,7 @@ namespace Slic3r {
 
 // Forward declarations.
 class GCode;
+class ExternalBridgeSeams;
 struct WipeInwardSupport;
 
 namespace CustomGCode{ struct Item; }
@@ -830,6 +831,19 @@ protected:
     // ORCA: Add support for role based fan speed control
     std::array<bool, ExtrusionRole::erCount> m_is_role_based_fan_on;
     std::array<int, ExtrusionRole::erCount>  m_role_based_fan_marker_layer;
+
+    // ORCA: External bridge seam fan, ordinary-wall side. The classifier is a value scoped to one
+    // object layer: it is built the first time a wall of that layer asks for it and dropped as soon as
+    // the emitter works on another layer. `m_external_bridge_seam_region` is the print region whose
+    // ordinary walls are being emitted, or -1 while anything else (fill, support, skirt, brim, wipe) is
+    // emitted, so no such path can borrow a wall's provenance. A shared pointer keeps the private
+    // geometry header out of this one, which every translation unit includes.
+    std::shared_ptr<ExternalBridgeSeams> m_external_bridge_seams;
+    const Layer                         *m_external_bridge_seams_layer { nullptr };
+    size_t                               m_external_bridge_seams_layer_id { size_t(-1) };
+    int                                  m_external_bridge_seam_region { -1 };
+    // Null whenever the feature cannot apply to the layer being emitted.
+    const ExternalBridgeSeams          *external_bridge_seams_for_current_layer();
     // Markers for the Pressure Equalizer to recognize the extrusion type.
     // The Pressure Equalizer removes the markers from the final G-code.
     bool                                m_enable_extrusion_role_markers;

@@ -11,6 +11,7 @@
 #include "ExtrusionEntityCollection.hpp"
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 #include <algorithm>
 #include <string>
 #include <functional>
@@ -142,6 +143,70 @@ private:
     const PrintRegion *m_region;
 };
 
+// ORCA: Observational external-bridge-seam provenance.
+//
+// An ordinary overhang wall span is registered here by the perimeter generator at the moment the
+// contour/hole orientation is still known, so the local material side is a *recorded* fact rather
+// than something guessed later from bridge geometry. Records are read-only once the perimeter pass
+// is done, are addressed by value (never by pointer, vector position or emission order) and are
+// rebuilt with the layer. They carry nothing that is printed: the G-code consumer only uses them to
+// decide whether an already emitted wall move may take the existing inline seam fan marker.
+enum class SeamWallSide : int8_t
+{
+    Unknown = 0,
+    Left    = 1,   // material lies left of the canonical directed centreline
+    Right   = -1,  // material lies right of the canonical directed centreline
+};
+
+struct SeamWallSpan
+{
+    // Slot number inside (layer, generation). 1-based, never 0 in a published record, unique for
+    // the whole generation because ids are handed out across all regions of one pass.
+    uint32_t     id = 0;
+    // The Layer::make_perimeters() generation that published this record. Together with `id` it
+    // forms ExtrusionPath::wall_span_key, so a key from a previous pass of the same layer cannot
+    // alias a freshly published record even though ids restart at 1.
+    uint32_t     generation = 0;
+    // Owning Layer::id(). Validated by the consumer, so a key that leaked from another layer
+    // (shared geometry, cached layer, stale pointer) cannot certify anything here.
+    int          layer_id = -1;
+    // PrintRegion::print_region_id() of the region that generated and later emits these paths.
+    // Validated by the consumer against the region it is currently emitting, so a path can only be
+    // certified inside the region that owns it.
+    int          print_region_id = -1;
+    int          inset_idx = -1;
+    // `(loop.loop_role() & elrHole) == 0` of the source ring.
+    bool         is_contour = true;
+    // The canonical line returns to its own start point, i.e. its end parameter *is* its start
+    // parameter and its total arc length. Consumers must treat its parameterisation as circular.
+    bool         closed = false;
+    SeamWallSide side = SeamWallSide::Unknown;
+    // Half width of the narrowest / widest extrusion path carrying this key, in scaled units.
+    double       min_half_width = 0.0;
+    double       max_half_width = 0.0;
+    // Canonical directed centreline in object-local scaled XY, as generated. Reversing, clipping,
+    // splitting or re-ordering an extrusion path never rewrites it: consumers project the emitted
+    // move onto it, so a reversed copy only swaps the parameter order, not the material side.
+    Polyline     line;
+    // Diagnostic only: identifies the source ring whose runs share it. It is never a key, never
+    // looked up and never compared for ownership (several spans of one ring share the value).
+    uint32_t     diagnostic_wall_id = 0;
+};
+
+// ORCA: auditable counters for the observational seam provenance of one layer generation. They
+// exist so that "why did this wall get no key" can be answered from data instead of guessed:
+// every counter is a *miss* on the positive side, never a widened match.
+struct SeamProvenanceStats
+{
+    uint32_t spans_published = 0;        // span records successfully published
+    uint32_t spans_rejected  = 0;        // runs rejected (degenerate line, unknown side, overflow)
+    uint32_t runs_split      = 0;        // overhang run cut because two paths were not adjacent
+    uint32_t degenerate_paths = 0;       // overhang paths skipped: no width or fewer than 2 points
+    uint32_t unkeyed_overhang_paths = 0; // erOverhangPerimeter paths left without a key (all causes)
+    uint32_t open_fragment_paths = 0;    // overhang paths outside any ExtrusionLoop (open Arachne)
+    uint32_t inset_fallback  = 0;        // 1 when the innermost-inset lookup failed: nothing published
+};
+
 class Layer
 {
 public:
@@ -191,6 +256,24 @@ public:
     LayerRegion*            get_region(int idx) { return m_regions[idx]; }
     LayerRegion*            add_region(const PrintRegion *print_region);
     const LayerRegionPtrs&  regions() const { return m_regions; }
+
+    // ORCA: external-bridge-seam provenance (observational only, no printing effect).
+    // Cleared and rebuilt with the perimeter pass. A key is `(generation << 32) | id`, so it is
+    // unique for the whole print, not just inside one table.
+    void                    clear_seam_wall_spans();
+    uint32_t                seam_wall_generation() const { return m_seam_wall_generation; }
+    static uint64_t         seam_wall_key(uint32_t generation, uint32_t id)
+        { return (uint64_t(generation) << 32) | uint64_t(id); }
+    // Diagnostic ring identity, shared by the runs of one generated loop. Never a lookup key.
+    uint32_t                next_seam_diagnostic_wall_id() { return m_next_seam_wall_id ++; }
+    // Publishes `span` (taking ownership of its canonical line), stamps the current generation and
+    // the owning layer id, and returns the composite key, or 0 when the record is unusable.
+    uint64_t                add_seam_wall_span(SeamWallSpan span);
+    // Null for 0, for a record of a previous generation, for a stale slot and for a foreign layer.
+    const SeamWallSpan*     seam_wall_span(uint64_t key) const;
+    const std::vector<SeamWallSpan>& seam_wall_spans() const { return m_seam_wall_spans; }
+    SeamProvenanceStats&       seam_provenance_stats() { return m_seam_stats; }
+    const SeamProvenanceStats& seam_provenance_stats() const { return m_seam_stats; }
     // Test whether whether there are any slices assigned to this layer.
     bool                    empty() const;
     void                    make_slices();
@@ -302,6 +385,12 @@ private:
     size_t              m_id;
     PrintObject        *m_object;
     LayerRegionPtrs     m_regions;
+    // ORCA: observational external-bridge-seam provenance for this layer generation.
+    std::vector<SeamWallSpan>   m_seam_wall_spans;
+    SeamProvenanceStats         m_seam_stats;
+    uint32_t                    m_seam_wall_generation  = 0;
+    uint32_t                    m_next_seam_wall_span_id = 1;
+    uint32_t                    m_next_seam_wall_id      = 1;
 };
 
 enum SupportInnerType {

@@ -13,6 +13,7 @@
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
 #include "GCode/CoolingBuffer.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
+#include "GCode/ExternalBridgeSeams.hpp"
 #include "CustomGCode.hpp"
 #include "GCode/TimelapsePosPicker.hpp"
 #include "ExPolygon.hpp"
@@ -9362,6 +9363,13 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                     if (!waits_for_infill(ee))
                         wipe_support->append(*ee);
 
+            // ORCA: Ordinary-wall provenance for the external bridge seam fan. Only a wall emitted
+            // through this traversal is a candidate; a skirt, brim, support or fill path that happens
+            // to run along the same geometry is not. The scope closes when the region is done, so no
+            // later path can borrow a wall's print region.
+            const ScopeGuard external_bridge_seam_scope([this]() { m_external_bridge_seam_region = -1; });
+            m_external_bridge_seam_region = print.get_print_region(&region - &by_region.front()).print_region_id();
+
             for (const ExtrusionEntity* ee : region.perimeters) {
                 if (defer_unsupported && waits_for_infill(ee) != unsupported_loops_only)
                     continue;
@@ -9795,6 +9803,78 @@ ExtrusionPaths GCode::belt_cut_at_band_edges(const ExtrusionPath &path, std::vec
         uncut_line_lengths.emplace_back(std::move(current_lengths));
     }
     return pieces;
+}
+
+// ORCA: The motion-local marker of the external bridge seam fan. A line that carries it is one
+// ordinary wall deposit that forms the seam against an external bridge; the cooling buffer hands that
+// one deposit the resolved external bridge fan and leaves every other command of the layer as it was.
+// The token has to ride on the deposit's own line: a line of its own would add an entry to the layer,
+// and the pressure equalizer looks back over the layer by line index.
+static constexpr const char *EXTERNAL_BRIDGE_SEAM_FAN_MARKER = ";_EXTERNAL_BRIDGE_SEAM_FAN";
+
+// ORCA: Append the seam marker as the final inline suffix of the line the writer just appended to
+// `gcode`, `line_begin` being the length of `gcode` before that write. Only a whole, actually
+// depositing move is labelled: the write has to have produced exactly one G1/G2/G3 line that sets a
+// positive E word. A move that wrote nothing, an unretract, a wipe, and an arc the writer expanded
+// into several lines because this machine cannot express a G2/G3 all stay unlabelled, so a partly
+// covered move is never stamped as a seam.
+static void append_external_bridge_seam_marker(std::string &gcode, const size_t line_begin)
+{
+    const size_t line_end = gcode.find('\n', line_begin);
+    if (line_end == std::string::npos || line_end + 1 != gcode.size() || line_end <= line_begin + 3)
+        return;
+    const char *line      = gcode.c_str() + line_begin;
+    const char *line_last = gcode.c_str() + line_end;
+    if (line[0] != 'G' || (line[1] != '1' && line[1] != '2' && line[1] != '3') || line[2] != ' ')
+        return;
+    // The E word has to be the move's own and positive; whatever follows ';' is a comment.
+    bool deposits = false;
+    for (const char *c = line + 2; c < line_last && *c != ';'; ++ c) {
+        if (*c != 'E' || c[-1] != ' ')
+            continue;
+        const bool negative = c[1] == '-';
+        bool       non_zero = false;
+        for (const char *digit = c + 1; digit < line_last && *digit != ' ' && *digit != ';'; ++ digit)
+            non_zero = non_zero || (*digit >= '1' && *digit <= '9');
+        deposits = ! negative && non_zero;
+        break;
+    }
+    if (! deposits)
+        return;
+    gcode.insert(line_end, std::string(" ") + EXTERNAL_BRIDGE_SEAM_FAN_MARKER);
+}
+
+// ORCA: The external bridge seam classifier of the object layer currently being emitted. It is built
+// at most once per layer, and only when the feature can do anything on that layer: cooling markers on,
+// and at least one logical filament that both sets an explicit external bridge fan and forces overhang
+// cooling, the same per-filament pair the external bridge fill itself answers to. Everything else, in
+// particular the default -1, stays on the plain path and never builds a classifier. The cache is
+// dropped as soon as another object layer is emitted, so one classifier is alive at a time.
+const ExternalBridgeSeams *GCode::external_bridge_seams_for_current_layer()
+{
+    if (m_layer == nullptr) {
+        m_external_bridge_seams.reset();
+        m_external_bridge_seams_layer = nullptr;
+        m_external_bridge_seams_layer_id = size_t(-1);
+        return nullptr;
+    }
+    if (m_external_bridge_seams_layer == m_layer && m_external_bridge_seams_layer_id == m_layer->id())
+        return m_external_bridge_seams.get();
+    m_external_bridge_seams.reset();
+    m_external_bridge_seams_layer = m_layer;
+    m_external_bridge_seams_layer_id = m_layer->id();
+    if (! m_enable_cooling_markers)
+        return nullptr;
+    const ConfigOptionInts  &fan_speeds     = m_config.external_bridge_fan_speed;
+    const ConfigOptionBools &forced_cooling = m_config.enable_overhang_bridge_fan;
+    bool                     any_filament_eligible = false;
+    for (size_t filament_id = 0; filament_id < fan_speeds.values.size() && ! any_filament_eligible; ++ filament_id)
+        any_filament_eligible = filament_id < forced_cooling.values.size() &&
+                                fan_speeds.values[filament_id] >= 0 && forced_cooling.get_at(filament_id);
+    if (! any_filament_eligible)
+        return nullptr;
+    m_external_bridge_seams = std::make_shared<ExternalBridgeSeams>(*m_layer);
+    return m_external_bridge_seams.get();
 }
 
 std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &path_description, double speed)
@@ -10422,6 +10502,41 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                                      ironing_fan_speed >= 0 && path.role() == erIroning);
     };
 
+    // ORCA: An explicit per-filament external bridge fan speed takes erBridgeInfill over on its own, at any
+    // value from 0 up, while -1 (the default) leaves the bridge on the overhang fan speed resolved
+    // downstream. The value and the forced-cooling switch it answers to are both per-filament, so they are
+    // read at the logical filament id, the index the cooling buffer reads them at: FILAMENT_CONFIG above
+    // goes through the variant-expanded column, which is a different column as soon as one filament prints
+    // with more than one variant (a nozzle group).
+    const unsigned int fan_filament_id        = m_writer.filament()->id();
+    const bool         external_bridge_fan_on = path.role() == erBridgeInfill &&
+                                                m_config.external_bridge_fan_speed.get_at(fan_filament_id) >= 0 &&
+                                                m_config.enable_overhang_bridge_fan.get_at(fan_filament_id);
+
+    // ORCA: An ordinary wall move that forms the seam against an external bridge takes the external
+    // bridge fan through the motion-local marker instead of the role markers above: the marker names
+    // this one deposit, so it opens no fan region and never touches the bridge-fill layer state. Only
+    // walls emitted by extrude_perimeters() are candidates - it records the print region of the
+    // traversal - and only on a filament that sets an explicit external bridge fan and forces overhang
+    // cooling, the same gates the bridge fill itself answers to.
+    const bool external_bridge_seam_candidate =
+        m_enable_cooling_markers && m_external_bridge_seam_region >= 0 && is_perimeter(path.role()) &&
+        ! path.is_force_no_extrusion() && m_config.external_bridge_fan_speed.get_at(fan_filament_id) >= 0 &&
+        m_config.enable_overhang_bridge_fan.get_at(fan_filament_id);
+
+    // `a` and `b` are the endpoints of the whole native move as written, in object-local scaled
+    // coordinates; `arc` is the fitted span when the move is a G2/G3. The classifier has to cover the
+    // whole move - a partial overlap keeps the old cooling and stays unlabelled.
+    auto mark_external_bridge_seam = [this, &path, external_bridge_seam_candidate](
+        std::string &out, const size_t line_begin, const Point &a, const Point &b, const ArcSegment *arc) {
+        if (! external_bridge_seam_candidate)
+            return;
+        const ExternalBridgeSeams *seams = this->external_bridge_seams_for_current_layer();
+        if (seams == nullptr || ! seams->contains(size_t(m_external_bridge_seam_region), path, a, b, arc))
+            return;
+        append_external_bridge_seam_marker(out, line_begin);
+    };
+
     // Farthest-point timelapse inline hook. When the photo head reaches (within 0.5 mm of) the
     // farthest-from-camera point while extruding, take the snapshot in place (skip_pos_pick → M971 inline
     // photo, no travel). Early-returns unless the subsystem is enabled AND the farthest point is on the
@@ -10531,6 +10646,11 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
         m_writer.set_speed(gcode, F, "", comment);
         {
             if (m_enable_cooling_markers) {
+                // ORCA: open the external bridge request first so it outranks the overhang one below. It is
+                // gated on the filament's own switch, not on the variant column the role markers use.
+                if (external_bridge_fan_on)
+                    append_role_based_fan_marker(erBridgeInfill, "_EXTERNAL_BRIDGE"sv, true);
+
                 if (enable_overhang_bridge_fan) {
                     append_role_based_fan_marker(erOverhangPerimeter, "_OVERHANG"sv, path_overhang_fan_active);
 
@@ -10539,6 +10659,12 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                 }
 
                 apply_role_based_fan_speed();
+
+                // ORCA: close it last, once every other role has taken the fan back (support interface and
+                // ironing are raised by apply_role_based_fan_speed above), so leaving the bridge never dips
+                // through another role's speed on the way to the layer fan.
+                if (! external_bridge_fan_on)
+                    append_role_based_fan_marker(erBridgeInfill, "_EXTERNAL_BRIDGE"sv, false);
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
@@ -10583,24 +10709,30 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                         if (z < 0.1) {
                             throw RuntimeError("GCode: very low z");
                         }
+                        const size_t seam_line_begin = gcode.size();
                         m_writer.extrude_to_xyz(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
                                                 flow_description.empty() ? description : flow_description);
+                        mark_external_bridge_seam(gcode, seam_line_begin, line.a.to_point(), line.b.to_point(), nullptr);
 
                     } else if (sloped == nullptr) {
                         // Normal extrusion
+                        const size_t seam_line_begin = gcode.size();
                         m_writer.extrude_to_xy(gcode,
                             this->point_to_gcode(line.b.to_point()),
                             dE,
                             flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                        mark_external_bridge_seam(gcode, seam_line_begin, line.a.to_point(), line.b.to_point(), nullptr);
                     } else {
                         // Sloped extrusion
                         const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
                         Vec2d dest2d = this->point_to_gcode(line.b.to_point());
                         Vec3d dest3d(dest2d(0), dest2d(1), get_sloped_z(z_ratio));
+                        const size_t seam_line_begin = gcode.size();
                         m_writer.extrude_to_xyz(gcode,
                             dest3d,
                             dE * e_ratio,
                             flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                        mark_external_bridge_seam(gcode, seam_line_begin, line.a.to_point(), line.b.to_point(), nullptr);
                     }
                     check_and_insert_timelapse(line.b.to_point()); // Inline farthest-point snapshot
                 }
@@ -10628,10 +10760,12 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                                     flow_description = description + Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
                                 }
                             }
+                            const size_t seam_line_begin = gcode.size();
                             m_writer.extrude_to_xy(gcode,
                                 this->point_to_gcode(line.b),
                                 dE,
                                 flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                            mark_external_bridge_seam(gcode, seam_line_begin, line.a, line.b, nullptr);
                             check_and_insert_timelapse(line.b); // Inline farthest-point snapshot
                         }
                         break;
@@ -10652,12 +10786,14 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                                 flow_description = description + Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, arc_length);
                             }
                         }
+                        const size_t seam_line_begin = gcode.size();
                         m_writer.extrude_arc_to_xy(gcode,
                             this->point_to_gcode(arc.end_point),
                             center_offset,
                             dE,
                             arc.direction == ArcDirection::Arc_Dir_CCW,
                             flow_description.empty() ? description : flow_description, path.is_force_no_extrusion());
+                        mark_external_bridge_seam(gcode, seam_line_begin, arc.start_point, arc.end_point, &arc);
                         check_and_insert_timelapse(arc.end_point); // Inline farthest-point snapshot
                         break;
                     }
@@ -10699,6 +10835,11 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             Vec3d                 p                   = this->point_to_gcode_quantized(processed_point.p);
             tag_belt_band(Point3((pre_processed_point.p + processed_point.p) / 2));
             if (m_enable_cooling_markers) {
+                // ORCA: open the external bridge request first so it outranks the overhang one below. It is
+                // gated on the filament's own switch, not on the variant column the role markers use.
+                if (external_bridge_fan_on)
+                    append_role_based_fan_marker(erBridgeInfill, "_EXTERNAL_BRIDGE"sv, true);
+
                 if (enable_overhang_bridge_fan) {
                     cur_fan_enabled = overhang_fan_active(processed_point.overlap, overhang_fan_threshold, path.role());
                     append_role_based_fan_marker(erOverhangPerimeter, "_OVERHANG"sv, pre_fan_enabled && cur_fan_enabled);
@@ -10709,6 +10850,12 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                 }
 
                 apply_role_based_fan_speed();
+
+                // ORCA: close it last, once every other role has taken the fan back (support interface and
+                // ironing are raised by apply_role_based_fan_speed above), so leaving the bridge never dips
+                // through another role's speed on the way to the layer fan.
+                if (! external_bridge_fan_on)
+                    append_role_based_fan_marker(erBridgeInfill, "_EXTERNAL_BRIDGE"sv, false);
             }
 
             const double line_length = (p - prev).norm();
@@ -10791,16 +10938,22 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                 if (z < 0.1) {
                     throw RuntimeError("GCode: very low z");
                 }
+                const size_t seam_line_begin = gcode.size();
                 m_writer.extrude_to_xyz(gcode, Vec3d(dest2d.x(), dest2d.y(), z), e,
                                         flow_description.empty() ? description : flow_description);
+                mark_external_bridge_seam(gcode, seam_line_begin, pre_processed_point.p.to_point(), processed_point.p.to_point(), nullptr);
             } else if (sloped == nullptr) {
                 // Normal extrusion
+                const size_t seam_line_begin = gcode.size();
                 m_writer.extrude_to_xy(gcode, p.head<2>(), dE, flow_description.empty() ? description : flow_description);
+                mark_external_bridge_seam(gcode, seam_line_begin, pre_processed_point.p.to_point(), processed_point.p.to_point(), nullptr);
             } else {
                 // Sloped extrusion
                 const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
                 Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
+                const size_t seam_line_begin = gcode.size();
                 m_writer.extrude_to_xyz(gcode, dest3d, dE * e_ratio, flow_description.empty() ? description : flow_description);
+                mark_external_bridge_seam(gcode, seam_line_begin, pre_processed_point.p.to_point(), processed_point.p.to_point(), nullptr);
             }
 
             // Inline farthest-point snapshot on the segmented emission path. Inert unless the

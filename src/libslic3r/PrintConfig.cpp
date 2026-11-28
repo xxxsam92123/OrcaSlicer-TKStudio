@@ -1637,17 +1637,37 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionBools{ true });
 
     def = this->add("overhang_fan_speed", coInts);
-    def->label = L("Overhangs and external bridges fan speed");
-    def->tooltip = L("Use this part cooling fan speed when printing bridges or overhang walls with an overhang threshold that exceeds "
-                     "the value set in the 'Overhangs cooling threshold' parameter above. Increasing the cooling specifically for overhangs "
-                     "and bridges can improve the overall print quality of these features.\n\n"
+    def->label = L("Overhangs fan speed");
+    def->tooltip = L("Use this part cooling fan speed when printing overhang walls with an overhang threshold that exceeds "
+                     "the value set in the 'Overhangs cooling threshold' parameter above. Increasing the cooling specifically "
+                     "for overhangs can improve the overall print quality of these features.\n\n"
                      "Please note, this fan speed is clamped on the lower end by the minimum fan speed threshold set above. It is also adjusted "
-                     "upwards up to the maximum fan speed threshold when the minimum layer time threshold is not met.");
+                     "upwards up to the maximum fan speed threshold when the minimum layer time threshold is not met.\n\n"
+                     "External bridges follow this fan speed too, unless 'External bridges fan speed' is set.");
     def->sidetext = "%";
     def->min = 0;
     def->max = 100;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInts { 100 });
+
+    // ORCA: Split the external bridge fan speed out of the overhang fan speed. -1 keeps an external
+    // bridge on the overhang fan speed resolved above, so profiles without the key print unchanged.
+    def = this->add("external_bridge_fan_speed", coInts);
+    def->label = L("External bridges fan speed");
+    // TRN: "-1", "0" and the option names in quotes are literal values, not wording to translate.
+    def->tooltip = L("Use this part cooling fan speed for external bridges alone. Unlike the overhang fan speed it is used as "
+                     "it is: a value below the regular fan speed reaches the bridge, and 0 prints the bridge with the part "
+                     "cooling fan off.\n\n"
+                     "Set to -1 (the default) to keep cooling external bridges at the overhang fan speed.\n\n"
+                     "The same gates apply as for the overhang fan speed: 'Force cooling for overhangs and bridges' off leaves "
+                     "bridges on the regular fan speed, 'No cooling for the first' layers keep the fan off, and a belt printer's "
+                     "band above the belt stays off. While the fan ramps up to 'Full fan speed at layer' the value is ramped with "
+                     "it, but 0 stays 0.");
+    def->sidetext = "%";
+    def->min = -1;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInts { -1 });
 
     def = this->add("overhang_fan_threshold", coEnums);
     def->label = L("Overhang cooling activation threshold");
